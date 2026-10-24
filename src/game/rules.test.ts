@@ -233,3 +233,122 @@ test('evaluateLipinskiRuleOfFive and computeTrainingWaveConfig return expected v
   assert.ok(wave3.totalEnemies > wave1.totalEnemies);
   assert.ok(wave3.hpMultiplier > wave1.hpMultiplier);
 });
+
+test('applyThumbstickDeadzone and parseStandardGamepadState map console controller inputs accurately', async () => {
+  const { applyThumbstickDeadzone, parseStandardGamepadState } = await import('./rules');
+
+  // Inside deadzone -> 0
+  assert.equal(applyThumbstickDeadzone(0.09, 0.16), 0);
+  assert.equal(applyThumbstickDeadzone(-0.12, 0.16), 0);
+  // Full deflection -> 1 / -1
+  assert.equal(applyThumbstickDeadzone(1.0, 0.16), 1);
+  assert.equal(applyThumbstickDeadzone(-1.0, 0.16), -1);
+
+  const mockButtons = Array.from({ length: 17 }, () => ({ pressed: false, value: 0 }));
+  mockButtons[0] = { pressed: true, value: 1 }; // A / Cross (Jump)
+  mockButtons[5] = { pressed: true, value: 1 }; // RB / R1 (Build Wall)
+  mockButtons[7] = { pressed: true, value: 0.9 }; // RT / R2 (Fire)
+
+  const frame1 = parseStandardGamepadState([0, -1, 0.5, 0], mockButtons, []);
+  assert.equal(frame1.moveForward, 1);
+  assert.ok(frame1.lookYawDelta > 0.3);
+  assert.equal(frame1.jumpJustPressed, true);
+  assert.equal(frame1.buildJustPressed, true);
+  assert.equal(frame1.fireHeld, true);
+  assert.equal(frame1.anyActiveInput, true);
+
+  // Holding the button on frame 2 should not re-trigger justPressed
+  const frame2 = parseStandardGamepadState(
+    [0, -1, 0.5, 0],
+    mockButtons,
+    frame1.nextPressedButtons
+  );
+  assert.equal(frame2.jumpJustPressed, false);
+  assert.equal(frame2.jumpHeld, true);
+  assert.equal(frame2.buildJustPressed, false);
+});
+
+test('evaluateSmartAimAssist, stepDynamicEnvironmentEventState, and interpolateReplayFrames work accurately', async () => {
+  const {
+    evaluateSmartAimAssist,
+    stepDynamicEnvironmentEventState,
+    interpolateReplayFrames,
+  } = await import('./rules');
+
+  // 1. Smart Aim Assist pulls yaw toward target slightly off-center and locks when aligned
+  const assist = evaluateSmartAimAssist(
+    { x: 0, y: 0, z: 0, eyeHeight: 1.72, yaw: 0.04, pitch: 0 },
+    [{ id: 'npc-1', x: 0, y: 0, z: -15, hp: 100, state: 'seek' }],
+    90,
+    0.05
+  );
+  assert.equal(assist.lockedTargetId, 'npc-1');
+  assert.ok(Math.abs(assist.nextYaw) < 0.04, 'Yaw should pull closer to 0 rad');
+  assert.equal(assist.shouldAutoFire, true);
+
+  // 2. Dynamic Environment Event lifecycle
+  const triggered = stepDynamicEnvironmentEventState('obsidian-foundry', 0, 0.2, 0.5, false);
+  assert.equal(triggered.justTriggered, true);
+  assert.equal(triggered.activeEvent?.id, 'magma-eruption');
+  assert.equal(triggered.nextActiveTimer, 16.0);
+
+  // 3. Match Replay keyframe interpolation
+  const interp = interpolateReplayFrames(
+    {
+      id: 'rep-1',
+      mapId: 'alpine-outpost',
+      trainingLevel: 1,
+      callsign: 'VANGUARD-01',
+      weaponId: 'vx-carbine',
+      skinId: 'vanguard-obsidian',
+      durationSec: 2.0,
+      finalScore: 200,
+      finalEliminations: 2,
+      highlights: [],
+      frames: [
+        {
+          timestamp: 0,
+          playerX: 0,
+          playerY: 0,
+          playerZ: 20,
+          playerYaw: 0,
+          playerPitch: 0,
+          eyeHeight: 1.72,
+          hp: 100,
+          shield: 50,
+          score: 0,
+          eliminations: 0,
+          movementMode: 'WALK',
+          firedShot: false,
+          activeEventId: null,
+          npcs: [],
+          walls: [],
+        },
+        {
+          timestamp: 2.0,
+          playerX: 10,
+          playerY: 0,
+          playerZ: 0,
+          playerYaw: 1.0,
+          playerPitch: 0.2,
+          eyeHeight: 1.72,
+          hp: 90,
+          shield: 40,
+          score: 200,
+          eliminations: 2,
+          movementMode: 'SPRINT',
+          firedShot: true,
+          activeEventId: 'cryo-blizzard',
+          npcs: [],
+          walls: [],
+        },
+      ],
+    },
+    1.0
+  );
+  assert.ok(interp);
+  assert.equal(interp.playerX, 5);
+  assert.equal(interp.playerZ, 10);
+});
+
+

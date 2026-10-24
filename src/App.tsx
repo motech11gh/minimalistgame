@@ -21,6 +21,13 @@ import {
   EmoteId,
   WallType,
   BuiltWallEntity,
+  ControlScheme,
+  ActiveInputDevice,
+  VirtualTouchInputState,
+  SmartControlConfig,
+  DYNAMIC_ENVIRONMENT_EVENTS,
+  ReplayCameraMode,
+  MatchReplayRecording,
 } from './game/types';
 import { computeWeaponStats } from './game/rules';
 import { soundEngine } from './game/sound';
@@ -33,6 +40,7 @@ import {
   BioSciencePanel,
   BioCompoundRecord,
 } from './components/BioScienceModal';
+import { TouchControlsOverlay } from './components/TouchControlsOverlay';
 import {
   auth,
   onAuthStateChanged,
@@ -86,6 +94,57 @@ export default function App() {
   const [dockCollapsed, setDockCollapsed] = useState<boolean>(false);
   const [muted, setMuted] = useState<boolean>(false);
   const [restartNonce, setRestartNonce] = useState<number>(0);
+
+  // Cross-Platform Input Support (PC Keyboard/Mouse · Mobile Touch · Console Controller)
+  const [controlScheme, setControlScheme] = useState<ControlScheme>('auto');
+  const [detectedDevice, setDetectedDevice] = useState<ActiveInputDevice>(() =>
+    typeof window !== 'undefined' &&
+    ('ontouchstart' in window || navigator.maxTouchPoints > 1)
+      ? 'touch'
+      : 'pc'
+  );
+  const [gamepadLabel, setGamepadLabel] = useState<string | null>(null);
+  const touchInputRef = useRef<VirtualTouchInputState>({
+    moveX: 0,
+    moveY: 0,
+    lookDeltaX: 0,
+    lookDeltaY: 0,
+    fireHeld: false,
+    adsHeld: false,
+    sprintHeld: false,
+    jumpHeld: false,
+    jumpJustPressed: false,
+    slideJustPressed: false,
+    reloadJustPressed: false,
+    abilityJustPressed: false,
+    buildJustPressed: false,
+    harvestJustPressed: false,
+    stimJustPressed: false,
+    emoteJustPressed: false,
+  });
+
+  const effectiveInputDevice: ActiveInputDevice =
+    controlScheme === 'auto' ? detectedDevice : controlScheme;
+
+  // Smart Control Assist Configuration (Aim Magnetism, Auto-Fire on Lock, Auto-Parkour)
+  const [smartControl, setSmartControl] = useState<SmartControlConfig>({
+    enabled: true,
+    aimAssistMagnetism: true,
+    autoFireOnLock: true,
+    autoSprintAndParkour: true,
+  });
+
+  // Dynamic Environment Event Trigger Nonce
+  const [triggerEventNonce, setTriggerEventNonce] = useState<number>(0);
+
+  // 3D Tactical Match Replay State
+  const [replayRecording, setReplayRecording] =
+    useState<MatchReplayRecording | null>(null);
+  const [replayTimeSec, setReplayTimeSec] = useState<number>(0);
+  const [replayPlaying, setReplayPlaying] = useState<boolean>(true);
+  const [replaySpeed, setReplaySpeed] = useState<number>(1);
+  const [replayCameraMode, setReplayCameraMode] =
+    useState<ReplayCameraMode>('orbit');
 
   // Firebase Auth & Persistent Operator Profile
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -141,6 +200,9 @@ export default function App() {
     hitMarkerActive: false,
     killMarkerActive: false,
     damageVignetteIntensity: 0,
+    smartTargetLocked: false,
+    activeEnvironmentEvent: null,
+    nextEventCooldownSec: 6.5,
     opponentsOverlay: [],
     minimapEntities: {
       playerX: 0,
@@ -157,6 +219,51 @@ export default function App() {
   useEffect(() => {
     document.body.dataset.state = gameState;
   }, [gameState]);
+
+  // Automatic Hardware Input Mutual-Exclusion Listener:
+  // Detecting Keyboard, Touch, or Gamepad immediately switches active controls and hides other devices' overlays
+  useEffect(() => {
+    const onKeyDown = () => {
+      setDetectedDevice('pc');
+      setControlScheme('auto');
+    };
+    const onTouchStart = () => {
+      setDetectedDevice('touch');
+      setControlScheme('auto');
+    };
+    const onGamepadConnected = (e: GamepadEvent) => {
+      setDetectedDevice('console');
+      setControlScheme('auto');
+      setGamepadLabel(e.gamepad?.id || 'Controller');
+    };
+    window.addEventListener('keydown', onKeyDown, { passive: true });
+    window.addEventListener('touchstart', onTouchStart, { passive: true });
+    window.addEventListener('gamepadconnected', onGamepadConnected);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('touchstart', onTouchStart);
+      window.removeEventListener('gamepadconnected', onGamepadConnected);
+    };
+  }, []);
+
+  // Advance 3D Match Replay timeline when in 'replay' state
+  useEffect(() => {
+    if (gameState !== 'replay' || !replayPlaying || !replayRecording) return;
+    const duration = Math.max(1, replayRecording.durationSec);
+    let lastTs = performance.now();
+    let raf = 0;
+    const step = (now: number) => {
+      const dt = Math.min(0.1, Math.max(0.001, (now - lastTs) / 1000));
+      lastTs = now;
+      setReplayTimeSec((prev) => {
+        const next = prev + dt * replaySpeed;
+        return next > duration ? 0 : next;
+      });
+      raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [gameState, replayPlaying, replaySpeed, replayRecording]);
 
   // Connect to Firebase Auth and load/create Firestore profile
   useEffect(() => {
@@ -374,10 +481,23 @@ export default function App() {
         remoteOperators={remoteOperators}
         sharedWalls={sharedWalls}
         restartNonce={restartNonce}
+        touchInputRef={touchInputRef}
+        smartControl={smartControl}
+        triggerEventNonce={triggerEventNonce}
+        replayRecording={replayRecording}
+        replayTimeSec={replayTimeSec}
+        replayCameraMode={replayCameraMode}
+        onDetectedInputDevice={(device, gpName) => {
+          setDetectedDevice(device);
+          // Mutual-exclusion input switching: automatically switch to detected hardware & hide other controls
+          setControlScheme('auto');
+          if (gpName !== undefined) setGamepadLabel(gpName);
+        }}
         onSelectWallType={(t) => setSelectedWallType(t)}
         onHudUpdate={setHud}
         onStateChange={handleStateChange}
         onSendMultiplayerUpdate={sendMultiplayerUpdate}
+        onReplayUpdated={setReplayRecording}
       />
 
       {/* ===================================================================== */}
@@ -462,6 +582,19 @@ export default function App() {
                   {dockCollapsed ? 'Show Loadout & Maps' : 'Hide Loadout Dock'}
                 </button>
 
+                <button
+                  type="button"
+                  data-testid="lobby-watch-replay-btn"
+                  onClick={() => {
+                    setReplayTimeSec(0);
+                    setReplayPlaying(true);
+                    handleStateChange('replay');
+                  }}
+                  className="px-4 py-3 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  Watch 3D Replay
+                </button>
+
                 {currentUser ? (
                   <button
                     type="button"
@@ -495,29 +628,85 @@ export default function App() {
               )}
             </div>
 
-            {/* Top-Right Audio Utility & Cloud Telemetry Readout */}
-            <div
-              className="pointer-events-auto flex items-center gap-3 px-4 py-2.5 rounded-lg border border-white/15 text-xs"
-              style={{ backgroundColor: 'rgba(9,13,22,0.88)' }}
-            >
-              <div className="font-mono tabular-nums text-slate-300">
-                <span>XP {operatorProfile?.xp ?? 0}</span>
-                <span className="mx-2 text-slate-600">·</span>
-                <span>ELIMS {operatorProfile?.totalEliminations ?? 0}</span>
-                <span className="mx-2 text-slate-600">·</span>
-                <span>SQUAD ONLINE {remoteOperators.length + 1}</span>
-              </div>
-              <button
-                type="button"
-                aria-label={muted ? 'Unmute Audio' : 'Mute Audio'}
-                onClick={(e) => {
-                  e.currentTarget.blur();
-                  setMuted(soundEngine.toggleMute());
-                }}
-                className="px-2.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-xs cursor-pointer"
+            {/* Top-Right Cross-Platform Input Mode Switcher, Smart Controls, Audio & Cloud Telemetry */}
+            <div className="pointer-events-auto flex flex-col items-end gap-2">
+              <div
+                className="flex items-center gap-3 px-4 py-2.5 rounded-lg border border-white/15 text-xs"
+                style={{ backgroundColor: 'rgba(9,13,22,0.88)' }}
               >
-                {muted ? 'AUDIO: OFF' : 'AUDIO: ON'}
-              </button>
+                <div className="font-mono tabular-nums text-slate-300">
+                  <span>XP {operatorProfile?.xp ?? 0}</span>
+                  <span className="mx-2 text-slate-600">·</span>
+                  <span>ELIMS {operatorProfile?.totalEliminations ?? 0}</span>
+                  <span className="mx-2 text-slate-600">·</span>
+                  <span>SQUAD ONLINE {remoteOperators.length + 1}</span>
+                </div>
+                <button
+                  type="button"
+                  aria-label={muted ? 'Unmute Audio' : 'Mute Audio'}
+                  onClick={(e) => {
+                    e.currentTarget.blur();
+                    setMuted(soundEngine.toggleMute());
+                  }}
+                  className="px-2.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-xs cursor-pointer"
+                >
+                  {muted ? 'AUDIO: OFF' : 'AUDIO: ON'}
+                </button>
+              </div>
+
+              {/* Cross-Platform Input Scheme Selector (AUTO / PC / TOUCH / CONSOLE) + Smart Assist */}
+              <div
+                className="flex flex-wrap items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/15 text-xs"
+                style={{ backgroundColor: 'rgba(9,13,22,0.92)' }}
+                role="group"
+                aria-label="Control Input Scheme"
+              >
+                <span className="text-[11px] font-mono text-slate-400 mr-1">
+                  CONTROLS:
+                </span>
+                {(
+                  [
+                    { id: 'auto', label: `AUTO (${detectedDevice.toUpperCase()})` },
+                    { id: 'pc', label: 'PC KBM' },
+                    { id: 'touch', label: 'TOUCH HUD' },
+                    { id: 'console', label: 'CONSOLE PAD' },
+                  ] as const
+                ).map((mode) => {
+                  const active = controlScheme === mode.id;
+                  return (
+                    <button
+                      key={mode.id}
+                      type="button"
+                      data-testid={`control-mode-${mode.id}`}
+                      onClick={() => setControlScheme(mode.id)}
+                      className={`px-2.5 py-1 rounded font-mono text-[11px] font-semibold transition-colors cursor-pointer ${
+                        active
+                          ? 'bg-amber-500 text-slate-950'
+                          : 'bg-slate-900 text-slate-300 hover:text-white'
+                      }`}
+                    >
+                      {mode.label}
+                    </button>
+                  );
+                })}
+                <button
+                  type="button"
+                  data-testid="lobby-smart-control-toggle"
+                  onClick={() =>
+                    setSmartControl((prev) => ({
+                      ...prev,
+                      enabled: !prev.enabled,
+                    }))
+                  }
+                  className={`ml-1 px-2.5 py-1 rounded font-mono text-[11px] font-semibold transition-colors cursor-pointer ${
+                    smartControl.enabled
+                      ? 'bg-emerald-500 text-slate-950'
+                      : 'bg-slate-900 text-slate-400 hover:text-white'
+                  }`}
+                >
+                  SMART ASSIST: {smartControl.enabled ? 'ON' : 'OFF'}
+                </button>
+              </div>
             </div>
           </div>
 
@@ -1030,28 +1219,46 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="md:col-span-5 bg-slate-900 border border-white/10 rounded-lg p-3">
-                      <div className="flex items-center justify-between mb-2">
-                        <span className="text-xs font-bold text-white">
-                          Live Multiplayer Sector Roster
-                        </span>
-                        <span className="text-[11px] font-mono text-emerald-400">
-                          WebSocket Synced · Port 3000
-                        </span>
-                      </div>
-                      <div className="space-y-1.5 text-xs font-mono">
-                        <div className="flex items-center justify-between py-1 px-2 rounded bg-slate-950 text-white">
-                          <span>{callsign} (YOU)</span>
-                          <span className="text-amber-400">
-                            {WEAPONS[weaponId].name}
+                    <div className="md:col-span-5 bg-slate-900 border border-white/10 rounded-lg p-3 flex flex-col justify-between gap-2">
+                      <div>
+                        <div className="flex items-center justify-between mb-1.5">
+                          <span className="text-xs font-bold text-white">
+                            Cross-Platform Controls ({effectiveInputDevice.toUpperCase()})
+                          </span>
+                          <span className="text-[10px] font-mono text-sky-400">
+                            {gamepadLabel ? 'Controller Linked' : 'PC · Touch · Gamepad'}
                           </span>
                         </div>
-                        {remoteOperators.length === 0 ? (
-                          <div className="text-[11px] text-slate-400 py-1">
-                            Open another browser tab to join this live multiplayer sector simultaneously.
+                        <div className="text-[11px] font-mono text-slate-300 space-y-1 bg-slate-950 p-2 rounded border border-white/5">
+                          <div>
+                            <span className="text-amber-400 font-bold">PC:</span> WASD Move · C Slide · Space Jump/Vault/Climb · LMB/RMB Fire/ADS · Q Ability · F Build
                           </div>
-                        ) : (
-                          remoteOperators.map((ro) => (
+                          <div>
+                            <span className="text-sky-400 font-bold">TOUCH:</span> Left Stick Move/Sprint · Right Drag Aim · Dedicated Fire/ADS/Jump/Slide/Build Pad
+                          </div>
+                          <div>
+                            <span className="text-emerald-400 font-bold">CONSOLE:</span> LS Move/Sprint · RS Aim · RT/LT Fire/ADS · A Jump/Vault · B Slide · RB Build · Y Ability
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="pt-1.5 border-t border-white/10">
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-[11px] font-bold text-white">
+                            Live Multiplayer Sector Roster
+                          </span>
+                          <span className="text-[10px] font-mono text-emerald-400">
+                            WS Synced · {remoteOperators.length + 1} Online
+                          </span>
+                        </div>
+                        <div className="space-y-1 text-xs font-mono">
+                          <div className="flex items-center justify-between py-1 px-2 rounded bg-slate-950 text-white">
+                            <span>{callsign} (YOU)</span>
+                            <span className="text-amber-400">
+                              {WEAPONS[weaponId].name}
+                            </span>
+                          </div>
+                          {remoteOperators.slice(0, 2).map((ro) => (
                             <div
                               key={ro.id}
                               className="flex items-center justify-between py-1 px-2 rounded bg-slate-950 text-sky-300"
@@ -1061,8 +1268,8 @@ export default function App() {
                                 HP {ro.hp}/{ro.maxHp} · Score {ro.score}
                               </span>
                             </div>
-                          ))
-                        )}
+                          ))}
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -1072,7 +1279,11 @@ export default function App() {
 
             {/* Flat Borderless Single-Line Control Hint in Bottom Safe Margin */}
             <div className="text-center text-xs font-mono text-slate-200 mt-2 hud-stroke whitespace-nowrap overflow-hidden text-ellipsis">
-              WASD Move · Shift Sprint · C Slide · Space Jump/Vault/Climb · LMB Fire · Q Ability · F Build Wall · G Bio-Stim · V Emote · Esc Pause
+              {effectiveInputDevice === 'touch'
+                ? 'TOUCH MODE ACTIVE: Left Thumb Virtual Stick Move/Sprint · Right Screen Drag Look · Tap FIRE / AIM / JUMP-VAULT / SLIDE / BUILD / ABILITY'
+                : effectiveInputDevice === 'console'
+                  ? 'CONSOLE CONTROLLER: Left Stick Move/Sprint · Right Stick Aim · RT Fire · LT ADS · [A/Cross] Jump/Vault/Climb · [B/Circle] Slide · [RB/R1] Build Wall · [Y/Triangle] Ability · [LB/L1] Bio-Stim'
+                  : 'PC + CONSOLE + TOUCH READY: WASD/Left-Stick Move · Shift/L3 Sprint · C/[B] Slide · Space/[A] Jump/Vault/Climb · LMB/RT Fire · Q/[Y] Ability · F/[RB] Build Wall · G/[LB] Bio-Stim'}
             </div>
           </div>
         </div>
@@ -1173,21 +1384,36 @@ export default function App() {
             );
           })}
 
-          {/* Exact (50%, 50%) Center Reticle & Hit/Kill Confirmation */}
+          {/* Exact (50%, 50%) Center Reticle, Smart Target Lock & Hit/Kill Confirmation */}
           <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none">
-            <svg viewBox="0 0 48 48" className="w-10 h-10">
+            <svg viewBox="0 0 48 48" className="w-11 h-11">
+              {hud.smartTargetLocked && (
+                <polygon
+                  points="24,6 42,24 24,42 6,24"
+                  fill="none"
+                  stroke="#10b981"
+                  strokeWidth="1.6"
+                  strokeDasharray="4 2"
+                />
+              )}
               <circle
                 cx="24"
                 cy="24"
-                r="2"
-                fill={hud.killMarkerActive ? '#ef4444' : '#38bdf8'}
+                r="2.2"
+                fill={
+                  hud.killMarkerActive
+                    ? '#ef4444'
+                    : hud.smartTargetLocked
+                      ? '#10b981'
+                      : '#38bdf8'
+                }
               />
               <line
                 x1="24"
                 y1="10"
                 x2="24"
                 y2="17"
-                stroke="#f8fafc"
+                stroke={hud.smartTargetLocked ? '#10b981' : '#f8fafc'}
                 strokeWidth="1.8"
               />
               <line
@@ -1195,7 +1421,7 @@ export default function App() {
                 y1="31"
                 x2="24"
                 y2="38"
-                stroke="#f8fafc"
+                stroke={hud.smartTargetLocked ? '#10b981' : '#f8fafc'}
                 strokeWidth="1.8"
               />
               <line
@@ -1203,7 +1429,7 @@ export default function App() {
                 y1="24"
                 x2="17"
                 y2="24"
-                stroke="#f8fafc"
+                stroke={hud.smartTargetLocked ? '#10b981' : '#f8fafc'}
                 strokeWidth="1.8"
               />
               <line
@@ -1211,7 +1437,7 @@ export default function App() {
                 y1="24"
                 x2="38"
                 y2="24"
-                stroke="#f8fafc"
+                stroke={hud.smartTargetLocked ? '#10b981' : '#f8fafc'}
                 strokeWidth="1.8"
               />
               {hud.hitMarkerActive && (
@@ -1226,6 +1452,50 @@ export default function App() {
                 </g>
               )}
             </svg>
+          </div>
+
+          {/* TOP-CENTER DYNAMIC ENVIRONMENT EVENT BANNER */}
+          <div className="fixed top-4 left-1/2 -translate-x-1/2 pointer-events-none flex flex-col items-center">
+            {hud.activeEnvironmentEvent ? (
+              <div
+                data-testid="active-env-event-banner"
+                className="px-4 py-1.5 rounded-lg border shadow-lg text-center"
+                style={{
+                  backgroundColor: 'rgba(9,13,22,0.9)',
+                  borderColor: hud.activeEnvironmentEvent.accentColor,
+                }}
+              >
+                <div className="flex items-center justify-center gap-2 text-xs font-mono font-bold">
+                  <span
+                    className="w-2 h-2 rounded-full animate-pulse"
+                    style={{
+                      backgroundColor: hud.activeEnvironmentEvent.accentColor,
+                    }}
+                  />
+                  <span className="text-white">
+                    {hud.activeEnvironmentEvent.name}
+                  </span>
+                  <span className="text-amber-300 tabular-nums">
+                    {hud.activeEnvironmentEvent.remainingSec.toFixed(1)}s
+                  </span>
+                </div>
+                <div className="text-[10px] font-mono text-slate-300 mt-0.5">
+                  {hud.activeEnvironmentEvent.subtitle}
+                </div>
+              </div>
+            ) : (
+              <div
+                data-testid="upcoming-env-event-pill"
+                className="px-3 py-1 rounded-md border border-white/10 text-[10px] font-mono text-slate-300"
+                style={{ backgroundColor: 'rgba(9,13,22,0.78)' }}
+              >
+                SECTOR WEATHER · NEXT ANOMALY IN{' '}
+                <span className="text-amber-300 font-bold tabular-nums">
+                  {hud.nextEventCooldownSec.toFixed(0)}s
+                </span>{' '}
+                [H]
+              </div>
+            )}
           </div>
 
           {/* Contextual Salvage / Emote Callout near Gaze Center */}
@@ -1352,8 +1622,60 @@ export default function App() {
             </div>
           </div>
 
-          {/* CORNER CLUSTER 2 (TOP-RIGHT): Compact Utility Buttons (Mute, Restart, Pause) */}
-          <div className="fixed top-4 right-4 pointer-events-auto flex items-center gap-2">
+          {/* CORNER CLUSTER 2 (TOP-RIGHT): Compact Utility Buttons (Event, Smart Assist, Mute, Restart, Replay, Pause) */}
+          <div className="fixed top-4 right-4 pointer-events-auto flex items-center gap-1.5">
+            <button
+              type="button"
+              tabIndex={-1}
+              data-testid="hud-trigger-event-btn"
+              aria-label="Trigger Dynamic Environment Event"
+              onClick={(e) => {
+                e.currentTarget.blur();
+                setTriggerEventNonce((n) => n + 1);
+              }}
+              className="px-2.5 h-9 rounded-lg border border-amber-400/35 flex items-center justify-center text-[10px] font-mono font-bold text-amber-300 hover:bg-slate-800 cursor-pointer"
+              style={{ backgroundColor: 'rgba(9,13,22,0.85)' }}
+            >
+              EVENT [H]
+            </button>
+            <button
+              type="button"
+              tabIndex={-1}
+              data-testid="hud-smart-assist-btn"
+              aria-label="Toggle Smart Control Assist"
+              onClick={(e) => {
+                e.currentTarget.blur();
+                setSmartControl((prev) => ({
+                  ...prev,
+                  enabled: !prev.enabled,
+                }));
+              }}
+              className={`px-2.5 h-9 rounded-lg border flex items-center justify-center text-[10px] font-mono font-bold cursor-pointer ${
+                smartControl.enabled
+                  ? 'border-emerald-400/40 text-emerald-300'
+                  : 'border-white/15 text-slate-400'
+              }`}
+              style={{ backgroundColor: 'rgba(9,13,22,0.85)' }}
+            >
+              {smartControl.enabled ? 'SMART:ON' : 'SMART:OFF'}
+            </button>
+            <button
+              type="button"
+              tabIndex={-1}
+              data-testid="hud-open-replay-btn"
+              aria-label="Open 3D Match Replay"
+              onClick={(e) => {
+                e.currentTarget.blur();
+                document.exitPointerLock?.();
+                setReplayTimeSec(0);
+                setReplayPlaying(true);
+                handleStateChange('replay');
+              }}
+              className="px-2.5 h-9 rounded-lg border border-white/15 flex items-center justify-center text-[10px] font-mono font-bold text-emerald-300 hover:bg-slate-800 cursor-pointer"
+              style={{ backgroundColor: 'rgba(9,13,22,0.85)' }}
+            >
+              REPLAY
+            </button>
             <button
               type="button"
               tabIndex={-1}
@@ -1382,6 +1704,31 @@ export default function App() {
             >
               <span className="text-[10px] font-mono font-bold">RST</span>
             </button>
+            {/* Button to cycle Input Mode directly in top-right utility cluster */}
+            <button
+              type="button"
+              tabIndex={-1}
+              data-testid="hud-cycle-controls-btn"
+              aria-label="Cycle Input Controls Mode"
+              onClick={(e) => {
+                e.currentTarget.blur();
+                setControlScheme((prev) =>
+                  prev === 'auto'
+                    ? 'touch'
+                    : prev === 'touch'
+                      ? 'console'
+                      : prev === 'console'
+                        ? 'pc'
+                        : 'auto'
+                );
+              }}
+              className="px-2.5 h-9 rounded-lg border border-white/15 flex items-center justify-center text-[10px] font-mono font-bold text-sky-300 hover:bg-slate-800 cursor-pointer"
+              style={{ backgroundColor: 'rgba(9,13,22,0.85)' }}
+            >
+              {controlScheme === 'auto'
+                ? `AUTO:${effectiveInputDevice.toUpperCase()}`
+                : controlScheme.toUpperCase()}
+            </button>
             <button
               type="button"
               tabIndex={-1}
@@ -1394,9 +1741,36 @@ export default function App() {
               className="px-3 h-9 rounded-lg border border-white/15 flex items-center justify-center text-xs font-mono font-bold text-amber-400 hover:bg-slate-800 cursor-pointer"
               style={{ backgroundColor: 'rgba(9,13,22,0.85)' }}
             >
-              ESC · PAUSE
+              {effectiveInputDevice === 'console'
+                ? 'START · PAUSE'
+                : effectiveInputDevice === 'touch'
+                  ? 'PAUSE'
+                  : 'ESC · PAUSE'}
             </button>
           </div>
+
+          {/* MUTUALLY EXCLUSIVE ACTIVE INPUT OVERLAY:
+              - When effectiveInputDevice === 'touch', ONLY the TouchControlsOverlay is rendered (PC & Console prompts hidden).
+              - When effectiveInputDevice === 'console', TouchControlsOverlay & PC prompts are hidden, and Console Pad bar is shown.
+              - When effectiveInputDevice === 'pc', TouchControlsOverlay & Console prompts are hidden, and PC KBM bar is shown. */}
+          {effectiveInputDevice === 'touch' ? (
+            <TouchControlsOverlay
+              touchInputRef={touchInputRef}
+              selectedWallType={selectedWallType}
+              onSelectWallType={setSelectedWallType}
+            />
+          ) : (
+            <div
+              data-testid="active-device-prompt"
+              data-device={effectiveInputDevice}
+              className="fixed bottom-4 left-1/2 -translate-x-1/2 max-w-[540px] truncate px-3 py-1 rounded-lg border border-white/10 text-[10px] font-mono text-slate-300 pointer-events-none whitespace-nowrap hidden xl:block"
+              style={{ backgroundColor: 'rgba(9,13,22,0.82)' }}
+            >
+              {effectiveInputDevice === 'console'
+                ? 'PAD ACTIVE · LS Move/Parkour · RS Aim · RT/LT Fire/ADS · [A] Vault · [B] Slide · [RB] Build · [Y] Ability'
+                : 'PC KBM ACTIVE · WASD Move · Space Vault/Climb · C Slide · LMB/RMB Fire/ADS · Q Ability · F Build · H Event'}
+            </div>
+          )}
 
           {/* CORNER CLUSTER 3 (BOTTOM-LEFT): Clean Unobtrusive Operator HP, Shield, Stamina & Movement State */}
           <div
@@ -1465,8 +1839,12 @@ export default function App() {
                 {hud.stimActiveTimer > 0
                   ? `BIO-STIM ACTIVE (${hud.stimActiveTimer.toFixed(1)}s)`
                   : hud.stimCooldown > 0
-                    ? `[G] STIM CD ${hud.stimCooldown.toFixed(0)}s`
-                    : '[G] BIO-STIM READY'}
+                    ? `STIM CD ${hud.stimCooldown.toFixed(0)}s`
+                    : effectiveInputDevice === 'console'
+                      ? '[LB] BIO-STIM READY'
+                      : effectiveInputDevice === 'touch'
+                        ? '[TAP] BIO-STIM READY'
+                        : '[G] BIO-STIM READY'}
               </span>
             </div>
           </div>
@@ -1486,7 +1864,13 @@ export default function App() {
                     ? `${currentWeapon.abilityName} ACTIVE (${hud.abilityActiveTimer.toFixed(1)}s)`
                     : hud.abilityCooldown > 0
                       ? `${currentWeapon.abilityName} (${hud.abilityCooldown.toFixed(0)}s)`
-                      : `${currentWeapon.abilityName} · READY`}
+                      : `${currentWeapon.abilityName} · ${
+                          effectiveInputDevice === 'console'
+                            ? '[Y]'
+                            : effectiveInputDevice === 'touch'
+                              ? '[TAP]'
+                              : '[Q]'
+                        } READY`}
                 </div>
               </div>
               <div className="text-right">
@@ -1528,7 +1912,13 @@ export default function App() {
                   );
                 })}
                 <span className="text-emerald-400 font-semibold ml-1">
-                  {hud.buildModeActive ? '[LMB/F] PLACE' : '[F/B] BUILD'}
+                  {hud.buildModeActive
+                    ? 'PLACE WALL'
+                    : effectiveInputDevice === 'console'
+                      ? '[RB] BUILD'
+                      : effectiveInputDevice === 'touch'
+                        ? '[BUILD]'
+                        : '[F/B] BUILD'}
                 </span>
               </div>
             </div>
@@ -1552,7 +1942,7 @@ export default function App() {
               Mission Paused
             </h2>
 
-            <div className="grid grid-cols-3 gap-2.5 mb-5 text-center font-mono tabular-nums">
+            <div className="grid grid-cols-3 gap-2.5 mb-4 text-center font-mono tabular-nums">
               <div className="p-2.5 rounded-lg bg-slate-950 border border-white/10">
                 <div className="text-[10px] text-slate-400">SCORE</div>
                 <div className="text-lg font-bold text-amber-400">
@@ -1573,13 +1963,105 @@ export default function App() {
               </div>
             </div>
 
+            {/* In-Match Control Scheme & Smart Assist Switcher */}
+            <div className="mb-4 p-2.5 rounded-lg bg-slate-950 border border-white/10 space-y-2">
+              <div className="text-[10px] font-mono text-slate-400">
+                ACTIVE INPUT SCHEME (AUTO-HIDES OTHER DEVICE CONTROLS)
+              </div>
+              <div className="grid grid-cols-4 gap-1.5">
+                {(
+                  [
+                    { id: 'auto', label: 'AUTO' },
+                    { id: 'pc', label: 'PC KBM' },
+                    { id: 'touch', label: 'TOUCH' },
+                    { id: 'console', label: 'CONSOLE' },
+                  ] as const
+                ).map((mode) => (
+                  <button
+                    key={mode.id}
+                    type="button"
+                    onClick={() => setControlScheme(mode.id)}
+                    className={`py-1.5 rounded text-[11px] font-mono font-bold cursor-pointer ${
+                      controlScheme === mode.id
+                        ? 'bg-amber-500 text-slate-950'
+                        : 'bg-slate-900 text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    {mode.label}
+                  </button>
+                ))}
+              </div>
+              <div className="grid grid-cols-3 gap-1.5 pt-1 border-t border-white/10">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSmartControl((p) => ({
+                      ...p,
+                      aimAssistMagnetism: !p.aimAssistMagnetism,
+                    }))
+                  }
+                  className={`py-1 rounded text-[10px] font-mono font-semibold cursor-pointer ${
+                    smartControl.aimAssistMagnetism
+                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/40'
+                      : 'bg-slate-900 text-slate-400'
+                  }`}
+                >
+                  AIM MAGNET: {smartControl.aimAssistMagnetism ? 'ON' : 'OFF'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSmartControl((p) => ({
+                      ...p,
+                      autoFireOnLock: !p.autoFireOnLock,
+                    }))
+                  }
+                  className={`py-1 rounded text-[10px] font-mono font-semibold cursor-pointer ${
+                    smartControl.autoFireOnLock
+                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/40'
+                      : 'bg-slate-900 text-slate-400'
+                  }`}
+                >
+                  AUTO-FIRE: {smartControl.autoFireOnLock ? 'ON' : 'OFF'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSmartControl((p) => ({
+                      ...p,
+                      autoSprintAndParkour: !p.autoSprintAndParkour,
+                    }))
+                  }
+                  className={`py-1 rounded text-[10px] font-mono font-semibold cursor-pointer ${
+                    smartControl.autoSprintAndParkour
+                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/40'
+                      : 'bg-slate-900 text-slate-400'
+                  }`}
+                >
+                  AUTO-PARKOUR: {smartControl.autoSprintAndParkour ? 'ON' : 'OFF'}
+                </button>
+              </div>
+            </div>
+
             <div className="flex flex-col gap-2.5">
               <button
                 type="button"
                 onClick={() => handleStateChange('playing')}
                 className="w-full py-2.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-sm cursor-pointer"
               >
-                Resume Combat [Esc]
+                Resume Combat [Esc / Start]
+              </button>
+              <button
+                type="button"
+                data-testid="pause-watch-replay-btn"
+                onClick={() => {
+                  setReplayTimeSec(0);
+                  setReplayPlaying(true);
+                  handleStateChange('replay');
+                }}
+                className="w-full py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold cursor-pointer"
+              >
+                Watch 3D Match Replay
               </button>
               <button
                 type="button"
@@ -1667,11 +2149,175 @@ export default function App() {
               </button>
               <button
                 type="button"
+                data-testid="gameover-watch-replay-btn"
+                onClick={() => {
+                  setReplayTimeSec(0);
+                  setReplayPlaying(true);
+                  handleStateChange('replay');
+                }}
+                className="w-full py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold cursor-pointer"
+              >
+                Watch 3D Match Replay ({replayRecording?.frames.length ?? 0} Frames)
+              </button>
+              <button
+                type="button"
                 onClick={() => handleStateChange('title')}
                 className="w-full py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold cursor-pointer"
               >
                 Return to Lobby &amp; Weaponsmith
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ===================================================================== */}
+      {/* STATE 5: 3D TACTICAL MATCH REPLAY VIEWER                              */}
+      {/* ===================================================================== */}
+      {gameState === 'replay' && (
+        <div
+          data-testid="replay-viewer-overlay"
+          className="fixed inset-0 z-30 pointer-events-none flex flex-col justify-between p-5"
+        >
+          {/* Top Bar: Replay Header + Camera Perspective Switcher + Exit */}
+          <div className="pointer-events-auto flex flex-wrap items-center justify-between gap-3">
+            <div
+              className="px-4 py-2.5 rounded-xl border border-emerald-400/40 flex items-center gap-3"
+              style={{ backgroundColor: 'rgba(9,13,22,0.9)' }}
+            >
+              <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+              <div>
+                <div className="text-xs font-mono font-bold text-emerald-300">
+                  3D TACTICAL MATCH REPLAY · {currentBiome.name.toUpperCase()}
+                </div>
+                <div className="text-[11px] font-mono text-slate-300">
+                  Operator {replayRecording?.callsign ?? callsign} · Score{' '}
+                  {replayRecording?.finalScore ?? hud.score} · Elims{' '}
+                  {replayRecording?.finalEliminations ?? hud.eliminations}
+                </div>
+              </div>
+            </div>
+
+            {/* 3D Replay Camera Perspective Selector */}
+            <div
+              className="flex items-center gap-1.5 p-1.5 rounded-xl border border-white/15"
+              style={{ backgroundColor: 'rgba(9,13,22,0.9)' }}
+              role="group"
+              aria-label="Replay Camera Mode"
+            >
+              {(
+                [
+                  { id: 'first-person', label: '1ST-PERSON POV' },
+                  { id: 'orbit', label: '3RD-PERSON ORBIT' },
+                  { id: 'drone', label: 'TACTICAL DRONE' },
+                ] as const
+              ).map((cam) => (
+                <button
+                  key={cam.id}
+                  type="button"
+                  data-testid={`replay-cam-${cam.id}`}
+                  onClick={() => setReplayCameraMode(cam.id)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold cursor-pointer transition-colors ${
+                    replayCameraMode === cam.id
+                      ? 'bg-amber-500 text-slate-950'
+                      : 'bg-slate-900 text-slate-300 hover:text-white'
+                  }`}
+                >
+                  {cam.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                data-testid="replay-return-game-btn"
+                onClick={() => handleStateChange('playing')}
+                className="px-4 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-xs cursor-pointer"
+              >
+                Resume Live Match
+              </button>
+              <button
+                type="button"
+                data-testid="replay-exit-lobby-btn"
+                onClick={() => handleStateChange('title')}
+                className="px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-200 border border-white/15 text-xs font-semibold cursor-pointer"
+              >
+                Lobby
+              </button>
+            </div>
+          </div>
+
+          {/* Bottom Timeline Scrubber, Speed Controls & Combat Highlight Markers */}
+          <div
+            className="pointer-events-auto w-full max-w-4xl mx-auto rounded-xl border border-white/15 p-4 shadow-2xl space-y-3"
+            style={{ backgroundColor: 'rgba(9,13,22,0.92)' }}
+          >
+            {/* Highlight Markers Strip */}
+            {replayRecording && replayRecording.highlights.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-[10px] font-mono text-slate-400 mr-1">
+                  HIGHLIGHTS:
+                </span>
+                {replayRecording.highlights.map((hl) => (
+                  <button
+                    key={hl.id}
+                    type="button"
+                    onClick={() => setReplayTimeSec(hl.timestamp ?? 0)}
+                    className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-white/10 text-[10px] font-mono text-amber-300 cursor-pointer"
+                  >
+                    [{(hl.timestamp ?? 0).toFixed(1)}s] {hl.label}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Scrubber Slider + Play/Pause + Speed */}
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                data-testid="replay-play-toggle"
+                onClick={() => setReplayPlaying((p) => !p)}
+                className="px-3.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-mono font-bold text-xs cursor-pointer shrink-0"
+              >
+                {replayPlaying ? 'PAUSE' : 'PLAY'}
+              </button>
+
+              <input
+                type="range"
+                data-testid="replay-scrubber"
+                min={0}
+                max={Math.max(1, replayRecording?.durationSec ?? 12)}
+                step={0.05}
+                value={Math.min(
+                  replayTimeSec,
+                  Math.max(1, replayRecording?.durationSec ?? 12)
+                )}
+                onChange={(e) => setReplayTimeSec(parseFloat(e.target.value))}
+                className="w-full accent-amber-400 cursor-pointer"
+              />
+
+              <div className="text-xs font-mono tabular-nums text-white shrink-0 w-24 text-right">
+                {replayTimeSec.toFixed(1)}s /{' '}
+                {(replayRecording?.durationSec ?? 12).toFixed(1)}s
+              </div>
+
+              <div className="flex items-center gap-1 shrink-0">
+                {[0.5, 1, 2].map((spd) => (
+                  <button
+                    key={spd}
+                    type="button"
+                    onClick={() => setReplaySpeed(spd)}
+                    className={`px-2 py-1 rounded text-[11px] font-mono font-bold cursor-pointer ${
+                      replaySpeed === spd
+                        ? 'bg-sky-500 text-slate-950'
+                        : 'bg-slate-800 text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    {spd}x
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
         </div>

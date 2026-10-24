@@ -1,4 +1,34 @@
-export type GameState = 'title' | 'playing' | 'paused' | 'gameover';
+export type GameState = 'title' | 'playing' | 'paused' | 'gameover' | 'replay';
+
+export type ControlScheme = 'auto' | 'pc' | 'touch' | 'console';
+export type ActiveInputDevice = 'pc' | 'touch' | 'console';
+export type ReplayCameraMode = 'fpv' | 'orbit' | 'drone';
+
+export interface SmartControlConfig {
+  enabled: boolean;
+  aimAssistMagnetism: boolean;
+  autoFireOnLock: boolean;
+  autoSprintAndParkour: boolean;
+}
+
+export interface VirtualTouchInputState {
+  moveX: number; // -1 (left) to 1 (right)
+  moveY: number; // -1 (backward) to 1 (forward)
+  lookDeltaX: number;
+  lookDeltaY: number;
+  fireHeld: boolean;
+  adsHeld: boolean;
+  sprintHeld: boolean;
+  jumpHeld: boolean;
+  jumpJustPressed: boolean;
+  slideJustPressed: boolean;
+  reloadJustPressed: boolean;
+  abilityJustPressed: boolean;
+  buildJustPressed: boolean;
+  harvestJustPressed: boolean;
+  stimJustPressed: boolean;
+  emoteJustPressed: boolean;
+}
 
 export type MapId =
   | 'alpine-outpost'
@@ -712,3 +742,190 @@ export const TRAINING_LEVELS = [
     archetypeWeights: { rusher: 0.2, marksman: 0.25, flanker: 0.25, juggernaut: 0.3 },
   },
 ];
+
+export type DynamicEnvironmentEventId =
+  | 'cryo-blizzard'
+  | 'solar-sandstorm'
+  | 'bio-spore-bloom'
+  | 'magma-eruption'
+  | 'aurora-emp-surge';
+
+export interface DynamicEnvironmentEventDef {
+  id: DynamicEnvironmentEventId;
+  mapId: MapId;
+  name: string;
+  subtitle: string;
+  accentColor: string;
+  fogHex: number;
+  fogDensityMult: number;
+  sunIntensityMult: number;
+  particleHex: number;
+  windDriftX: number;
+  windDriftZ: number;
+  speedMultiplier: number;
+  damageMultiplier: number;
+  shieldRegenBonus: number;
+  hpRegenBonus: number;
+  jumpMultiplier: number;
+  disruptEnemyShields: boolean;
+}
+
+export const DYNAMIC_ENVIRONMENT_EVENTS: Record<MapId, DynamicEnvironmentEventDef> = {
+  'alpine-outpost': {
+    id: 'cryo-blizzard',
+    mapId: 'alpine-outpost',
+    name: 'CRYO-BLIZZARD SQUALL',
+    subtitle: '+40% Shield Recharge · Icy Crosswind · Frost Visibility Shift',
+    accentColor: '#38bdf8',
+    fogHex: 0xcbd5e1,
+    fogDensityMult: 1.75,
+    sunIntensityMult: 0.72,
+    particleHex: 0xe0f2fe,
+    windDriftX: 0.9,
+    windDriftZ: 0.35,
+    speedMultiplier: 1.05,
+    damageMultiplier: 1.0,
+    shieldRegenBonus: 4.5,
+    hpRegenBonus: 0,
+    jumpMultiplier: 1.0,
+    disruptEnemyShields: false,
+  },
+  'dune-refinery': {
+    id: 'solar-sandstorm',
+    mapId: 'dune-refinery',
+    name: 'SOLAR SILICA SANDSTORM',
+    subtitle: '+18% Sprint & Slide Velocity · Thermal Target Lock · Amber Dust Wall',
+    accentColor: '#f59e0b',
+    fogHex: 0xd97706,
+    fogDensityMult: 1.85,
+    sunIntensityMult: 0.78,
+    particleHex: 0xfbbf24,
+    windDriftX: -1.1,
+    windDriftZ: 0.4,
+    speedMultiplier: 1.18,
+    damageMultiplier: 1.08,
+    shieldRegenBonus: 1.5,
+    hpRegenBonus: 0,
+    jumpMultiplier: 1.0,
+    disruptEnemyShields: false,
+  },
+  'emerald-citadel': {
+    id: 'bio-spore-bloom',
+    mapId: 'emerald-citadel',
+    name: 'BIOLUMINESCENT SPORE BLOOM',
+    subtitle: '+6 HP/s Cellular Bio-Regen · +25% Salvage Yield · Spore Canopy',
+    accentColor: '#10b981',
+    fogHex: 0x059669,
+    fogDensityMult: 1.5,
+    sunIntensityMult: 0.88,
+    particleHex: 0x34d399,
+    windDriftX: 0.25,
+    windDriftZ: -0.25,
+    speedMultiplier: 1.08,
+    damageMultiplier: 1.05,
+    shieldRegenBonus: 2.0,
+    hpRegenBonus: 6.0,
+    jumpMultiplier: 1.05,
+    disruptEnemyShields: false,
+  },
+  'obsidian-foundry': {
+    id: 'magma-eruption',
+    mapId: 'obsidian-foundry',
+    name: 'THERMAL MAGMA ERUPTION',
+    subtitle: '+25% Ballistic Damage Overcharge · Thermal Updraft (+22% Jump) · Ember Rain',
+    accentColor: '#ef4444',
+    fogHex: 0x991b1b,
+    fogDensityMult: 1.6,
+    sunIntensityMult: 1.35,
+    particleHex: 0xf97316,
+    windDriftX: 0.4,
+    windDriftZ: -0.5,
+    speedMultiplier: 1.06,
+    damageMultiplier: 1.25,
+    shieldRegenBonus: 1.0,
+    hpRegenBonus: 0,
+    jumpMultiplier: 1.22,
+    disruptEnemyShields: false,
+  },
+  'cryo-spire': {
+    id: 'aurora-emp-surge',
+    mapId: 'cryo-spire',
+    name: 'AURORA EMP IONIC SURGE',
+    subtitle: 'Shatters Hostile Energy Shields · -40% Ability Cooldown · Ionized Sky',
+    accentColor: '#22d3ee',
+    fogHex: 0x0891b2,
+    fogDensityMult: 1.4,
+    sunIntensityMult: 1.3,
+    particleHex: 0x67e8f9,
+    windDriftX: -0.5,
+    windDriftZ: 0.5,
+    speedMultiplier: 1.12,
+    damageMultiplier: 1.15,
+    shieldRegenBonus: 5.0,
+    hpRegenBonus: 2.5,
+    jumpMultiplier: 1.1,
+    disruptEnemyShields: true,
+  },
+};
+
+export interface ReplayHighlightMarker {
+  id: string;
+  timestamp: number;
+  frameIndex: number;
+  type: 'ELIMINATION' | 'HEADSHOT' | 'WALL_BUILT' | 'ENV_EVENT' | 'ABILITY' | 'WAVE_CLEAR';
+  label: string;
+  colorHex: string;
+}
+
+export interface ReplayFrameSnapshot {
+  timestamp: number;
+  playerX: number;
+  playerY: number;
+  playerZ: number;
+  playerYaw: number;
+  playerPitch: number;
+  eyeHeight: number;
+  hp: number;
+  shield: number;
+  score: number;
+  eliminations: number;
+  movementMode: PlayerPhysicsState['movementMode'];
+  firedShot: boolean;
+  activeEventId: DynamicEnvironmentEventId | null;
+  npcs: Array<{
+    id: string;
+    callsign: string;
+    archetype: NpcArchetype;
+    x: number;
+    y: number;
+    z: number;
+    rotY: number;
+    hp: number;
+    maxHp: number;
+    state: NpcEntity['state'];
+  }>;
+  walls: Array<{
+    id: string;
+    type: WallType;
+    x: number;
+    y: number;
+    z: number;
+    rotY: number;
+    hp: number;
+  }>;
+}
+
+export interface MatchReplayRecording {
+  id: string;
+  mapId: MapId;
+  trainingLevel: number;
+  callsign: string;
+  weaponId: WeaponId;
+  skinId: SkinId;
+  durationSec: number;
+  finalScore: number;
+  finalEliminations: number;
+  frames: ReplayFrameSnapshot[];
+  highlights: ReplayHighlightMarker[];
+}
+

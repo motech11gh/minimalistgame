@@ -19,6 +19,10 @@ import {
   ObstacleBox,
   BuiltWallEntity,
   NpcEntity,
+  DYNAMIC_ENVIRONMENT_EVENTS,
+  DynamicEnvironmentEventDef,
+  ReplayFrameSnapshot,
+  MatchReplayRecording,
 } from './types';
 
 export function computeWeaponStats(
@@ -114,6 +118,8 @@ export interface MovementInput {
   jumpJustPressed: boolean;
   jumpHeld: boolean;
   speedMultiplier?: number;
+  jumpMultiplier?: number;
+  smartParkour?: boolean;
 }
 
 /**
@@ -130,6 +136,7 @@ export function evaluateMovementPhysics(
   const dt = Math.min(rawDt, 0.05);
   const next: PlayerPhysicsState = { ...state };
   const speedMult = input.speedMultiplier ?? 1.0;
+  const jumpMult = input.jumpMultiplier ?? 1.0;
 
   // Timers
   next.coyoteTimer = next.grounded ? 0.11 : Math.max(0, next.coyoteTimer - dt);
@@ -219,18 +226,21 @@ export function evaluateMovementPhysics(
     }
   }
 
-  // Vaulting / Climbing / Jumping
-  if (input.jumpHeld && frontClimbable && input.forward > 0.1) {
+  // Vaulting / Climbing / Jumping (supports Smart Auto-Parkour when moving forward into cover)
+  const autoClimb = Boolean(input.smartParkour && input.forward > 0.72);
+  const autoVault = Boolean(input.smartParkour && input.forward > 0.65 && next.grounded);
+
+  if ((input.jumpHeld || autoClimb) && frontClimbable && input.forward > 0.1) {
     // Climbing tall obstacle/rampart
     next.isClimbing = true;
     next.isVaulting = false;
     next.isSliding = false;
     next.grounded = false;
-    next.vy = 5.4;
+    next.vy = 5.4 * jumpMult;
     next.vx = forwardX * 2.2;
     next.vz = forwardZ * 2.2;
   } else if (
-    (next.jumpBufferTimer > 0 || (input.jumpHeld && input.forward > 0.2)) &&
+    (next.jumpBufferTimer > 0 || (input.jumpHeld && input.forward > 0.2) || autoVault) &&
     frontVaultable &&
     next.y < frontVaultable.y + frontVaultable.height - 0.1
   ) {
@@ -241,12 +251,12 @@ export function evaluateMovementPhysics(
     next.vaultTimer = 0.28;
     next.jumpBufferTimer = 0;
     next.grounded = false;
-    next.vy = 6.8;
+    next.vy = 6.8 * jumpMult;
     next.vx = forwardX * 8.5;
     next.vz = forwardZ * 8.5;
   } else if (next.jumpBufferTimer > 0 && next.coyoteTimer > 0) {
     // Standard Jump
-    next.vy = 8.4;
+    next.vy = 8.4 * jumpMult;
     next.grounded = false;
     next.coyoteTimer = 0;
     next.jumpBufferTimer = 0;
@@ -526,6 +536,317 @@ export function stepAiDecisionPolicy(
     nextVz: moveZ,
     nextRotY: targetRotY,
     nextState,
-    triggerFire,
+    triggerFire: triggerFire,
   };
 }
+
+/**
+ * Applies a scaled radial/axial deadzone so slight analog stick drift is ignored
+ * while preserving smooth 0..1 ramp above the threshold.
+ */
+export function applyThumbstickDeadzone(value: number, deadzone = 0.16): number {
+  const abs = Math.abs(value);
+  if (abs <= deadzone) return 0;
+  const sign = value >= 0 ? 1 : -1;
+  const normalized = (abs - deadzone) / Math.max(0.0001, 1 - deadzone);
+  return sign * Math.min(1, normalized);
+}
+
+export interface ParsedGamepadFrame {
+  moveRight: number;
+  moveForward: number;
+  lookYawDelta: number;
+  lookPitchDelta: number;
+  fireHeld: boolean;
+  adsHeld: boolean;
+  sprintHeld: boolean;
+  jumpHeld: boolean;
+  jumpJustPressed: boolean;
+  slideJustPressed: boolean;
+  reloadOrHarvestJustPressed: boolean;
+  abilityJustPressed: boolean;
+  stimJustPressed: boolean;
+  buildJustPressed: boolean;
+  emoteJustPressed: boolean;
+  pauseJustPressed: boolean;
+  wallSelectSlot: 1 | 2 | 3 | null;
+  anyActiveInput: boolean;
+  nextPressedButtons: boolean[];
+}
+
+/**
+ * Parses W3C Standard Gamepad layout (Xbox / PlayStation DualSense / Switch Pro)
+ * into unified held & edge-triggered actions.
+ */
+export function parseStandardGamepadState(
+  axes: readonly number[],
+  buttons: ReadonlyArray<{ pressed: boolean; value: number }>,
+  prevPressed: readonly boolean[] = [],
+  deadzone = 0.16
+): ParsedGamepadFrame {
+  const lx = applyThumbstickDeadzone(axes[0] ?? 0, deadzone);
+  // Standard gamepad axis[1] is -1 up (forward), +1 down (backward)
+  const ly = applyThumbstickDeadzone(-(axes[1] ?? 0), deadzone);
+  const rx = applyThumbstickDeadzone(axes[2] ?? 0, deadzone);
+  const ry = applyThumbstickDeadzone(-(axes[3] ?? 0), deadzone);
+
+  const isPressed = (idx: number) => {
+    const b = buttons[idx];
+    if (!b) return false;
+    return Boolean(b.pressed || b.value > 0.35);
+  };
+
+  const justPressed = (idx: number) => isPressed(idx) && !prevPressed[idx];
+
+  const nextPressedButtons: boolean[] = [];
+  let anyBtnPressed = false;
+  for (let i = 0; i < Math.max(buttons.length, 17); i++) {
+    const p = isPressed(i);
+    nextPressedButtons[i] = p;
+    if (p) anyBtnPressed = true;
+  }
+
+  let wallSelectSlot: 1 | 2 | 3 | null = null;
+  if (justPressed(14)) wallSelectSlot = 1; // D-Pad Left -> Barricade
+  else if (justPressed(12)) wallSelectSlot = 2; // D-Pad Up -> Rampart
+  else if (justPressed(15)) wallSelectSlot = 3; // D-Pad Right -> Bastion
+
+  const anyStickMoved =
+    Math.abs(lx) > 0.01 ||
+    Math.abs(ly) > 0.01 ||
+    Math.abs(rx) > 0.01 ||
+    Math.abs(ry) > 0.01;
+
+  return {
+    moveRight: lx,
+    moveForward: ly,
+    lookYawDelta: rx,
+    lookPitchDelta: ry,
+    fireHeld: isPressed(7), // RT / R2
+    adsHeld: isPressed(6), // LT / L2
+    sprintHeld: isPressed(10) || ly > 0.88, // L3 or full forward tilt
+    jumpHeld: isPressed(0), // A / Cross
+    jumpJustPressed: justPressed(0),
+    slideJustPressed: justPressed(1), // B / Circle
+    reloadOrHarvestJustPressed: justPressed(2), // X / Square
+    abilityJustPressed: justPressed(3), // Y / Triangle
+    stimJustPressed: justPressed(4), // LB / L1
+    buildJustPressed: justPressed(5), // RB / R1
+    emoteJustPressed: justPressed(13), // D-Pad Down
+    pauseJustPressed: justPressed(9), // Start / Options
+    wallSelectSlot,
+    anyActiveInput: anyStickMoved || anyBtnPressed,
+    nextPressedButtons,
+  };
+}
+
+/**
+ * Evaluates Smart Target Magnetism & Aim Assist for smooth cross-platform play.
+ * Gently pulls yaw/pitch toward the closest hostile within the acquisition cone
+ * and signals whether the reticle is tightly locked for Smart Auto-Fire.
+ */
+export function evaluateSmartAimAssist(
+  player: { x: number; y: number; z: number; eyeHeight: number; yaw: number; pitch: number },
+  npcs: ReadonlyArray<Pick<NpcEntity, 'id' | 'x' | 'y' | 'z' | 'hp' | 'state'>>,
+  maxRange: number,
+  dt: number,
+  assistStrength = 6.5
+): {
+  nextYaw: number;
+  nextPitch: number;
+  lockedTargetId: string | null;
+  shouldAutoFire: boolean;
+} {
+  const eyeX = player.x;
+  const eyeY = player.y + player.eyeHeight;
+  const eyeZ = player.z;
+
+  // Player look unit vector from yaw & pitch (Three.js YXZ convention: -Z is forward at yaw=0)
+  const cosPitch = Math.cos(player.pitch);
+  const lookX = -Math.sin(player.yaw) * cosPitch;
+  const lookY = Math.sin(player.pitch);
+  const lookZ = -Math.cos(player.yaw) * cosPitch;
+
+  let bestNpc: Pick<NpcEntity, 'id' | 'x' | 'y' | 'z' | 'hp' | 'state'> | null = null;
+  let bestScore = -Infinity;
+  let bestYawErr = 0;
+  let bestPitchErr = 0;
+  let bestAngle = Infinity;
+
+  for (const npc of npcs) {
+    if (npc.hp <= 0 || npc.state === 'ko') continue;
+    const tx = npc.x - eyeX;
+    const ty = npc.y + 1.38 - eyeY; // Aim at upper torso / neck
+    const tz = npc.z - eyeZ;
+    const dist = Math.hypot(tx, ty, tz);
+    if (dist < 0.5 || dist > maxRange) continue;
+
+    const dirX = tx / dist;
+    const dirY = ty / dist;
+    const dirZ = tz / dist;
+
+    const dot = Math.max(-1, Math.min(1, lookX * dirX + lookY * dirY + lookZ * dirZ));
+    const angle = Math.acos(dot);
+
+    // Acquisition cone of ~13.5 degrees (0.235 rad)
+    if (angle <= 0.235) {
+      const score = (0.24 - angle) * 100 - dist * 0.15;
+      if (score > bestScore) {
+        bestScore = score;
+        bestNpc = npc;
+        bestAngle = angle;
+
+        const targetYaw = Math.atan2(-tx, -tz);
+        let dyaw = targetYaw - player.yaw;
+        while (dyaw > Math.PI) dyaw -= Math.PI * 2;
+        while (dyaw < -Math.PI) dyaw += Math.PI * 2;
+        bestYawErr = dyaw;
+
+        const targetPitch = Math.asin(Math.max(-1, Math.min(1, dirY)));
+        bestPitchErr = targetPitch - player.pitch;
+      }
+    }
+  }
+
+  if (!bestNpc) {
+    return {
+      nextYaw: player.yaw,
+      nextPitch: player.pitch,
+      lockedTargetId: null,
+      shouldAutoFire: false,
+    };
+  }
+
+  const pull = 1 - Math.exp(-assistStrength * Math.min(dt, 0.05));
+  const nextYaw = player.yaw + bestYawErr * pull;
+  const nextPitch = Math.max(
+    -1.25,
+    Math.min(1.25, player.pitch + bestPitchErr * pull)
+  );
+
+  return {
+    nextYaw,
+    nextPitch,
+    lockedTargetId: bestNpc.id,
+    shouldAutoFire: bestAngle <= 0.052,
+  };
+}
+
+/**
+ * Steps Dynamic Environment Event lifecycle for a given biome mapId.
+ */
+export function stepDynamicEnvironmentEventState(
+  mapId: MapId,
+  activeTimer: number,
+  cooldownTimer: number,
+  dt: number,
+  forceTrigger = false
+): {
+  activeEvent: DynamicEnvironmentEventDef | null;
+  nextActiveTimer: number;
+  nextCooldownTimer: number;
+  justTriggered: boolean;
+} {
+  const eventDef = DYNAMIC_ENVIRONMENT_EVENTS[mapId] || DYNAMIC_ENVIRONMENT_EVENTS['alpine-outpost'];
+
+  if (forceTrigger) {
+    return {
+      activeEvent: eventDef,
+      nextActiveTimer: 16.0,
+      nextCooldownTimer: 18.0,
+      justTriggered: true,
+    };
+  }
+
+  if (activeTimer > 0) {
+    const nextActive = Math.max(0, activeTimer - dt);
+    return {
+      activeEvent: nextActive > 0 ? eventDef : null,
+      nextActiveTimer: nextActive,
+      nextCooldownTimer: nextActive > 0 ? cooldownTimer : 18.0,
+      justTriggered: false,
+    };
+  }
+
+  const nextCooldown = Math.max(0, cooldownTimer - dt);
+  if (nextCooldown <= 0) {
+    return {
+      activeEvent: eventDef,
+      nextActiveTimer: 16.0,
+      nextCooldownTimer: 18.0,
+      justTriggered: true,
+    };
+  }
+
+  return {
+    activeEvent: null,
+    nextActiveTimer: 0,
+    nextCooldownTimer: nextCooldown,
+    justTriggered: false,
+  };
+}
+
+/**
+ * Smoothly interpolates between recorded Match Replay keyframes for 60fps playback
+ * at any playback speed (0.5x, 1x, 2x) or timeline scrub position.
+ */
+export function interpolateReplayFrames(
+  recording: MatchReplayRecording,
+  targetTimeSec: number
+): ReplayFrameSnapshot | null {
+  const frames = recording.frames;
+  if (!frames || frames.length === 0) return null;
+  if (frames.length === 1 || targetTimeSec <= frames[0].timestamp) {
+    return frames[0];
+  }
+  const last = frames[frames.length - 1];
+  if (targetTimeSec >= last.timestamp) {
+    return last;
+  }
+
+  // Binary search or linear scan for bounding frames
+  let idx = 0;
+  for (let i = 0; i < frames.length - 1; i++) {
+    if (frames[i + 1].timestamp >= targetTimeSec) {
+      idx = i;
+      break;
+    }
+  }
+
+  const f0 = frames[idx];
+  const f1 = frames[idx + 1];
+  const span = Math.max(0.0001, f1.timestamp - f0.timestamp);
+  const alpha = Math.max(0, Math.min(1, (targetTimeSec - f0.timestamp) / span));
+
+  // Shortest-angle yaw interpolation
+  let dyaw = f1.playerYaw - f0.playerYaw;
+  while (dyaw > Math.PI) dyaw -= Math.PI * 2;
+  while (dyaw < -Math.PI) dyaw += Math.PI * 2;
+
+  const interpNpcs = f0.npcs.map((n0) => {
+    const n1 = f1.npcs.find((cand) => cand.id === n0.id);
+    if (!n1) return n0;
+    return {
+      ...n1,
+      x: n0.x + (n1.x - n0.x) * alpha,
+      y: n0.y + (n1.y - n0.y) * alpha,
+      z: n0.z + (n1.z - n0.z) * alpha,
+      rotY: n0.rotY + (n1.rotY - n0.rotY) * alpha,
+    };
+  });
+
+  return {
+    ...f0,
+    timestamp: targetTimeSec,
+    playerX: f0.playerX + (f1.playerX - f0.playerX) * alpha,
+    playerY: f0.playerY + (f1.playerY - f0.playerY) * alpha,
+    playerZ: f0.playerZ + (f1.playerZ - f0.playerZ) * alpha,
+    playerYaw: f0.playerYaw + dyaw * alpha,
+    playerPitch: f0.playerPitch + (f1.playerPitch - f0.playerPitch) * alpha,
+    eyeHeight: f0.eyeHeight + (f1.eyeHeight - f0.eyeHeight) * alpha,
+    firedShot: f0.firedShot || f1.firedShot,
+    npcs: interpNpcs,
+  };
+}
+
+

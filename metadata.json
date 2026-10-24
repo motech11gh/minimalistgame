@@ -2,5 +2,7 @@
   "name": "Apex Vanguard: Bio-Tactical FPS",
   "description": "A first-person tactical multiplayer shooter featuring 5 photorealistic biomes, progressive AI training tiers, customizable weapon attachments, defensive wall building, sliding/vaulting/climbing movement mechanics, and PubChem/ChEMBL bioscience combat stimulants.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

@@ -23,6 +23,15 @@ import {
   ProjectedOpponentOverlay,
   SalvageNode,
   BuiltWallEntity,
+  ActiveInputDevice,
+  VirtualTouchInputState,
+  SmartControlConfig,
+  DYNAMIC_ENVIRONMENT_EVENTS,
+  DynamicEnvironmentEventDef,
+  ReplayCameraMode,
+  ReplayFrameSnapshot,
+  ReplayHighlightMarker,
+  MatchReplayRecording,
 } from './types';
 import {
   computeWeaponStats,
@@ -31,6 +40,11 @@ import {
   canBuildWall,
   computeTrainingWaveConfig,
   stepAiDecisionPolicy,
+  parseStandardGamepadState,
+  ParsedGamepadFrame,
+  evaluateSmartAimAssist,
+  stepDynamicEnvironmentEventState,
+  interpolateReplayFrames,
 } from './rules';
 import { soundEngine } from './sound';
 
@@ -62,6 +76,15 @@ export interface HudTelemetrySnapshot {
   hitMarkerActive: boolean;
   killMarkerActive: boolean;
   damageVignetteIntensity: number;
+  smartTargetLocked: boolean;
+  activeEnvironmentEvent: {
+    id: string;
+    name: string;
+    subtitle: string;
+    accentColor: string;
+    remainingSec: number;
+  } | null;
+  nextEventCooldownSec: number;
   opponentsOverlay: ProjectedOpponentOverlay[];
   minimapEntities: {
     playerX: number;
@@ -116,8 +139,16 @@ interface ThreeArenaProps {
   remoteOperators: RemoteSquadOperator[];
   sharedWalls: BuiltWallEntity[];
   restartNonce: number;
+  smartControl: SmartControlConfig;
+  triggerEventNonce: number;
+  replayRecording: MatchReplayRecording | null;
+  replayTimeSec: number;
+  replayCameraMode: ReplayCameraMode;
+  touchInputRef: React.MutableRefObject<VirtualTouchInputState>;
+  onDetectedInputDevice?: (device: ActiveInputDevice, gamepadLabel?: string | null) => void;
   onSelectWallType: (type: WallType) => void;
   onHudUpdate: (snapshot: HudTelemetrySnapshot) => void;
+  onReplayUpdated: (recording: MatchReplayRecording) => void;
   onStateChange: (
     nextState: GameState,
     outcome?: {
@@ -638,7 +669,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     rebuildBiome?: (mapId: MapId) => void;
     rebuildWeaponMesh?: () => void;
     resetSession?: () => void;
-    triggerEmote?: (emoteId: EmoteId) => void;
+    forceTriggerEnvironmentEvent?: () => void;
   }>({});
 
   // Trigger biome rebuild when mapId changes
@@ -662,6 +693,13 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
   useEffect(() => {
     internalRef.current.resetSession?.();
   }, [props.restartNonce, props.trainingLevel]);
+
+  // Trigger dynamic environment event when requested from UI
+  useEffect(() => {
+    if (props.triggerEventNonce > 0) {
+      internalRef.current.forceTriggerEnvironmentEvent?.();
+    }
+  }, [props.triggerEventNonce]);
 
   useEffect(() => {
     const container = mountRef.current;
@@ -805,6 +843,39 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     wallPreviewMesh.visible = false;
     scene.add(wallPreviewMesh);
 
+    // 3D Dynamic Weather Particle InstancedMesh (42 atmospheric particles)
+    const WEATHER_CAP = 42;
+    const weatherGeo = new THREE.OctahedronGeometry(0.14, 0);
+    const weatherMat = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.78,
+    });
+    const weatherInstanced = new THREE.InstancedMesh(weatherGeo, weatherMat, WEATHER_CAP);
+    weatherInstanced.frustumCulled = false;
+    weatherInstanced.visible = false;
+    scene.add(weatherInstanced);
+
+    const weatherPool = Array.from({ length: WEATHER_CAP }, (_, i) => ({
+      offsetX: ((i * 19) % 36) - 18,
+      offsetY: (i * 7) % 14,
+      offsetZ: ((i * 23) % 36) - 18,
+      fallSpeed: 3.2 + (i % 4) * 1.1,
+    }));
+
+    // 3D Local Player Avatar for 3rd-Person Match Replay Camera Modes
+    const replayOperatorAvatar = buildOperatorCharacterGroup(
+      'SQUAD',
+      contactShadowTex,
+      {
+        primary: OPERATOR_SKINS[propsRef.current.skinId]?.primaryHex || '#1e293b',
+        secondary: OPERATOR_SKINS[propsRef.current.skinId]?.secondaryHex || '#334155',
+        visor: OPERATOR_SKINS[propsRef.current.skinId]?.visorHex || '#f59e0b',
+      }
+    );
+    replayOperatorAvatar.root.visible = false;
+    scene.add(replayOperatorAvatar.root);
+
     // Static obstacles & dynamic built walls
     let staticObstacles: ObstacleBox[] = [];
     let localBuiltWalls: BuiltWallEntity[] = [];
@@ -876,6 +947,198 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     let killMarkerTimer = 0;
     let damageVignette = 0;
     let sessionEnded = false;
+    let smartTargetLocked = false;
+    let firedThisStep = false;
+
+    // Dynamic Environment Event State
+    let activeEnvEvent: DynamicEnvironmentEventDef | null = null;
+    let envEventActiveTimer = 0;
+    let envEventCooldownTimer = 6.5; // First dynamic biome event triggers 6.5s into combat
+    let pendingForceEnvEvent = false;
+
+    // Match Replay Recording Buffers
+    let matchElapsedSec = 0;
+    let lastReplayCaptureSec = -1;
+    let replayFrames: ReplayFrameSnapshot[] = [];
+    let replayHighlights: ReplayHighlightMarker[] = [];
+
+    function recordReplayHighlight(
+      type: ReplayHighlightMarker['type'],
+      label: string,
+      colorHex: string
+    ) {
+      replayHighlights.push({
+        id: `hl-${Date.now()}-${replayHighlights.length}`,
+        timestamp: Number(matchElapsedSec.toFixed(2)),
+        frameIndex: Math.max(0, replayFrames.length - 1),
+        type,
+        label,
+        colorHex,
+      });
+    }
+
+    function captureReplayFrame(forceCapture = false) {
+      if (!forceCapture && matchElapsedSec - lastReplayCaptureSec < 0.12) return;
+      lastReplayCaptureSec = matchElapsedSec;
+      const snap: ReplayFrameSnapshot = {
+        timestamp: Number(matchElapsedSec.toFixed(2)),
+        playerX: Number(playerState.x.toFixed(2)),
+        playerY: Number(playerState.y.toFixed(2)),
+        playerZ: Number(playerState.z.toFixed(2)),
+        playerYaw: Number(playerState.yaw.toFixed(3)),
+        playerPitch: Number(playerState.pitch.toFixed(3)),
+        eyeHeight: Number(playerState.eyeHeight.toFixed(2)),
+        hp: Math.round(playerHp),
+        shield: Math.round(playerShield),
+        score: Math.round(playerScore),
+        eliminations: playerEliminations,
+        movementMode: playerState.movementMode,
+        firedShot: firedThisStep,
+        activeEventId: activeEnvEvent ? activeEnvEvent.id : null,
+        npcs: npcs.map((n) => ({
+          id: n.id,
+          callsign: n.callsign,
+          archetype: n.archetype,
+          x: Number(n.x.toFixed(2)),
+          y: Number(n.y.toFixed(2)),
+          z: Number(n.z.toFixed(2)),
+          rotY: Number(n.rotY.toFixed(2)),
+          hp: Math.round(n.hp),
+          maxHp: Math.round(n.maxHp),
+          state: n.state,
+        })),
+        walls: localBuiltWalls.map((w) => ({
+          id: w.id,
+          type: w.type,
+          x: Number(w.x.toFixed(2)),
+          y: Number(w.y.toFixed(2)),
+          z: Number(w.z.toFixed(2)),
+          rotY: Number(w.rotY.toFixed(2)),
+          hp: Math.round(w.hp),
+        })),
+      };
+      firedThisStep = false;
+      replayFrames.push(snap);
+      if (replayFrames.length > 600) {
+        replayFrames.shift();
+      }
+    }
+
+    function publishReplayRecording() {
+      const p = propsRef.current;
+      let framesToPublish = [...replayFrames];
+      let highlightsToPublish = [...replayHighlights];
+
+      // If fewer than 4 frames have been recorded yet, synthesize a 12s Tactical Highlight Replay
+      // so the player can test and scrub 3D Match Replay immediately from the Lobby or early match.
+      if (framesToPublish.length < 4) {
+        const envDef = DYNAMIC_ENVIRONMENT_EVENTS[p.mapId] || DYNAMIC_ENVIRONMENT_EVENTS['alpine-outpost'];
+        framesToPublish = Array.from({ length: 41 }, (_, idx) => {
+          const t = Number((idx * 0.3).toFixed(2));
+          const progress = idx / 40;
+          const px = Math.sin(progress * Math.PI * 1.5) * 6.5;
+          const pz = 20 - progress * 18;
+          const py = getTerrainHeight(px, pz, p.mapId);
+          return {
+            timestamp: t,
+            playerX: Number(px.toFixed(2)),
+            playerY: Number(py.toFixed(2)),
+            playerZ: Number(pz.toFixed(2)),
+            playerYaw: Number((Math.sin(progress * Math.PI * 2) * 0.35).toFixed(3)),
+            playerPitch: Number((Math.cos(progress * Math.PI * 3) * 0.08).toFixed(3)),
+            eyeHeight: idx >= 14 && idx <= 18 ? 0.9 : 1.72,
+            hp: Math.max(65, 100 - idx),
+            shield: 50,
+            score: idx * 25,
+            eliminations: idx >= 30 ? 2 : idx >= 18 ? 1 : 0,
+            movementMode: idx >= 14 && idx <= 18 ? 'SLIDE' : 'SPRINT',
+            firedShot: idx % 4 === 0,
+            activeEventId: idx >= 10 ? envDef.id : null,
+            npcs: npcs.map((n, nIdx) => ({
+              id: n.id,
+              callsign: n.callsign,
+              archetype: n.archetype,
+              x: Number((n.x + Math.sin(progress * 4 + nIdx) * 3.5).toFixed(2)),
+              y: Number(n.y.toFixed(2)),
+              z: Number((n.z + progress * 6).toFixed(2)),
+              rotY: Number(n.rotY.toFixed(2)),
+              hp: nIdx === 0 && idx >= 18 ? 0 : nIdx === 1 && idx >= 30 ? 0 : n.maxHp,
+              maxHp: n.maxHp,
+              state:
+                (nIdx === 0 && idx >= 18) || (nIdx === 1 && idx >= 30)
+                  ? 'ko'
+                  : idx % 7 === 0
+                    ? 'windup'
+                    : 'seek',
+            })),
+            walls: localBuiltWalls.map((w) => ({
+              id: w.id,
+              type: w.type,
+              x: w.x,
+              y: w.y,
+              z: w.z,
+              rotY: w.rotY,
+              hp: w.hp,
+            })),
+          };
+        });
+        highlightsToPublish = [
+          {
+            id: 'hl-demo-1',
+            timestamp: 2.1,
+            frameIndex: 7,
+            type: 'WALL_BUILT',
+            label: 'Built Ballistic Barricade',
+            colorHex: '#38bdf8',
+          },
+          {
+            id: 'hl-demo-2',
+            timestamp: 3.0,
+            frameIndex: 10,
+            type: 'ENV_EVENT',
+            label: envDef.name,
+            colorHex: envDef.accentColor,
+          },
+          {
+            id: 'hl-demo-3',
+            timestamp: 5.4,
+            frameIndex: 18,
+            type: 'HEADSHOT',
+            label: 'Headshot RUSHER-01',
+            colorHex: '#f59e0b',
+          },
+          {
+            id: 'hl-demo-4',
+            timestamp: 9.0,
+            frameIndex: 30,
+            type: 'ELIMINATION',
+            label: 'Eliminated MARKSMAN-02',
+            colorHex: '#ef4444',
+          },
+        ];
+      }
+
+      const durationSec =
+        framesToPublish.length > 0
+          ? Math.max(0.5, framesToPublish[framesToPublish.length - 1].timestamp)
+          : 12.0;
+      p.onReplayUpdated({
+        id: `replay-${Date.now()}`,
+        mapId: p.mapId,
+        trainingLevel: p.trainingLevel,
+        callsign: p.callsign,
+        weaponId: p.weaponId,
+        skinId: p.skinId,
+        durationSec,
+        finalScore: Math.max(playerScore, framesToPublish[framesToPublish.length - 1]?.score ?? 0),
+        finalEliminations: Math.max(
+          playerEliminations,
+          framesToPublish[framesToPublish.length - 1]?.eliminations ?? 0
+        ),
+        frames: framesToPublish,
+        highlights: highlightsToPublish,
+      });
+    }
 
     // Build / Rebuild Biome Environment
     function buildBiomeScene(mapId: MapId) {
@@ -1273,6 +1536,14 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       stimCooldown = 0;
       stimActiveTimer = 0;
       sessionEnded = false;
+      activeEnvEvent = null;
+      envEventActiveTimer = 0;
+      envEventCooldownTimer = 6.5;
+      pendingForceEnvEvent = false;
+      matchElapsedSec = 0;
+      lastReplayCaptureSec = -1;
+      replayFrames = [];
+      replayHighlights = [];
 
       // Clear local built walls
       while (wallsGroup.children.length > 0) {
@@ -1282,11 +1553,16 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       localBuiltWalls = [];
 
       spawnWaveNpcs(1);
+      captureReplayFrame(true);
+      publishReplayRecording();
     }
 
     internalRef.current.rebuildBiome = buildBiomeScene;
     internalRef.current.rebuildWeaponMesh = rebuildWeaponViewModel;
     internalRef.current.resetSession = resetSession;
+    internalRef.current.forceTriggerEnvironmentEvent = () => {
+      pendingForceEnvEvent = true;
+    };
 
     buildBiomeScene(propsRef.current.mapId);
     rebuildWeaponViewModel();
@@ -1301,6 +1577,18 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     const keysJustPressed = new Set<string>();
     let mouseDown = false;
     let rightMouseDown = false;
+    let prevGamepadButtons: boolean[] = [];
+    let lastReportedDevice: ActiveInputDevice = 'pc';
+    let lastReportedGamepadId: string | null = null;
+
+    const reportDeviceIfChanged = (device: ActiveInputDevice, gamepadId?: string | null) => {
+      const normalizedGp = gamepadId ?? lastReportedGamepadId;
+      if (device !== lastReportedDevice || normalizedGp !== lastReportedGamepadId) {
+        lastReportedDevice = device;
+        lastReportedGamepadId = normalizedGp;
+        propsRef.current.onDetectedInputDevice?.(device, normalizedGp);
+      }
+    };
 
     const clearInputs = () => {
       keysHeld.clear();
@@ -1316,6 +1604,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       ) {
         return;
       }
+      reportDeviceIfChanged('pc');
       if (!keysHeld.has(e.code)) {
         keysJustPressed.add(e.code);
       }
@@ -1330,10 +1619,13 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
 
       if (e.code === 'Escape' || e.code === 'KeyP') {
         if (p.gameState === 'playing') {
+          publishReplayRecording();
           document.exitPointerLock?.();
           p.onStateChange('paused');
         } else if (p.gameState === 'paused') {
           p.onStateChange('playing');
+        } else if (p.gameState === 'replay') {
+          p.onStateChange('title');
         }
       } else if (e.code === 'Digit1') {
         p.onSelectWallType('barricade');
@@ -1341,6 +1633,8 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         p.onSelectWallType('rampart');
       } else if (e.code === 'Digit3') {
         p.onSelectWallType('bastion');
+      } else if (e.code === 'KeyH') {
+        pendingForceEnvEvent = true;
       }
     };
 
@@ -1348,10 +1642,19 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       keysHeld.delete(e.code);
     };
 
+    let lastTouchTimestamp = 0;
+
     const onMouseDown = (e: MouseEvent) => {
+      if (Date.now() - lastTouchTimestamp > 650) {
+        reportDeviceIfChanged('pc');
+      }
       if (propsRef.current.gameState !== 'playing') return;
       if (e.target === renderer.domElement) {
         if (e.button === 0) mouseDown = true;
+        if (e.button === 1) {
+          e.preventDefault();
+          keysJustPressed.add('KeyF'); // Middle mouse button quick-builds wall
+        }
         if (e.button === 2) rightMouseDown = true;
         renderer.domElement.requestPointerLock?.();
       }
@@ -1363,6 +1666,9 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     };
 
     const onMouseMove = (e: MouseEvent) => {
+      if (Date.now() - lastTouchTimestamp > 650 && (Math.abs(e.movementX) > 2 || Math.abs(e.movementY) > 2)) {
+        reportDeviceIfChanged('pc');
+      }
       if (propsRef.current.gameState !== 'playing') return;
       if (document.pointerLockElement === renderer.domElement || mouseDown || rightMouseDown) {
         const sens = rightMouseDown ? 0.0014 : 0.0022;
@@ -1373,6 +1679,29 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           1.25
         );
       }
+    };
+
+    const onWheel = (e: WheelEvent) => {
+      if (propsRef.current.gameState !== 'playing') return;
+      reportDeviceIfChanged('pc');
+      const order: WallType[] = ['barricade', 'rampart', 'bastion'];
+      const curIdx = order.indexOf(propsRef.current.selectedWallType);
+      const nextIdx = (curIdx + (e.deltaY > 0 ? 1 : 2)) % order.length;
+      propsRef.current.onSelectWallType(order[nextIdx]);
+    };
+
+    const onTouchStartGlobal = () => {
+      lastTouchTimestamp = Date.now();
+      reportDeviceIfChanged('touch');
+    };
+
+    const onGamepadConnected = (e: GamepadEvent) => {
+      reportDeviceIfChanged('console', e.gamepad?.id || 'Standard Controller');
+    };
+
+    const onGamepadDisconnected = () => {
+      lastReportedGamepadId = null;
+      reportDeviceIfChanged('pc', null);
     };
 
     const onContextMenu = (e: MouseEvent) => {
@@ -1395,6 +1724,10 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     window.addEventListener('mousedown', onMouseDown);
     window.addEventListener('mouseup', onMouseUp);
     window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('wheel', onWheel, { passive: true });
+    window.addEventListener('touchstart', onTouchStartGlobal, { passive: true });
+    window.addEventListener('gamepadconnected', onGamepadConnected);
+    window.addEventListener('gamepaddisconnected', onGamepadDisconnected);
     window.addEventListener('contextmenu', onContextMenu);
     window.addEventListener('blur', clearInputs);
     window.addEventListener('resize', onResize);
@@ -1436,6 +1769,12 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       };
       localBuiltWalls.push(newWall);
       spawnParticles(targetX, targetY + 1.0, targetZ, 14, 0x38bdf8, 5);
+      recordReplayHighlight(
+        'WALL_BUILT',
+        `Built ${blueprint.name}`,
+        blueprint.accentColor
+      );
+      captureReplayFrame(true);
 
       p.onSendMultiplayerUpdate({
         type: 'wall:build',
@@ -1455,6 +1794,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     const shootRaycaster = new THREE.Raycaster();
     function fireWeaponRound(stats: ReturnType<typeof computeWeaponStats>) {
       const p = propsRef.current;
+      firedThisStep = true;
       currentAmmo = Math.max(0, currentAmmo - 1);
       fireCooldown =
         abilityActiveTimer > 0 && p.weaponId === 'vx-carbine'
@@ -1471,6 +1811,8 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
 
       // Muzzle recoil impulse on weapon rig
       weaponRigGroup.position.z = 0.06;
+
+      const eventDmgMult = activeEnvEvent ? activeEnvEvent.damageMultiplier : 1.0;
 
       for (let pellet = 0; pellet < stats.pelletCount; pellet++) {
         const spreadScale = rightMouseDown ? 0.35 : playerState.isSliding ? 0.75 : 1.0;
@@ -1504,7 +1846,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         }
 
         if (closestNpc) {
-          let dmg = stats.damage + stats.bioDotDamage;
+          let dmg = Math.round((stats.damage + stats.bioDotDamage) * eventDmgMult);
           if (hitHead) dmg = Math.round(dmg * 1.5);
           if (abilityActiveTimer > 0 && p.weaponId === 'solaris-dmr') {
             dmg = Math.round(dmg * 1.35);
@@ -1538,6 +1880,12 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
             playerSalvage += 18;
             soundEngine.playHitMarker(true);
             spawnParticles(closestNpc.x, closestNpc.y + 1.2, closestNpc.z, 18, 0xf97316, 8);
+            recordReplayHighlight(
+              hitHead ? 'HEADSHOT' : 'ELIMINATION',
+              `${hitHead ? 'Headshot' : 'Eliminated'} ${closestNpc.callsign}`,
+              hitHead ? '#f59e0b' : '#ef4444'
+            );
+            captureReplayFrame(true);
           } else {
             soundEngine.playHitMarker(false);
           }
@@ -1625,10 +1973,86 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         }
       }
 
+      // Poll W3C Standard Gamepad API (Xbox / PlayStation DualSense / Switch Pro)
+      let gpFrame: ParsedGamepadFrame = {
+        moveRight: 0,
+        moveForward: 0,
+        lookYawDelta: 0,
+        lookPitchDelta: 0,
+        fireHeld: false,
+        adsHeld: false,
+        sprintHeld: false,
+        jumpHeld: false,
+        jumpJustPressed: false,
+        slideJustPressed: false,
+        reloadOrHarvestJustPressed: false,
+        abilityJustPressed: false,
+        stimJustPressed: false,
+        buildJustPressed: false,
+        emoteJustPressed: false,
+        pauseJustPressed: false,
+        wallSelectSlot: null,
+        anyActiveInput: false,
+        nextPressedButtons: [],
+      };
+
+      if (typeof navigator !== 'undefined' && typeof navigator.getGamepads === 'function') {
+        const pads = navigator.getGamepads();
+        const activePad = pads ? Array.from(pads).find((pad) => pad && pad.connected) : null;
+        if (activePad) {
+          gpFrame = parseStandardGamepadState(
+            activePad.axes,
+            activePad.buttons,
+            prevGamepadButtons
+          );
+          prevGamepadButtons = gpFrame.nextPressedButtons;
+          if (gpFrame.anyActiveInput) {
+            reportDeviceIfChanged('console', activePad.id || 'Console Controller');
+          }
+        }
+      }
+
+      const touch = p.touchInputRef.current;
+      const anyTouchActive =
+        Math.abs(touch.moveX) > 0.01 ||
+        Math.abs(touch.moveY) > 0.01 ||
+        Math.abs(touch.lookDeltaX) > 0.01 ||
+        Math.abs(touch.lookDeltaY) > 0.01 ||
+        touch.fireHeld ||
+        touch.adsHeld ||
+        touch.jumpJustPressed ||
+        touch.slideJustPressed ||
+        touch.reloadJustPressed ||
+        touch.abilityJustPressed ||
+        touch.buildJustPressed ||
+        touch.harvestJustPressed ||
+        touch.stimJustPressed ||
+        touch.emoteJustPressed;
+      if (anyTouchActive) {
+        reportDeviceIfChanged('touch');
+      }
+
+      // Handle Gamepad Start / A button in Title, Paused, or GameOver states
+      if (p.gameState === 'title' && (gpFrame.pauseJustPressed || gpFrame.jumpJustPressed)) {
+        p.onStateChange('playing');
+      } else if (p.gameState === 'paused' && gpFrame.pauseJustPressed) {
+        p.onStateChange('playing');
+      } else if (p.gameState === 'playing' && gpFrame.pauseJustPressed) {
+        publishReplayRecording();
+        document.exitPointerLock?.();
+        p.onStateChange('paused');
+      }
+
+      if (gpFrame.wallSelectSlot === 1) p.onSelectWallType('barricade');
+      else if (gpFrame.wallSelectSlot === 2) p.onSelectWallType('rampart');
+      else if (gpFrame.wallSelectSlot === 3) p.onSelectWallType('bastion');
+
       // Stage 1: Title Screen Live World Camera Spline Flyover
       if (p.gameState === 'title') {
         weaponRigGroup.visible = false;
         wallPreviewMesh.visible = false;
+        replayOperatorAvatar.root.visible = false;
+        weatherInstanced.visible = false;
         const orbitAngle = elapsed * 0.18;
         const camRadius = 32;
         const targetCamX = Math.sin(orbitAngle) * camRadius;
@@ -1636,8 +2060,116 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         const targetCamY = getTerrainHeight(targetCamX, targetCamZ, p.mapId) + 9.5;
         camera.position.lerp(_vec3A.set(targetCamX, targetCamY, targetCamZ), 1 - Math.exp(-4 * dt));
         camera.lookAt(0, 4.2, -16);
+      } else if (p.gameState === 'replay') {
+        // ===================================================================
+        // STAGE 5: 3D TACTICAL MATCH REPLAY ENGINE (FPV / ORBIT / DRONE CAM)
+        // ===================================================================
+        wallPreviewMesh.visible = false;
+        const activeRec = p.replayRecording;
+        const frameSnap = activeRec
+          ? interpolateReplayFrames(activeRec, p.replayTimeSec)
+          : null;
+
+        if (frameSnap) {
+          // Sync recorded NPCs
+          for (const recNpc of frameSnap.npcs) {
+            const meshEntry = npcMeshMap.get(recNpc.id);
+            if (!meshEntry) continue;
+            meshEntry.root.visible = recNpc.hp > 0 || recNpc.state === 'ko';
+            meshEntry.root.position.set(recNpc.x, recNpc.y, recNpc.z);
+            meshEntry.root.rotation.y = recNpc.rotY;
+            meshEntry.root.rotation.x = recNpc.hp <= 0 ? -Math.PI / 2 : 0;
+            meshEntry.telegraphRing.visible = recNpc.state === 'windup' && recNpc.hp > 0;
+          }
+
+          if (p.replayCameraMode === 'fpv') {
+            replayOperatorAvatar.root.visible = false;
+            weaponRigGroup.visible = true;
+            camera.position.set(
+              frameSnap.playerX,
+              frameSnap.playerY + frameSnap.eyeHeight,
+              frameSnap.playerZ
+            );
+            camera.rotation.order = 'YXZ';
+            camera.rotation.y = frameSnap.playerYaw;
+            camera.rotation.x = frameSnap.playerPitch;
+            camera.rotation.z = 0;
+          } else if (p.replayCameraMode === 'orbit') {
+            weaponRigGroup.visible = false;
+            replayOperatorAvatar.root.visible = true;
+            replayOperatorAvatar.root.position.set(
+              frameSnap.playerX,
+              frameSnap.playerY,
+              frameSnap.playerZ
+            );
+            replayOperatorAvatar.root.rotation.y = frameSnap.playerYaw + Math.PI;
+            const orbitYaw = frameSnap.playerYaw + Math.sin(elapsed * 0.45) * 0.4;
+            const camX = frameSnap.playerX + Math.sin(orbitYaw) * 6.8;
+            const camZ = frameSnap.playerZ + Math.cos(orbitYaw) * 6.8;
+            const camY = frameSnap.playerY + 3.4;
+            camera.position.lerp(_vec3A.set(camX, camY, camZ), 1 - Math.exp(-10 * dt));
+            camera.lookAt(
+              frameSnap.playerX,
+              frameSnap.playerY + 1.4,
+              frameSnap.playerZ
+            );
+          } else {
+            // Drone Overhead Tactical Overview
+            weaponRigGroup.visible = false;
+            replayOperatorAvatar.root.visible = true;
+            replayOperatorAvatar.root.position.set(
+              frameSnap.playerX,
+              frameSnap.playerY,
+              frameSnap.playerZ
+            );
+            replayOperatorAvatar.root.rotation.y = frameSnap.playerYaw + Math.PI;
+            camera.position.lerp(
+              _vec3A.set(frameSnap.playerX * 0.6, frameSnap.playerY + 22, frameSnap.playerZ + 18),
+              1 - Math.exp(-6 * dt)
+            );
+            camera.lookAt(frameSnap.playerX, frameSnap.playerY + 1.0, frameSnap.playerZ - 6);
+          }
+
+          if (frameSnap.firedShot) {
+            spawnParticles(
+              frameSnap.playerX - Math.sin(frameSnap.playerYaw) * 1.4,
+              frameSnap.playerY + 1.45,
+              frameSnap.playerZ - Math.cos(frameSnap.playerYaw) * 1.4,
+              2,
+              0xf59e0b,
+              4
+            );
+          }
+        }
       } else if (p.gameState === 'playing') {
+        replayOperatorAvatar.root.visible = false;
         weaponRigGroup.visible = true;
+
+        const isAdsActive = rightMouseDown || touch.adsHeld || gpFrame.adsHeld;
+        let isFireActive = mouseDown || touch.fireHeld || gpFrame.fireHeld;
+
+        // Apply Touch Look Deltas & Console Right-Stick Look Rotation
+        if (Math.abs(touch.lookDeltaX) > 0 || Math.abs(touch.lookDeltaY) > 0) {
+          const touchSens = isAdsActive ? 0.0028 : 0.0044;
+          playerState.yaw -= touch.lookDeltaX * touchSens;
+          playerState.pitch = THREE.MathUtils.clamp(
+            playerState.pitch - touch.lookDeltaY * touchSens,
+            -1.25,
+            1.25
+          );
+          touch.lookDeltaX = 0;
+          touch.lookDeltaY = 0;
+        }
+
+        if (Math.abs(gpFrame.lookYawDelta) > 0 || Math.abs(gpFrame.lookPitchDelta) > 0) {
+          const gpTurnSpeed = isAdsActive ? 1.55 : 2.65;
+          playerState.yaw -= gpFrame.lookYawDelta * gpTurnSpeed * dt;
+          playerState.pitch = THREE.MathUtils.clamp(
+            playerState.pitch + gpFrame.lookPitchDelta * gpTurnSpeed * 0.8 * dt,
+            -1.25,
+            1.25
+          );
+        }
 
         const stats = computeWeaponStats(
           p.weaponId,
@@ -1655,8 +2187,31 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
             : p.stimBuff
         );
 
+        // Evaluate Smart Control Target Magnetism & Optional Auto-Fire
+        if (p.smartControl.enabled && p.smartControl.aimAssistMagnetism) {
+          const assist = evaluateSmartAimAssist(
+            playerState,
+            npcs,
+            stats.range,
+            dt,
+            isAdsActive ? 8.5 : 5.5
+          );
+          playerState.yaw = assist.nextYaw;
+          playerState.pitch = assist.nextPitch;
+          smartTargetLocked = assist.lockedTargetId !== null;
+          if (
+            p.smartControl.autoFireOnLock &&
+            assist.shouldAutoFire &&
+            !buildModeActive
+          ) {
+            isFireActive = true;
+          }
+        } else {
+          smartTargetLocked = false;
+        }
+
         // Smooth ADS FOV damping
-        const targetFov = rightMouseDown
+        const targetFov = isAdsActive
           ? stats.adsFov
           : playerState.movementMode === 'SPRINT' || playerState.movementMode === 'SLIDE'
             ? 76
@@ -1675,19 +2230,32 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         emoteBannerTimer = Math.max(0, emoteBannerTimer - dt);
         if (emoteBannerTimer <= 0) activeEmoteBanner = null;
 
-        // One-shot Edge Trigger Actions
+        // One-shot Edge Trigger Actions (Keyboard + Touch + Console Gamepad)
         if (keysJustPressed.has('KeyB')) {
           buildModeActive = !buildModeActive;
         }
-        if (keysJustPressed.has('KeyR') && reloadTimer <= 0 && currentAmmo < stats.magSize) {
+        if (
+          (keysJustPressed.has('KeyR') ||
+            touch.reloadJustPressed ||
+            gpFrame.reloadOrHarvestJustPressed) &&
+          reloadTimer <= 0 &&
+          currentAmmo < stats.magSize
+        ) {
           reloadTimer = stats.reloadSec;
         }
-        // Tactical Weapon Ability [Q]
-        if (keysJustPressed.has('KeyQ') && abilityCooldown <= 0) {
+        // Tactical Weapon Ability [Q / Y / Touch Ability]
+        if (
+          (keysJustPressed.has('KeyQ') ||
+            touch.abilityJustPressed ||
+            gpFrame.abilityJustPressed) &&
+          abilityCooldown <= 0
+        ) {
           const wep = WEAPONS[p.weaponId];
-          abilityCooldown = wep.abilityCooldownSec;
+          const cdMult = activeEnvEvent?.id === 'aurora-emp-surge' ? 0.6 : 1.0;
+          abilityCooldown = wep.abilityCooldownSec * cdMult;
           abilityActiveTimer = 5.0;
           soundEngine.playMovementAction('stim');
+          recordReplayHighlight('ABILITY', `Activated ${wep.abilityName}`, '#38bdf8');
 
           if (p.weaponId === 'kodiak-shotgun') {
             // Concussive Shockwave
@@ -1711,15 +2279,18 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
             playerHp = Math.min(playerMaxHp, playerHp + 45);
           }
         }
-        // Bio-Stimulant Injector [G]
-        if (keysJustPressed.has('KeyG') && stimCooldown <= 0) {
+        // Bio-Stimulant Injector [G / LB / Touch Stim]
+        if (
+          (keysJustPressed.has('KeyG') || touch.stimJustPressed || gpFrame.stimJustPressed) &&
+          stimCooldown <= 0
+        ) {
           stimCooldown = 14;
           stimActiveTimer = 7.5;
           playerHp = Math.min(playerMaxHp, playerHp + 25);
           soundEngine.playMovementAction('stim');
         }
-        // Emote Trigger [V]
-        if (keysJustPressed.has('KeyV')) {
+        // Emote Trigger [V / D-Pad Down / Touch Emote]
+        if (keysJustPressed.has('KeyV') || touch.emoteJustPressed || gpFrame.emoteJustPressed) {
           activeEmoteBanner = `${p.callsign} [${p.emoteId.toUpperCase()}]`;
           emoteBannerTimer = 3.8;
           p.onSendMultiplayerUpdate({
@@ -1733,18 +2304,114 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         const simDt = hitstopTimer > 0 ? 0 : dt;
 
         if (simDt > 0) {
+          matchElapsedSec += simDt;
           fireCooldown = Math.max(0, fireCooldown - simDt);
           abilityCooldown = Math.max(0, abilityCooldown - simDt);
           abilityActiveTimer = Math.max(0, abilityActiveTimer - simDt);
           stimCooldown = Math.max(0, stimCooldown - simDt);
           stimActiveTimer = Math.max(0, stimActiveTimer - simDt);
 
-          // Bio-Stimulant + Bastion Wall regeneration
+          // Step Dynamic Environment Event Lifecycle
+          const envStep = stepDynamicEnvironmentEventState(
+            p.mapId,
+            envEventActiveTimer,
+            envEventCooldownTimer,
+            simDt,
+            pendingForceEnvEvent
+          );
+          pendingForceEnvEvent = false;
+          activeEnvEvent = envStep.activeEvent;
+          envEventActiveTimer = envStep.nextActiveTimer;
+          envEventCooldownTimer = envStep.nextCooldownTimer;
+
+          const biome = BIOMES[p.mapId] || BIOMES['alpine-outpost'];
+          if (envStep.justTriggered && activeEnvEvent) {
+            soundEngine.playTelegraphAlert();
+            cameraTrauma = Math.min(1, cameraTrauma + 0.22);
+            recordReplayHighlight(
+              'ENV_EVENT',
+              activeEnvEvent.name,
+              activeEnvEvent.accentColor
+            );
+            captureReplayFrame(true);
+
+            if (activeEnvEvent.disruptEnemyShields) {
+              for (const npc of npcs) {
+                if (npc.hp > 0 && npc.shield > 0) {
+                  npc.shield = 0;
+                  npc.hitFlashTimer = 0.2;
+                  spawnParticles(npc.x, npc.y + 1.4, npc.z, 8, 0x22d3ee, 6);
+                }
+              }
+            }
+          }
+
+          // Smoothly blend biome fog & sunlight with active Dynamic Environment Event
+          if (scene.fog instanceof THREE.FogExp2) {
+            const targetFogDensity = activeEnvEvent
+              ? biome.fogDensity * activeEnvEvent.fogDensityMult
+              : biome.fogDensity;
+            scene.fog.density = THREE.MathUtils.damp(
+              scene.fog.density,
+              targetFogDensity,
+              4,
+              simDt
+            );
+            _color.setHex(activeEnvEvent ? activeEnvEvent.fogHex : biome.fogHex);
+            scene.fog.color.lerp(_color, 1 - Math.exp(-4 * simDt));
+          }
+          const targetSunInt = activeEnvEvent
+            ? biome.sunIntensity * activeEnvEvent.sunIntensityMult
+            : biome.sunIntensity;
+          sunLight.intensity = THREE.MathUtils.damp(
+            sunLight.intensity,
+            targetSunInt,
+            4,
+            simDt
+          );
+
+          // Update 3D Weather Particle System when an Environment Event is active
+          weatherInstanced.visible = Boolean(activeEnvEvent);
+          if (activeEnvEvent) {
+            _color.setHex(activeEnvEvent.particleHex);
+            for (let wIdx = 0; wIdx < WEATHER_CAP; wIdx++) {
+              const wp = weatherPool[wIdx];
+              const wy =
+                ((wp.offsetY - elapsed * wp.fallSpeed) % 14 + 14) % 14;
+              const wx =
+                playerState.x +
+                wp.offsetX +
+                Math.sin(elapsed * 1.8 + wIdx) * 1.5;
+              const wz =
+                playerState.z +
+                wp.offsetZ +
+                Math.cos(elapsed * 1.6 + wIdx) * 1.5;
+              _dummyObj.position.set(wx, playerState.y + wy, wz);
+              _dummyObj.rotation.set(elapsed * 2, elapsed * 1.5, 0);
+              const s = 0.75 + (wIdx % 3) * 0.25;
+              _dummyObj.scale.set(s, s, s);
+              _dummyObj.updateMatrix();
+              weatherInstanced.setMatrixAt(wIdx, _dummyObj.matrix);
+              weatherInstanced.setColorAt(wIdx, _color);
+            }
+            weatherInstanced.instanceMatrix.needsUpdate = true;
+            if (weatherInstanced.instanceColor) {
+              weatherInstanced.instanceColor.needsUpdate = true;
+            }
+          }
+
+          // Bio-Stimulant + Bastion Wall + Dynamic Environment Event regeneration
+          const eventHpRegen = activeEnvEvent ? activeEnvEvent.hpRegenBonus : 0;
+          const eventShieldRegen = activeEnvEvent ? activeEnvEvent.shieldRegenBonus : 0;
           const regenRate =
             (stimActiveTimer > 0 ? p.stimBuff.regenPerSec * 1.8 : p.stimBuff.regenPerSec * 0.4) +
-            1.5;
+            1.5 +
+            eventHpRegen;
           playerHp = Math.min(playerMaxHp, playerHp + regenRate * simDt * 0.35);
-          playerShield = Math.min(playerMaxShield, playerShield + 2.5 * simDt);
+          playerShield = Math.min(
+            playerMaxShield,
+            playerShield + (2.5 + eventShieldRegen) * simDt
+          );
 
           if (reloadTimer > 0) {
             reloadTimer -= simDt;
@@ -1770,28 +2437,61 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
             });
           }
 
-          const forwardInput =
+          const kbForward =
             (keysHeld.has('KeyW') || keysHeld.has('ArrowUp') ? 1 : 0) -
             (keysHeld.has('KeyS') || keysHeld.has('ArrowDown') ? 1 : 0);
-          const rightInput =
+          const kbRight =
             (keysHeld.has('KeyD') || keysHeld.has('ArrowRight') ? 1 : 0) -
             (keysHeld.has('KeyA') || keysHeld.has('ArrowLeft') ? 1 : 0);
 
-          // Keyboard turn support (Q/E or Left/Right when holding Shift)
+          const forwardInput = THREE.MathUtils.clamp(
+            kbForward + touch.moveY + gpFrame.moveForward,
+            -1,
+            1
+          );
+          const rightInput = THREE.MathUtils.clamp(
+            kbRight + touch.moveX + gpFrame.moveRight,
+            -1,
+            1
+          );
+
+          const smartAutoSprint =
+            p.smartControl.enabled &&
+            p.smartControl.autoSprintAndParkour &&
+            forwardInput > 0.78;
+          const eventSpeedMult = activeEnvEvent ? activeEnvEvent.speedMultiplier : 1.0;
+          const eventJumpMult = activeEnvEvent ? activeEnvEvent.jumpMultiplier : 1.0;
+
           const prevMode = playerState.movementMode;
           playerState = evaluateMovementPhysics(
             playerState,
             {
               forward: forwardInput,
               right: rightInput,
-              sprintHeld: keysHeld.has('ShiftLeft') || keysHeld.has('ShiftRight'),
-              slideJustPressed: keysJustPressed.has('KeyC') || keysJustPressed.has('ControlLeft'),
-              jumpJustPressed: keysJustPressed.has('Space'),
-              jumpHeld: keysHeld.has('Space'),
+              sprintHeld:
+                keysHeld.has('ShiftLeft') ||
+                keysHeld.has('ShiftRight') ||
+                touch.sprintHeld ||
+                gpFrame.sprintHeld ||
+                smartAutoSprint,
+              slideJustPressed:
+                keysJustPressed.has('KeyC') ||
+                keysJustPressed.has('ControlLeft') ||
+                touch.slideJustPressed ||
+                gpFrame.slideJustPressed,
+              jumpJustPressed:
+                keysJustPressed.has('Space') ||
+                touch.jumpJustPressed ||
+                gpFrame.jumpJustPressed,
+              jumpHeld:
+                keysHeld.has('Space') || touch.jumpHeld || gpFrame.jumpHeld,
               speedMultiplier:
-                stimActiveTimer > 0
+                (stimActiveTimer > 0
                   ? p.stimBuff.speedMultiplier * 1.12
-                  : p.stimBuff.speedMultiplier,
+                  : p.stimBuff.speedMultiplier) * eventSpeedMult,
+              jumpMultiplier: eventJumpMult,
+              smartParkour:
+                p.smartControl.enabled && p.smartControl.autoSprintAndParkour,
             },
             simDt,
             allObstacles,
@@ -1804,7 +2504,9 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
             else if (playerState.movementMode === 'CLIMB') soundEngine.playMovementAction('climb');
           }
 
-          // Harvest Salvage Crates (auto-collect within 2.5m or press E within 4.2m)
+          // Harvest Salvage Crates (auto-collect within 3.2m with Smart Controls or press E / X / Loot within 4.5m)
+          const salvageBonusMult = activeEnvEvent?.id === 'bio-spore-bloom' ? 1.25 : 1.0;
+          const autoHarvestRadius = p.smartControl.enabled ? 3.4 : 2.6;
           for (const node of salvageNodes) {
             const crateMesh = crateMeshMap.get(node.id);
             if (node.cooldown > 0) {
@@ -1813,8 +2515,14 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
               continue;
             }
             const dist = Math.hypot(node.x - playerState.x, node.z - playerState.z);
-            if (dist < 2.6 || (dist < 4.5 && keysJustPressed.has('KeyE'))) {
-              playerSalvage += node.amount;
+            if (
+              dist < autoHarvestRadius ||
+              (dist < 4.5 &&
+                (keysJustPressed.has('KeyE') ||
+                  touch.harvestJustPressed ||
+                  gpFrame.reloadOrHarvestJustPressed))
+            ) {
+              playerSalvage += Math.round(node.amount * salvageBonusMult);
               playerScore += 25;
               node.cooldown = 14;
               if (crateMesh) crateMesh.visible = false;
@@ -1839,15 +2547,17 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           }
 
           if (
-            (buildModeActive && mouseDown && fireCooldown <= 0) ||
-            keysJustPressed.has('KeyF')
+            (buildModeActive && isFireActive && fireCooldown <= 0) ||
+            keysJustPressed.has('KeyF') ||
+            touch.buildJustPressed ||
+            gpFrame.buildJustPressed
           ) {
             if (attemptBuildWall()) {
               fireCooldown = 0.35;
               buildModeActive = false;
               wallPreviewMesh.visible = false;
             }
-          } else if (mouseDown && fireCooldown <= 0 && reloadTimer <= 0) {
+          } else if (isFireActive && fireCooldown <= 0 && reloadTimer <= 0) {
             if (currentAmmo > 0) {
               fireWeaponRound(stats);
             } else {
@@ -1967,6 +2677,8 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
 
                 if (playerHp <= 0 && !sessionEnded) {
                   sessionEnded = true;
+                  captureReplayFrame(true);
+                  publishReplayRecording();
                   document.exitPointerLock?.();
                   soundEngine.playOutcomeSting(false);
                   p.onStateChange('gameover', {
@@ -1999,6 +2711,9 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
             }
           }
 
+          // Record periodic Match Replay keyframe (~8.3 Hz)
+          captureReplayFrame(false);
+
           // Check Wave Completion / Victory
           const aliveCount = npcs.filter((n) => n.hp > 0).length;
           if (aliveCount === 0 && !sessionEnded) {
@@ -2006,9 +2721,14 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
               currentWave += 1;
               playerSalvage += 45;
               playerHp = Math.min(playerMaxHp, playerHp + 35);
+              recordReplayHighlight('WAVE_CLEAR', `Cleared Wave 1`, '#10b981');
               spawnWaveNpcs(currentWave);
+              captureReplayFrame(true);
             } else {
               sessionEnded = true;
+              recordReplayHighlight('WAVE_CLEAR', `Sector Victory`, '#10b981');
+              captureReplayFrame(true);
+              publishReplayRecording();
               document.exitPointerLock?.();
               soundEngine.playOutcomeSting(true);
               p.onStateChange('gameover', {
@@ -2100,6 +2820,14 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       if (particleInstanced.instanceColor) particleInstanced.instanceColor.needsUpdate = true;
 
       keysJustPressed.clear();
+      touch.jumpJustPressed = false;
+      touch.slideJustPressed = false;
+      touch.reloadJustPressed = false;
+      touch.abilityJustPressed = false;
+      touch.buildJustPressed = false;
+      touch.harvestJustPressed = false;
+      touch.stimJustPressed = false;
+      touch.emoteJustPressed = false;
       renderer.render(scene, camera);
 
       // Throttle HUD telemetry & 3D-to-2D Over-The-Head HP Bar Projections to ~15Hz
@@ -2208,6 +2936,17 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           hitMarkerActive: hitMarkerTimer > 0,
           killMarkerActive: killMarkerTimer > 0,
           damageVignetteIntensity: damageVignette,
+          smartTargetLocked,
+          activeEnvironmentEvent: activeEnvEvent
+            ? {
+                id: activeEnvEvent.id,
+                name: activeEnvEvent.name,
+                subtitle: activeEnvEvent.subtitle,
+                accentColor: activeEnvEvent.accentColor,
+                remainingSec: envEventActiveTimer,
+              }
+            : null,
+          nextEventCooldownSec: envEventCooldownTimer,
           opponentsOverlay,
           minimapEntities: {
             playerX: playerState.x,
@@ -2279,6 +3018,10 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       window.removeEventListener('mousedown', onMouseDown);
       window.removeEventListener('mouseup', onMouseUp);
       window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('wheel', onWheel);
+      window.removeEventListener('touchstart', onTouchStartGlobal);
+      window.removeEventListener('gamepadconnected', onGamepadConnected);
+      window.removeEventListener('gamepaddisconnected', onGamepadDisconnected);
       window.removeEventListener('contextmenu', onContextMenu);
       window.removeEventListener('blur', clearInputs);
       window.removeEventListener('resize', onResize);
