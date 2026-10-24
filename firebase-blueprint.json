@@ -1,0 +1,179 @@
+{
+  "entities": {
+    "OperatorProfile": {
+      "title": "OperatorProfile",
+      "description": "Stores a player's public tactical operator profile, progression stats, unlocked skins, and equipped loadout configuration.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the operator owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "callsign": {
+          "type": "string",
+          "description": "Operator display callsign.",
+          "minLength": 2,
+          "maxLength": 32
+        },
+        "skinId": {
+          "type": "string",
+          "description": "Equipped operator skin identifier.",
+          "enum": ["vanguard-obsidian", "alpine-ghost", "dune-stalker", "emerald-recon", "cryo-sentinel"]
+        },
+        "emoteId": {
+          "type": "string",
+          "description": "Equipped tactical emote identifier.",
+          "enum": ["salute", "rally-banner", "bio-scan", "victory-flare", "taunt-pulse"]
+        },
+        "primaryWeaponId": {
+          "type": "string",
+          "description": "Equipped primary weapon identifier.",
+          "enum": ["vx-carbine", "kodiak-shotgun", "solaris-dmr", "aegis-smg", "helix-bio-rifle"]
+        },
+        "opticId": {
+          "type": "string",
+          "description": "Equipped optic attachment.",
+          "enum": ["iron-sight", "holo-reflex", "acog-4x", "thermal-bio-scope"]
+        },
+        "barrelId": {
+          "type": "string",
+          "description": "Equipped barrel attachment.",
+          "enum": ["standard-barrel", "tactical-suppressor", "muzzle-compensator", "heavy-fluted"]
+        },
+        "underbarrelId": {
+          "type": "string",
+          "description": "Equipped underbarrel attachment.",
+          "enum": ["none", "angled-foregrip", "vertical-stabilizer", "laser-targeter"]
+        },
+        "magId": {
+          "type": "string",
+          "description": "Equipped magazine attachment.",
+          "enum": ["standard-mag", "extended-drum", "fast-mag", "bio-catalyst-cell"]
+        },
+        "stimCompoundCid": {
+          "type": "number",
+          "description": "Selected PubChem compound CID for tactical bio-stimulant."
+        },
+        "xp": {
+          "type": "number",
+          "description": "Total operator experience points."
+        },
+        "highestTrainingLevel": {
+          "type": "number",
+          "description": "Highest unlocked training level (1 to 4)."
+        },
+        "totalEliminations": {
+          "type": "number",
+          "description": "Cumulative AI and multiplayer eliminations."
+        },
+        "wallsBuilt": {
+          "type": "number",
+          "description": "Cumulative defensive fortifications constructed."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of profile creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last profile update."
+        }
+      },
+      "required": [
+        "uid",
+        "callsign",
+        "skinId",
+        "emoteId",
+        "primaryWeaponId",
+        "opticId",
+        "barrelId",
+        "underbarrelId",
+        "magId",
+        "stimCompoundCid",
+        "xp",
+        "highestTrainingLevel",
+        "totalEliminations",
+        "wallsBuilt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "MatchRecord": {
+      "title": "MatchRecord",
+      "description": "Stores an immutable combat report from a completed training wave or multiplayer match.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the operator who recorded the match.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "callsign": {
+          "type": "string",
+          "description": "Operator display callsign at match completion.",
+          "minLength": 2,
+          "maxLength": 32
+        },
+        "mapId": {
+          "type": "string",
+          "description": "Biome map identifier.",
+          "enum": ["alpine-outpost", "dune-refinery", "emerald-citadel", "obsidian-foundry", "cryo-spire"]
+        },
+        "trainingLevel": {
+          "type": "number",
+          "description": "Training difficulty tier (1 to 4)."
+        },
+        "score": {
+          "type": "number",
+          "description": "Final tactical combat score."
+        },
+        "eliminations": {
+          "type": "number",
+          "description": "Enemies neutralized during the session."
+        },
+        "wallsConstructed": {
+          "type": "number",
+          "description": "Defensive walls built during the session."
+        },
+        "outcome": {
+          "type": "string",
+          "description": "Final match status.",
+          "enum": ["victory", "defeat"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of match record creation."
+        }
+      },
+      "required": [
+        "uid",
+        "callsign",
+        "mapId",
+        "trainingLevel",
+        "score",
+        "eliminations",
+        "wallsConstructed",
+        "outcome",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/operators/{operatorId}": {
+      "schema": { "$ref": "#/entities/OperatorProfile" },
+      "description": "Operator loadout, skin/emote customization, and progression records keyed by user UID."
+    },
+    "/matches/{matchId}": {
+      "schema": { "$ref": "#/entities/MatchRecord" },
+      "description": "Immutable completed match telemetry and combat score records."
+    }
+  }
+}

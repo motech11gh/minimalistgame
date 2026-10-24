@@ -1,0 +1,204 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1: Global Default-Deny Catch-All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global Hardened Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Validation Blueprint: OperatorProfile
+    function isValidOperatorProfile(data) {
+      return data.keys().hasAll([
+        'uid',
+        'callsign',
+        'skinId',
+        'emoteId',
+        'primaryWeaponId',
+        'opticId',
+        'barrelId',
+        'underbarrelId',
+        'magId',
+        'stimCompoundCid',
+        'xp',
+        'highestTrainingLevel',
+        'totalEliminations',
+        'wallsBuilt',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'uid',
+        'callsign',
+        'skinId',
+        'emoteId',
+        'primaryWeaponId',
+        'opticId',
+        'barrelId',
+        'underbarrelId',
+        'magId',
+        'stimCompoundCid',
+        'xp',
+        'highestTrainingLevel',
+        'totalEliminations',
+        'wallsBuilt',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.uid == request.auth.uid &&
+      data.callsign is string && data.callsign.size() >= 2 && data.callsign.size() <= 32 &&
+      data.skinId is string && data.skinId.size() <= 32 &&
+      data.skinId in ['vanguard-obsidian', 'alpine-ghost', 'dune-stalker', 'emerald-recon', 'cryo-sentinel'] &&
+      data.emoteId is string && data.emoteId.size() <= 32 &&
+      data.emoteId in ['salute', 'rally-banner', 'bio-scan', 'victory-flare', 'taunt-pulse'] &&
+      data.primaryWeaponId is string && data.primaryWeaponId.size() <= 32 &&
+      data.primaryWeaponId in ['vx-carbine', 'kodiak-shotgun', 'solaris-dmr', 'aegis-smg', 'helix-bio-rifle'] &&
+      data.opticId is string && data.opticId.size() <= 32 &&
+      data.opticId in ['iron-sight', 'holo-reflex', 'acog-4x', 'thermal-bio-scope'] &&
+      data.barrelId is string && data.barrelId.size() <= 32 &&
+      data.barrelId in ['standard-barrel', 'tactical-suppressor', 'muzzle-compensator', 'heavy-fluted'] &&
+      data.underbarrelId is string && data.underbarrelId.size() <= 32 &&
+      data.underbarrelId in ['none', 'angled-foregrip', 'vertical-stabilizer', 'laser-targeter'] &&
+      data.magId is string && data.magId.size() <= 32 &&
+      data.magId in ['standard-mag', 'extended-drum', 'fast-mag', 'bio-catalyst-cell'] &&
+      data.stimCompoundCid is number && data.stimCompoundCid >= 1 && data.stimCompoundCid <= 999999999 &&
+      data.xp is number && data.xp >= 0 && data.xp <= 100000000 &&
+      data.highestTrainingLevel is number && data.highestTrainingLevel >= 1 && data.highestTrainingLevel <= 4 &&
+      data.totalEliminations is number && data.totalEliminations >= 0 && data.totalEliminations <= 10000000 &&
+      data.wallsBuilt is number && data.wallsBuilt >= 0 && data.wallsBuilt <= 10000000 &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: MatchRecord
+    function isValidMatchRecord(data) {
+      return data.keys().hasAll([
+        'uid',
+        'callsign',
+        'mapId',
+        'trainingLevel',
+        'score',
+        'eliminations',
+        'wallsConstructed',
+        'outcome',
+        'createdAt'
+      ]) &&
+      data.keys().hasOnly([
+        'uid',
+        'callsign',
+        'mapId',
+        'trainingLevel',
+        'score',
+        'eliminations',
+        'wallsConstructed',
+        'outcome',
+        'createdAt'
+      ]) &&
+      data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.uid == request.auth.uid &&
+      data.callsign is string && data.callsign.size() >= 2 && data.callsign.size() <= 32 &&
+      data.mapId is string && data.mapId.size() <= 32 &&
+      data.mapId in ['alpine-outpost', 'dune-refinery', 'emerald-citadel', 'obsidian-foundry', 'cryo-spire'] &&
+      data.trainingLevel is number && data.trainingLevel >= 1 && data.trainingLevel <= 4 &&
+      data.score is number && data.score >= 0 && data.score <= 10000000 &&
+      data.eliminations is number && data.eliminations >= 0 && data.eliminations <= 100000 &&
+      data.wallsConstructed is number && data.wallsConstructed >= 0 && data.wallsConstructed <= 100000 &&
+      data.outcome is string && data.outcome.size() <= 16 &&
+      data.outcome in ['victory', 'defeat'] &&
+      data.createdAt is timestamp;
+    }
+
+    // Collection: /operators/{operatorId}
+    match /operators/{operatorId} {
+      allow get: if isSignedIn() && isValidId(operatorId) && isOwner(operatorId);
+      allow list: if isSignedIn() && resource.data.uid == request.auth.uid;
+
+      allow create: if isVerifiedUser() &&
+        isValidId(operatorId) &&
+        isOwner(operatorId) &&
+        isValidOperatorProfile(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser() &&
+        isValidId(operatorId) &&
+        isOwner(operatorId) &&
+        isValidOperatorProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          // Action 1: Customize Loadout & Cosmetics
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'callsign',
+            'skinId',
+            'emoteId',
+            'primaryWeaponId',
+            'opticId',
+            'barrelId',
+            'underbarrelId',
+            'magId',
+            'stimCompoundCid',
+            'updatedAt'
+          ]) ||
+          // Action 2: Record Progression & Combat Stats
+          (
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'xp',
+              'highestTrainingLevel',
+              'totalEliminations',
+              'wallsBuilt',
+              'updatedAt'
+            ]) &&
+            incoming().xp >= existing().xp &&
+            incoming().highestTrainingLevel >= existing().highestTrainingLevel &&
+            incoming().totalEliminations >= existing().totalEliminations &&
+            incoming().wallsBuilt >= existing().wallsBuilt
+          )
+        );
+
+      allow delete: if false;
+    }
+
+    // Collection: /matches/{matchId}
+    match /matches/{matchId} {
+      allow get: if isSignedIn() && isValidId(matchId) && resource.data.uid == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.uid == request.auth.uid;
+
+      allow create: if isVerifiedUser() &&
+        isValidId(matchId) &&
+        isValidMatchRecord(incoming()) &&
+        incoming().createdAt == request.time &&
+        exists(/databases/$(database)/documents/operators/$(request.auth.uid));
+
+      // Terminal State Lock: Completed match records are immutable
+      allow update, delete: if false;
+    }
+  }
+}
