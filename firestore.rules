@@ -46,6 +46,7 @@ service cloud.firestore {
         'magId',
         'stimCompoundCid',
         'xp',
+        'credits',
         'highestTrainingLevel',
         'totalEliminations',
         'wallsBuilt',
@@ -64,6 +65,7 @@ service cloud.firestore {
         'magId',
         'stimCompoundCid',
         'xp',
+        'credits',
         'highestTrainingLevel',
         'totalEliminations',
         'wallsBuilt',
@@ -74,7 +76,18 @@ service cloud.firestore {
       data.uid == request.auth.uid &&
       data.callsign is string && data.callsign.size() >= 2 && data.callsign.size() <= 32 &&
       data.skinId is string && data.skinId.size() <= 32 &&
-      data.skinId in ['vanguard-obsidian', 'alpine-ghost', 'dune-stalker', 'emerald-recon', 'cryo-sentinel'] &&
+      data.skinId in [
+        'vanguard-obsidian',
+        'alpine-ghost',
+        'dune-stalker',
+        'emerald-recon',
+        'cryo-sentinel',
+        'solaris-valkyrie',
+        'void-walker',
+        'crimson-ronin',
+        'nebula-titan',
+        'apex-sovereign'
+      ] &&
       data.emoteId is string && data.emoteId.size() <= 32 &&
       data.emoteId in ['salute', 'rally-banner', 'bio-scan', 'victory-flare', 'taunt-pulse'] &&
       data.primaryWeaponId is string && data.primaryWeaponId.size() <= 32 &&
@@ -89,9 +102,38 @@ service cloud.firestore {
       data.magId in ['standard-mag', 'extended-drum', 'fast-mag', 'bio-catalyst-cell'] &&
       data.stimCompoundCid is number && data.stimCompoundCid >= 1 && data.stimCompoundCid <= 999999999 &&
       data.xp is number && data.xp >= 0 && data.xp <= 100000000 &&
+      data.credits is number && data.credits >= 0 && data.credits <= 100000000 &&
       data.highestTrainingLevel is number && data.highestTrainingLevel >= 1 && data.highestTrainingLevel <= 4 &&
       data.totalEliminations is number && data.totalEliminations >= 0 && data.totalEliminations <= 10000000 &&
       data.wallsBuilt is number && data.wallsBuilt >= 0 && data.wallsBuilt <= 10000000 &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: FriendRequest
+    function isValidFriendRequest(data) {
+      return data.keys().hasAll([
+        'fromUid',
+        'fromUsername',
+        'toUsername',
+        'status',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'fromUid',
+        'fromUsername',
+        'toUsername',
+        'status',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.fromUid is string && data.fromUid.size() >= 1 && data.fromUid.size() <= 128 && data.fromUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.fromUid == request.auth.uid &&
+      data.fromUsername is string && data.fromUsername.size() >= 2 && data.fromUsername.size() <= 32 &&
+      data.toUsername is string && data.toUsername.size() >= 2 && data.toUsername.size() <= 32 &&
+      data.status is string && data.status.size() <= 16 &&
+      data.status in ['pending', 'accepted', 'declined'] &&
       data.createdAt is timestamp &&
       data.updatedAt is timestamp;
     }
@@ -154,7 +196,7 @@ service cloud.firestore {
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time &&
         (
-          // Action 1: Customize Loadout & Cosmetics
+          // Action 1: Customize Loadout, Shop Credits & Cosmetics
           incoming().diff(existing()).affectedKeys().hasOnly([
             'callsign',
             'skinId',
@@ -165,12 +207,14 @@ service cloud.firestore {
             'underbarrelId',
             'magId',
             'stimCompoundCid',
+            'credits',
             'updatedAt'
           ]) ||
-          // Action 2: Record Progression & Combat Stats
+          // Action 2: Record Progression, XP, Credits & Combat Stats
           (
             incoming().diff(existing()).affectedKeys().hasOnly([
               'xp',
+              'credits',
               'highestTrainingLevel',
               'totalEliminations',
               'wallsBuilt',
@@ -182,6 +226,33 @@ service cloud.firestore {
             incoming().wallsBuilt >= existing().wallsBuilt
           )
         );
+
+      allow delete: if false;
+    }
+
+    // Collection: /friendRequests/{requestId}
+    match /friendRequests/{requestId} {
+      allow get: if isSignedIn() && isValidId(requestId) && resource.data.fromUid == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.fromUid == request.auth.uid;
+
+      allow create: if isVerifiedUser() &&
+        isValidId(requestId) &&
+        isValidFriendRequest(incoming()) &&
+        incoming().status == 'pending' &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        exists(/databases/$(database)/documents/operators/$(request.auth.uid));
+
+      allow update: if isVerifiedUser() &&
+        isValidId(requestId) &&
+        isValidFriendRequest(incoming()) &&
+        existing().status == 'pending' &&
+        incoming().fromUid == existing().fromUid &&
+        incoming().fromUsername == existing().fromUsername &&
+        incoming().toUsername == existing().toUsername &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']);
 
       allow delete: if false;
     }

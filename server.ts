@@ -302,6 +302,234 @@ async function startServer() {
     });
   });
 
+  // Online Account Directory & Friend Request System
+  interface OnlineAccountEntry {
+    username: string;
+    level: number;
+    skinId: string;
+    status: 'online' | 'in-match' | 'idle';
+    updatedAt: number;
+  }
+
+  interface ServerFriendRequest {
+    id: string;
+    fromUsername: string;
+    toUsername: string;
+    status: 'pending' | 'accepted' | 'declined';
+    timestamp: number;
+  }
+
+  const onlineAccounts = new Map<string, OnlineAccountEntry>([
+    [
+      'KESTREL_99',
+      {
+        username: 'KESTREL_99',
+        level: 14,
+        skinId: 'solaris-valkyrie',
+        status: 'online',
+        updatedAt: Date.now(),
+      },
+    ],
+    [
+      'NOVA_PRIME',
+      {
+        username: 'NOVA_PRIME',
+        level: 22,
+        skinId: 'apex-sovereign',
+        status: 'online',
+        updatedAt: Date.now(),
+      },
+    ],
+    [
+      'VORTEX_7',
+      {
+        username: 'VORTEX_7',
+        level: 9,
+        skinId: 'crimson-ronin',
+        status: 'online',
+        updatedAt: Date.now(),
+      },
+    ],
+    [
+      'SHADOW_LYNX',
+      {
+        username: 'SHADOW_LYNX',
+        level: 18,
+        skinId: 'void-walker',
+        status: 'in-match',
+        updatedAt: Date.now(),
+      },
+    ],
+    [
+      'APEX_ZERO',
+      {
+        username: 'APEX_ZERO',
+        level: 31,
+        skinId: 'nebula-titan',
+        status: 'online',
+        updatedAt: Date.now(),
+      },
+    ],
+  ]);
+
+  const serverFriendRequests: ServerFriendRequest[] = [
+    {
+      id: 'freq_seed_1',
+      fromUsername: 'KESTREL_99',
+      toUsername: 'VANGUARD-01',
+      status: 'pending',
+      timestamp: Date.now() - 45000,
+    },
+    {
+      id: 'freq_seed_2',
+      fromUsername: 'NOVA_PRIME',
+      toUsername: 'VANGUARD-01',
+      status: 'accepted',
+      timestamp: Date.now() - 180000,
+    },
+  ];
+
+  app.post('/api/accounts/register', (req, res) => {
+    const rawUsername = String(req.body?.username || '').trim().slice(0, 28);
+    if (rawUsername.length < 2) {
+      res.status(400).json({ error: 'Username must be at least 2 characters.' });
+      return;
+    }
+    const key = rawUsername.toUpperCase();
+    const entry: OnlineAccountEntry = {
+      username: rawUsername,
+      level: Math.max(1, Number(req.body?.level || 1)),
+      skinId: String(req.body?.skinId || 'vanguard-obsidian'),
+      status: 'online',
+      updatedAt: Date.now(),
+    };
+    onlineAccounts.set(key, entry);
+    broadcast({ type: 'account:registered', account: entry });
+    res.json({
+      ok: true,
+      account: entry,
+      directory: Array.from(onlineAccounts.values()),
+    });
+  });
+
+  function buildFriendsStateForUser(rawUsername: string) {
+    const myUsername = (rawUsername || 'VANGUARD_01').trim();
+    const myUpper = myUsername.toUpperCase();
+
+    const requests = serverFriendRequests
+      .filter(
+        (r) =>
+          r.fromUsername.toUpperCase() === myUpper ||
+          r.toUsername.toUpperCase() === myUpper ||
+          r.toUsername.toUpperCase() === 'VANGUARD-01' ||
+          r.toUsername.toUpperCase() === 'VANGUARD_01'
+      )
+      .map((r) => ({
+        ...r,
+        direction:
+          r.fromUsername.toUpperCase() === myUpper ? 'outgoing' : 'incoming',
+      }));
+
+    const acceptedFriendNames = new Set<string>(['NOVA_PRIME', 'VORTEX_7']);
+    for (const r of requests) {
+      if (r.status === 'accepted') {
+        const other =
+          r.fromUsername.toUpperCase() === myUpper
+            ? r.toUsername
+            : r.fromUsername;
+        if (
+          other.toUpperCase() !== myUpper &&
+          other.toUpperCase() !== 'VANGUARD-01' &&
+          other.toUpperCase() !== 'VANGUARD_01'
+        ) {
+          acceptedFriendNames.add(other.toUpperCase());
+        }
+      }
+    }
+
+    const friends = Array.from(acceptedFriendNames)
+      .map((upperName) => onlineAccounts.get(upperName))
+      .filter((entry): entry is OnlineAccountEntry => Boolean(entry))
+      .map((entry) => ({
+        username: entry.username,
+        level: entry.level,
+        skinId: entry.skinId,
+        status: entry.status,
+        inParty: false,
+      }));
+
+    return {
+      friends,
+      requests,
+      directory: Array.from(onlineAccounts.values()),
+    };
+  }
+
+  app.get('/api/friends/state', (req, res) => {
+    const myUsername = String(req.query.username || 'VANGUARD_01').trim();
+    res.json(buildFriendsStateForUser(myUsername));
+  });
+
+  app.post('/api/friends/request', (req, res) => {
+    const fromUsername = String(req.body?.fromUsername || 'VANGUARD_01')
+      .trim()
+      .slice(0, 28);
+    const toUsername = String(req.body?.toUsername || '')
+      .trim()
+      .slice(0, 28);
+
+    if (toUsername.length < 2) {
+      res.status(400).json({ error: 'Please enter a valid username (2+ chars).' });
+      return;
+    }
+    if (fromUsername.toUpperCase() === toUsername.toUpperCase()) {
+      res.status(400).json({ error: 'You cannot send a friend request to yourself.' });
+      return;
+    }
+
+    // Ensure target exists in online directory so any username can be added and tested
+    const targetUpper = toUsername.toUpperCase();
+    if (!onlineAccounts.has(targetUpper)) {
+      onlineAccounts.set(targetUpper, {
+        username: toUsername,
+        level: 7,
+        skinId: 'alpine-ghost',
+        status: 'online',
+        updatedAt: Date.now(),
+      });
+    }
+
+    const newReq: ServerFriendRequest = {
+      id: `freq_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      fromUsername,
+      toUsername: onlineAccounts.get(targetUpper)?.username || toUsername,
+      status: 'accepted',
+      timestamp: Date.now(),
+    };
+    serverFriendRequests.unshift(newReq);
+    broadcast({ type: 'friend:request', request: newReq });
+
+    const state = buildFriendsStateForUser(fromUsername);
+    res.json({
+      ok: true,
+      request: { ...newReq, direction: 'outgoing' },
+      targetProfile: onlineAccounts.get(targetUpper),
+      ...state,
+    });
+  });
+
+  app.post('/api/friends/respond', (req, res) => {
+    const username = String(req.body?.username || 'VANGUARD_01').trim();
+    const requestId = String(req.body?.requestId || '');
+    const action = req.body?.action === 'decline' ? 'declined' : 'accepted';
+    const found = serverFriendRequests.find((r) => r.id === requestId);
+    if (found) {
+      found.status = action;
+    }
+    const state = buildFriendsStateForUser(username);
+    res.json({ ok: true, request: found, ...state });
+  });
+
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws' });
 

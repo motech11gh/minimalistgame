@@ -23,6 +23,10 @@ import {
   DynamicEnvironmentEventDef,
   ReplayFrameSnapshot,
   MatchReplayRecording,
+  BATTLE_MODES,
+  BOT_HARDNESS_TIERS,
+  BattleModeId,
+  BotHardnessId,
 } from './types';
 
 export function computeWeaponStats(
@@ -848,5 +852,131 @@ export function interpolateReplayFrames(
     npcs: interpNpcs,
   };
 }
+
+/**
+ * Computes custom XP and Credits for a completed match.
+ * XP scales with time played + total eliminations + kills-per-minute (KPM) velocity bonus
+ * so achieving the most kills in less time yields significantly higher XP.
+ * Winning a match awards a large Victory Credit bonus scaled by Bot Hardness and Team Mode.
+ */
+export function calculateMatchXpAndCredits(params: {
+  durationSec: number;
+  eliminations: number;
+  wallsConstructed: number;
+  victory: boolean;
+  battleMode: BattleModeId;
+  botHardness: BotHardnessId;
+}): {
+  killsPerMinute: number;
+  timeXp: number;
+  eliminationXp: number;
+  kpmVelocityBonusXp: number;
+  victoryBonusXp: number;
+  totalXpEarned: number;
+  creditsEarned: number;
+} {
+  const modeDef = BATTLE_MODES[params.battleMode] || BATTLE_MODES['2v2'];
+  const hardnessDef = BOT_HARDNESS_TIERS[params.botHardness] || BOT_HARDNESS_TIERS.recruit;
+
+  const safeDurationSec = Math.max(5, Math.min(3600, params.durationSec));
+  const durationMinutes = Math.max(0.2, safeDurationSec / 60);
+  const safeElims = Math.max(0, Math.round(params.eliminations));
+  const safeWalls = Math.max(0, Math.round(params.wallsConstructed));
+
+  // Kills-per-minute efficiency rate (higher kills in shorter time -> higher KPM bonus)
+  const killsPerMinute = Number((safeElims / durationMinutes).toFixed(2));
+
+  const timeXp = Math.round(Math.min(550, safeDurationSec * 4.2));
+  const eliminationXp = safeElims * 145 + safeWalls * 25;
+  const kpmVelocityBonusXp = Math.round(killsPerMinute * 110);
+  const victoryBonusXp = params.victory ? 320 : 80;
+
+  const combinedMult = modeDef.xpMultiplier * hardnessDef.xpCreditMultiplier;
+  const totalXpEarned = Math.max(
+    60,
+    Math.round((timeXp + eliminationXp + kpmVelocityBonusXp + victoryBonusXp) * combinedMult)
+  );
+
+  // Credits earned: base match completion + Win Bonus + eliminations + KPM efficiency
+  const baseCredits = 45;
+  const winCredits = params.victory ? modeDef.creditWinBonus : 0;
+  const elimCredits = safeElims * 24;
+  const kpmCredits = Math.round(killsPerMinute * 18);
+
+  const creditsEarned = Math.max(
+    25,
+    Math.round((baseCredits + winCredits + elimCredits + kpmCredits) * hardnessDef.xpCreditMultiplier)
+  );
+
+  return {
+    killsPerMinute,
+    timeXp,
+    eliminationXp,
+    kpmVelocityBonusXp,
+    victoryBonusXp,
+    totalXpEarned,
+    creditsEarned,
+  };
+}
+
+/**
+ * Computes Operator Level and progress bar percentage from cumulative XP.
+ */
+export function computeOperatorLevelFromXp(xp: number): {
+  level: number;
+  xpIntoLevel: number;
+  xpForNextLevel: number;
+  progressPct: number;
+} {
+  const safeXp = Math.max(0, Math.floor(xp));
+  const xpPerLevel = 1000;
+  const level = Math.floor(safeXp / xpPerLevel) + 1;
+  const xpIntoLevel = safeXp % xpPerLevel;
+  const progressPct = Math.min(100, Math.round((xpIntoLevel / xpPerLevel) * 100));
+  return {
+    level,
+    xpIntoLevel,
+    xpForNextLevel: xpPerLevel,
+    progressPct,
+  };
+}
+
+/**
+ * Computes the team match roster and bot scaling for 1v1, 2v2, 3v3, 4v4, Co-Op Split-Screen, and Practice.
+ */
+export function computeTeamMatchRoster(
+  battleMode: BattleModeId,
+  botHardness: BotHardnessId,
+  waveNumber: number
+): {
+  allyCount: number;
+  enemyCount: number;
+  totalWaves: number;
+  hpMultiplier: number;
+  speedMultiplier: number;
+  damageMultiplier: number;
+  windupSec: number;
+  fireCooldownMultiplier: number;
+  maxConcurrentWindups: number;
+  startingSalvage: number;
+} {
+  const modeDef = BATTLE_MODES[battleMode] || BATTLE_MODES['2v2'];
+  const hardnessDef = BOT_HARDNESS_TIERS[botHardness] || BOT_HARDNESS_TIERS.recruit;
+  const waveScale = 1 + Math.max(0, waveNumber - 1) * 0.14;
+
+  return {
+    allyCount: modeDef.allyCount,
+    enemyCount: modeDef.enemyCount,
+    totalWaves: modeDef.waves,
+    hpMultiplier: Number((hardnessDef.hpScale * waveScale).toFixed(2)),
+    speedMultiplier: Number((hardnessDef.speedScale * (1 + Math.max(0, waveNumber - 1) * 0.06)).toFixed(2)),
+    damageMultiplier: Number((hardnessDef.damageScale * waveScale).toFixed(2)),
+    windupSec: hardnessDef.windupSec,
+    fireCooldownMultiplier: Number(Math.max(0.45, hardnessDef.windupSec).toFixed(2)),
+    maxConcurrentWindups: hardnessDef.rankIndex >= 4 ? 3 : 2,
+    startingSalvage: modeDef.isPractice ? 300 : 140,
+  };
+}
+
 
 

@@ -2,7 +2,7 @@
   "entities": {
     "OperatorProfile": {
       "title": "OperatorProfile",
-      "description": "Stores a player's public tactical operator profile, progression stats, unlocked skins, and equipped loadout configuration.",
+      "description": "Stores a player's public tactical operator profile, username, credits, progression stats, unlocked skins, friends, and equipped loadout configuration.",
       "type": "object",
       "properties": {
         "uid": {
@@ -14,14 +14,25 @@
         },
         "callsign": {
           "type": "string",
-          "description": "Operator display callsign.",
+          "description": "Operator display username / callsign.",
           "minLength": 2,
           "maxLength": 32
         },
         "skinId": {
           "type": "string",
           "description": "Equipped operator skin identifier.",
-          "enum": ["vanguard-obsidian", "alpine-ghost", "dune-stalker", "emerald-recon", "cryo-sentinel"]
+          "enum": [
+            "vanguard-obsidian",
+            "alpine-ghost",
+            "dune-stalker",
+            "emerald-recon",
+            "cryo-sentinel",
+            "solaris-valkyrie",
+            "void-walker",
+            "crimson-ronin",
+            "nebula-titan",
+            "apex-sovereign"
+          ]
         },
         "emoteId": {
           "type": "string",
@@ -61,6 +72,10 @@
           "type": "number",
           "description": "Total operator experience points."
         },
+        "credits": {
+          "type": "number",
+          "description": "Total operator shop credits earned from matches."
+        },
         "highestTrainingLevel": {
           "type": "number",
           "description": "Highest unlocked training level (1 to 4)."
@@ -96,9 +111,59 @@
         "magId",
         "stimCompoundCid",
         "xp",
+        "credits",
         "highestTrainingLevel",
         "totalEliminations",
         "wallsBuilt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "FriendRequest": {
+      "title": "FriendRequest",
+      "description": "Stores a friend request sent from one operator username to another.",
+      "type": "object",
+      "properties": {
+        "fromUid": {
+          "type": "string",
+          "description": "Sender Firebase Auth UID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "fromUsername": {
+          "type": "string",
+          "description": "Sender username.",
+          "minLength": 2,
+          "maxLength": 32
+        },
+        "toUsername": {
+          "type": "string",
+          "description": "Recipient username.",
+          "minLength": 2,
+          "maxLength": 32
+        },
+        "status": {
+          "type": "string",
+          "description": "Friend request state.",
+          "enum": ["pending", "accepted", "declined"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of friend request creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last status update."
+        }
+      },
+      "required": [
+        "fromUid",
+        "fromUsername",
+        "toUsername",
+        "status",
         "createdAt",
         "updatedAt"
       ]
@@ -169,7 +234,11 @@
   "firestore": {
     "/operators/{operatorId}": {
       "schema": { "$ref": "#/entities/OperatorProfile" },
-      "description": "Operator loadout, skin/emote customization, and progression records keyed by user UID."
+      "description": "Operator loadout, skin/emote customization, credits, and progression records keyed by user UID."
+    },
+    "/friendRequests/{requestId}": {
+      "schema": { "$ref": "#/entities/FriendRequest" },
+      "description": "Friend requests sent by username between operators."
     },
     "/matches/{matchId}": {
       "schema": { "$ref": "#/entities/MatchRecord" },

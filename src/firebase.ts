@@ -103,6 +103,7 @@ export interface OperatorProfileData {
   magId: string;
   stimCompoundCid: number;
   xp: number;
+  credits: number;
   highestTrainingLevel: number;
   totalEliminations: number;
   wallsBuilt: number;
@@ -150,6 +151,7 @@ export async function loadOrCreateOperatorProfile(
         magId: String(data.magId || defaults.magId),
         stimCompoundCid: Number(data.stimCompoundCid || defaults.stimCompoundCid),
         xp: Number(data.xp || 0),
+        credits: Number(data.credits ?? defaults.credits ?? 600),
         highestTrainingLevel: Math.max(1, Math.min(4, Number(data.highestTrainingLevel || 1))),
         totalEliminations: Number(data.totalEliminations || 0),
         wallsBuilt: Number(data.wallsBuilt || 0),
@@ -168,6 +170,7 @@ export async function loadOrCreateOperatorProfile(
       magId: defaults.magId,
       stimCompoundCid: defaults.stimCompoundCid,
       xp: defaults.xp,
+      credits: defaults.credits,
       highestTrainingLevel: defaults.highestTrainingLevel,
       totalEliminations: defaults.totalEliminations,
       wallsBuilt: defaults.wallsBuilt,
@@ -199,6 +202,7 @@ export async function saveOperatorCustomization(
     | 'underbarrelId'
     | 'magId'
     | 'stimCompoundCid'
+    | 'credits'
   >
 ): Promise<void> {
   if (!user.emailVerified) return;
@@ -215,10 +219,33 @@ export async function saveOperatorCustomization(
       underbarrelId: customization.underbarrelId,
       magId: customization.magId,
       stimCompoundCid: customization.stimCompoundCid,
+      credits: Math.max(0, Math.min(100000000, Math.round(customization.credits))),
       updatedAt: serverTimestamp(),
     });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+export async function sendFirestoreFriendRequest(
+  user: User,
+  fromUsername: string,
+  toUsername: string
+): Promise<void> {
+  if (!user.emailVerified) return;
+  const reqId = `freq_${user.uid.slice(0, 12)}_${Date.now()}`;
+  const path = `friendRequests/${reqId}`;
+  try {
+    await setDoc(doc(db, 'friendRequests', reqId), {
+      fromUid: user.uid,
+      fromUsername: sanitizeCallsign(fromUsername),
+      toUsername: sanitizeCallsign(toUsername),
+      status: 'pending',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, path);
   }
 }
 
@@ -229,12 +256,18 @@ export async function recordMatchAndProgression(
     mapId: string;
     trainingLevel: number;
     score: number;
+    xpEarned: number;
+    creditsEarned: number;
     eliminations: number;
     wallsConstructed: number;
     outcome: 'victory' | 'defeat';
   }
 ): Promise<OperatorProfileData> {
-  const nextXp = Math.min(100000000, currentProfile.xp + Math.max(50, match.score));
+  const nextXp = Math.min(100000000, currentProfile.xp + Math.max(50, match.xpEarned));
+  const nextCredits = Math.min(
+    100000000,
+    currentProfile.credits + Math.max(10, match.creditsEarned)
+  );
   const nextHighestLevel =
     match.outcome === 'victory'
       ? Math.min(4, Math.max(currentProfile.highestTrainingLevel, match.trainingLevel + 1))
@@ -251,6 +284,7 @@ export async function recordMatchAndProgression(
   const updatedProfile: OperatorProfileData = {
     ...currentProfile,
     xp: nextXp,
+    credits: nextCredits,
     highestTrainingLevel: nextHighestLevel,
     totalEliminations: nextElims,
     wallsBuilt: nextWalls,
@@ -262,6 +296,7 @@ export async function recordMatchAndProgression(
   try {
     await updateDoc(doc(db, 'operators', user.uid), {
       xp: nextXp,
+      credits: nextCredits,
       highestTrainingLevel: nextHighestLevel,
       totalEliminations: nextElims,
       wallsBuilt: nextWalls,

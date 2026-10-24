@@ -8,6 +8,10 @@ import {
   OPERATOR_SKINS,
   GameState,
   MapId,
+  BattleModeId,
+  BotHardnessId,
+  FriendProfile,
+  SplitScreenP2Telemetry,
   WeaponId,
   OpticId,
   BarrelId,
@@ -39,6 +43,7 @@ import {
   evaluateMovementPhysics,
   canBuildWall,
   computeTrainingWaveConfig,
+  computeTeamMatchRoster,
   stepAiDecisionPolicy,
   parseStandardGamepadState,
   ParsedGamepadFrame,
@@ -66,6 +71,8 @@ export interface HudTelemetrySnapshot {
   stimCooldown: number;
   stimActiveTimer: number;
   wave: number;
+  totalWaves: number;
+  matchElapsedSec: number;
   enemiesRemaining: number;
   totalEnemiesInWave: number;
   score: number;
@@ -85,6 +92,7 @@ export interface HudTelemetrySnapshot {
     remainingSec: number;
   } | null;
   nextEventCooldownSec: number;
+  splitScreenP2: SplitScreenP2Telemetry | null;
   opponentsOverlay: ProjectedOpponentOverlay[];
   minimapEntities: {
     playerX: number;
@@ -119,6 +127,9 @@ export interface RemoteSquadOperator {
 interface ThreeArenaProps {
   gameState: GameState;
   mapId: MapId;
+  battleMode: BattleModeId;
+  botHardness: BotHardnessId;
+  partyMembers: FriendProfile[];
   trainingLevel: number;
   callsign: string;
   skinId: SkinId;
@@ -157,6 +168,7 @@ interface ThreeArenaProps {
       eliminations: number;
       wallsConstructed: number;
       waveReached: number;
+      durationSec: number;
     }
   ) => void;
   onSendMultiplayerUpdate: (payload: Record<string, unknown>) => void;
@@ -670,6 +682,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     rebuildWeaponMesh?: () => void;
     resetSession?: () => void;
     forceTriggerEnvironmentEvent?: () => void;
+    syncLobbyAvatars?: () => void;
   }>({});
 
   // Trigger biome rebuild when mapId changes
@@ -677,9 +690,10 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     internalRef.current.rebuildBiome?.(props.mapId);
   }, [props.mapId]);
 
-  // Trigger weapon viewmodel rebuild when weapon or attachments change
+  // Trigger weapon viewmodel & lobby avatar rebuild when weapon, attachments, skin, or party changes
   useEffect(() => {
     internalRef.current.rebuildWeaponMesh?.();
+    internalRef.current.syncLobbyAvatars?.();
   }, [
     props.weaponId,
     props.opticId,
@@ -687,12 +701,13 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     props.underbarrelId,
     props.magId,
     props.skinId,
+    props.partyMembers,
   ]);
 
-  // Reset session when restartNonce or trainingLevel changes
+  // Reset session when restartNonce, trainingLevel, battleMode, or botHardness changes
   useEffect(() => {
     internalRef.current.resetSession?.();
-  }, [props.restartNonce, props.trainingLevel]);
+  }, [props.restartNonce, props.trainingLevel, props.battleMode, props.botHardness]);
 
   // Trigger dynamic environment event when requested from UI
   useEffect(() => {
@@ -741,9 +756,20 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       (container.clientWidth || window.innerWidth) /
         Math.max(1, container.clientHeight || window.innerHeight),
       0.1,
-      280
+      360
     );
+    camera.position.set(0, 2.2, 20.65);
     scene.add(camera);
+
+    // Second PerspectiveCamera for Offline Co-Op Split-Screen (Player 2)
+    const p2Camera = new THREE.PerspectiveCamera(
+      70,
+      ((container.clientWidth || window.innerWidth) * 0.5) /
+        Math.max(1, container.clientHeight || window.innerHeight),
+      0.1,
+      360
+    );
+    scene.add(p2Camera);
 
     // Mandatory Studio Environment Reflection (RoomEnvironment + PMREMGenerator)
     const pmremGenerator = new THREE.PMREMGenerator(renderer);
@@ -762,13 +788,13 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     sunLight.castShadow = !isSoftwareGl;
     sunLight.shadow.mapSize.width = 1024;
     sunLight.shadow.mapSize.height = 1024;
-    const d = 55;
+    const d = 80;
     sunLight.shadow.camera.left = -d;
     sunLight.shadow.camera.right = d;
     sunLight.shadow.camera.top = d;
     sunLight.shadow.camera.bottom = -d;
     sunLight.shadow.camera.near = 5;
-    sunLight.shadow.camera.far = 160;
+    sunLight.shadow.camera.far = 220;
     sunLight.shadow.bias = -0.0005;
     sunLight.shadow.normalBias = 0.02;
     scene.add(sunLight);
@@ -777,12 +803,24 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     const environmentGroup = new THREE.Group();
     const wallsGroup = new THREE.Group();
     const npcsGroup = new THREE.Group();
+    const alliesGroup = new THREE.Group();
     const cratesGroup = new THREE.Group();
     const remotePlayersGroup = new THREE.Group();
+    const lobbyPartyGroup = new THREE.Group();
     const weaponRigGroup = new THREE.Group();
+    const p2WeaponRigGroup = new THREE.Group();
     camera.add(weaponRigGroup);
+    p2Camera.add(p2WeaponRigGroup);
 
-    scene.add(environmentGroup, wallsGroup, npcsGroup, cratesGroup, remotePlayersGroup);
+    scene.add(
+      environmentGroup,
+      wallsGroup,
+      npcsGroup,
+      alliesGroup,
+      cratesGroup,
+      remotePlayersGroup,
+      lobbyPartyGroup
+    );
 
     // Pooled InstancedMesh Particle Ring Buffer (36 particles)
     const PARTICLE_CAP = 36;
@@ -863,8 +901,8 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       fallSpeed: 3.2 + (i % 4) * 1.1,
     }));
 
-    // 3D Local Player Avatar for 3rd-Person Match Replay Camera Modes
-    const replayOperatorAvatar = buildOperatorCharacterGroup(
+    // 3D Local Player Avatar for Lobby Centerpiece Showcase & 3rd-Person Match Replay
+    let replayOperatorAvatar = buildOperatorCharacterGroup(
       'SQUAD',
       contactShadowTex,
       {
@@ -875,6 +913,56 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     );
     replayOperatorAvatar.root.visible = false;
     scene.add(replayOperatorAvatar.root);
+
+    // 3D Split-Screen Player 2 Avatar
+    const p2OperatorAvatar = buildOperatorCharacterGroup('SQUAD', contactShadowTex, {
+      primary: '#0f766e',
+      secondary: '#115e59',
+      visor: '#38bdf8',
+    });
+    p2OperatorAvatar.root.visible = false;
+    scene.add(p2OperatorAvatar.root);
+
+    function syncLobbyAvatars() {
+      const p = propsRef.current;
+      const skinDef = OPERATOR_SKINS[p.skinId] || OPERATOR_SKINS['vanguard-obsidian'];
+      const wasVisible = replayOperatorAvatar.root.visible;
+      const prevPos = replayOperatorAvatar.root.position.clone();
+      const prevRotY = replayOperatorAvatar.root.rotation.y;
+      scene.remove(replayOperatorAvatar.root);
+
+      replayOperatorAvatar = buildOperatorCharacterGroup('SQUAD', contactShadowTex, {
+        primary: skinDef.primaryHex,
+        secondary: skinDef.secondaryHex,
+        visor: skinDef.visorHex,
+      });
+      replayOperatorAvatar.root.visible = wasVisible;
+      replayOperatorAvatar.root.position.copy(prevPos);
+      replayOperatorAvatar.root.rotation.y = prevRotY;
+      scene.add(replayOperatorAvatar.root);
+
+      while (lobbyPartyGroup.children.length > 0) {
+        lobbyPartyGroup.remove(lobbyPartyGroup.children[0]);
+      }
+      const offsets = [
+        { x: -1.85, z: 15.1, rotY: 0.25 },
+        { x: 1.85, z: 15.1, rotY: -0.25 },
+        { x: -3.35, z: 14.3, rotY: 0.35 },
+      ];
+      p.partyMembers.slice(0, 3).forEach((friend, idx) => {
+        const fSkin = OPERATOR_SKINS[friend.skinId] || OPERATOR_SKINS['alpine-ghost'];
+        const fBuilt = buildOperatorCharacterGroup('SQUAD', contactShadowTex, {
+          primary: fSkin.primaryHex,
+          secondary: fSkin.secondaryHex,
+          visor: fSkin.visorHex,
+        });
+        const slot = offsets[idx] || offsets[0];
+        const gy = getTerrainHeight(slot.x, slot.z, p.mapId);
+        fBuilt.root.position.set(slot.x, gy, slot.z);
+        fBuilt.root.rotation.y = slot.rotY;
+        lobbyPartyGroup.add(fBuilt.root);
+      });
+    }
 
     // Static obstacles & dynamic built walls
     let staticObstacles: ObstacleBox[] = [];
@@ -888,6 +976,13 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     // AI NPCs
     let npcs: NpcEntity[] = [];
     const npcMeshMap = new Map<
+      string,
+      ReturnType<typeof buildOperatorCharacterGroup>
+    >();
+
+    // Friendly AI / Party Squadmates (for 2v2, 3v3, 4v4)
+    let allyNpcs: NpcEntity[] = [];
+    const allyMeshMap = new Map<
       string,
       ReturnType<typeof buildOperatorCharacterGroup>
     >();
@@ -922,12 +1017,44 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       movementMode: 'WALK',
     };
 
+    // Player 2 Combat & Physics State (Offline Co-Op Split-Screen)
+    let p2State: PlayerPhysicsState = {
+      x: 3.6,
+      y: 0,
+      z: 20,
+      vx: 0,
+      vy: 0,
+      vz: 0,
+      yaw: 0,
+      pitch: 0,
+      grounded: true,
+      coyoteTimer: 0.1,
+      jumpBufferTimer: 0,
+      isSliding: false,
+      slideTimer: 0,
+      slideCooldown: 0,
+      isVaulting: false,
+      vaultTimer: 0,
+      isClimbing: false,
+      eyeHeight: 1.72,
+      stamina: 100,
+      movementMode: 'WALK',
+    };
+    let p2Hp = 100;
+    const p2MaxHp = 100;
+    let p2Shield = 50;
+    const p2MaxShield = 50;
+    let p2Ammo = 30;
+    let p2FireCooldown = 0;
+    let p2Eliminations = 0;
+
     let playerHp = 100;
     const playerMaxHp = 100;
     let playerShield = 50;
     const playerMaxShield = 50;
     let playerSalvage = 100;
     let currentWave = 1;
+    let totalWavesInMatch = 2;
     let playerScore = 0;
     let playerEliminations = 0;
     let wallsConstructedCount = 0;
@@ -1140,11 +1267,11 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       });
     }
 
-    // Build / Rebuild Biome Environment
+    // Build / Rebuild Expanded Biome Environment (320m x 320m terrain, 192m x 192m playable arena)
     function buildBiomeScene(mapId: MapId) {
       const biome = BIOMES[mapId] || BIOMES['alpine-outpost'];
       scene.background = new THREE.Color(biome.skyHorizonHex);
-      scene.fog = new THREE.FogExp2(biome.fogHex, biome.fogDensity);
+      scene.fog = new THREE.FogExp2(biome.fogHex, biome.fogDensity * 0.82);
       sunLight.color.setHex(biome.sunHex);
       sunLight.intensity = biome.sunIntensity;
       hemiLight.color.setHex(biome.hemiSkyHex);
@@ -1162,8 +1289,8 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         biome.terrainSecondaryHex
       );
 
-      // 1. Sculpted Outdoor Terrain Mesh (180m x 180m)
-      const terrainGeo = new THREE.PlaneGeometry(180, 180, 44, 44);
+      // 1. Expanded Sculpted Outdoor Terrain Mesh (320m x 320m)
+      const terrainGeo = new THREE.PlaneGeometry(320, 320, 56, 56);
       terrainGeo.rotateX(-Math.PI / 2);
       const posAttr = terrainGeo.attributes.position;
       for (let i = 0; i < posAttr.count; i++) {
@@ -1185,7 +1312,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       terrainMesh.receiveShadow = true;
       environmentGroup.add(terrainMesh);
 
-      // 2. Central Landmark Structure (visible in initial spawn vista at z = -16)
+      // 2. Central Landmark Structure (visible in initial spawn vista at z = -18)
       const landmarkGroup = new THREE.Group();
       const structMat = new THREE.MeshStandardMaterial({
         color: 0x334155,
@@ -1205,13 +1332,13 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       });
 
       // Base foundation platform
-      const basePad = new THREE.Mesh(new THREE.BoxGeometry(9, 0.8, 9), trimMat);
+      const basePad = new THREE.Mesh(new THREE.BoxGeometry(10, 0.8, 10), trimMat);
       basePad.position.set(0, 0.4, -18);
       basePad.receiveShadow = true;
       landmarkGroup.add(basePad);
 
       // Central Spire / Tower Core
-      const towerCore = new THREE.Mesh(new THREE.BoxGeometry(4.4, 11, 4.4), structMat);
+      const towerCore = new THREE.Mesh(new THREE.BoxGeometry(4.6, 11.5, 4.6), structMat);
       towerCore.position.set(0, 5.9, -18);
       towerCore.castShadow = true;
       towerCore.receiveShadow = true;
@@ -1219,20 +1346,35 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
 
       // Upper Observation Ring & Radome / Reactor Crown
       const upperRing = new THREE.Mesh(
-        new THREE.CylinderGeometry(3.6, 2.8, 1.8, 16),
+        new THREE.CylinderGeometry(3.8, 2.9, 1.8, 16),
         trimMat
       );
-      upperRing.position.set(0, 12.0, -18);
+      upperRing.position.set(0, 12.2, -18);
       landmarkGroup.add(upperRing);
 
       const domeCrown = new THREE.Mesh(
         biome.landmarkType === 'cryo-monolith' || biome.landmarkType === 'obsidian-reactor'
-          ? new THREE.OctahedronGeometry(2.6, 1)
-          : new THREE.SphereGeometry(2.5, 18, 14),
+          ? new THREE.OctahedronGeometry(2.7, 1)
+          : new THREE.SphereGeometry(2.6, 18, 14),
         beaconMat
       );
-      domeCrown.position.set(0, 14.4, -18);
+      domeCrown.position.set(0, 14.6, -18);
       landmarkGroup.add(domeCrown);
+
+      // Lobby Tactical Pedestal Disc at (0, groundY, 16)
+      const pedY = getTerrainHeight(0, 16, mapId);
+      const pedDisc = new THREE.Mesh(
+        new THREE.CylinderGeometry(2.1, 2.4, 0.16, 24),
+        trimMat
+      );
+      pedDisc.position.set(0, pedY + 0.08, 16);
+      const pedRing = new THREE.Mesh(
+        new THREE.TorusGeometry(2.15, 0.05, 8, 32),
+        beaconMat
+      );
+      pedRing.rotation.x = Math.PI / 2;
+      pedRing.position.set(0, pedY + 0.16, 16);
+      landmarkGroup.add(pedDisc, pedRing);
 
       environmentGroup.add(landmarkGroup);
       staticObstacles.push({
@@ -1240,14 +1382,14 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         x: 0,
         y: 0,
         z: -18,
-        width: 4.8,
+        width: 5.0,
         height: 12,
-        depth: 4.8,
+        depth: 5.0,
         climbable: true,
         vaultable: false,
       });
 
-      // 3. Tactical Cover Clusters: Vaultable Low Barriers (height 1.35m) & Climbable Watch Platforms (height 3.0m)
+      // 3. Expanded Tactical Cover Clusters across 192m x 192m Arena
       const coverConfigs = [
         // Front spawn cover (offset left & right so spawn centerline has a clear vista)
         { x: -6.5, z: 9, w: 3.8, h: 1.35, d: 0.8, climb: false, vault: true },
@@ -1261,6 +1403,16 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         { x: 14, z: -12, w: 4.4, h: 2.9, d: 4.4, climb: true, vault: false },
         { x: -9, z: -26, w: 4.0, h: 2.8, d: 4.0, climb: true, vault: false },
         { x: 9, z: -26, w: 4.0, h: 2.8, d: 4.0, climb: true, vault: false },
+        // Outer Perimeter Flanking Bunkers & Watchtowers (Expanded 192m x 192m Sector)
+        { x: -28, z: 6, w: 5.2, h: 3.1, d: 5.2, climb: true, vault: false },
+        { x: 28, z: 6, w: 5.2, h: 3.1, d: 5.2, climb: true, vault: false },
+        { x: -32, z: -24, w: 4.8, h: 1.4, d: 1.2, climb: false, vault: true },
+        { x: 32, z: -24, w: 4.8, h: 1.4, d: 1.2, climb: false, vault: true },
+        { x: -22, z: -44, w: 5.0, h: 3.2, d: 5.0, climb: true, vault: false },
+        { x: 22, z: -44, w: 5.0, h: 3.2, d: 5.0, climb: true, vault: false },
+        { x: 0, z: -48, w: 6.2, h: 1.4, d: 1.2, climb: false, vault: true },
+        { x: -18, z: 34, w: 4.6, h: 1.4, d: 1.1, climb: false, vault: true },
+        { x: 18, z: 34, w: 4.6, h: 1.4, d: 1.1, climb: false, vault: true },
       ];
 
       coverConfigs.forEach((cfg, idx) => {
@@ -1309,11 +1461,11 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         });
       });
 
-      // 4. Natural Perimeter Barriers using InstancedMesh (> 48 composite 3-part trees/monoliths)
-      const instanceCount = 56;
-      const trunkGeo = new THREE.CylinderGeometry(0.35, 0.55, 2.8, 8);
-      const canopyGeo = new THREE.ConeGeometry(2.2, 4.2, 8);
-      const upperCrownGeo = new THREE.ConeGeometry(1.55, 3.4, 8);
+      // 4. Expanded Natural Perimeter Barriers using InstancedMesh (72 composite 3-part trees/monoliths)
+      const instanceCount = 72;
+      const trunkGeo = new THREE.CylinderGeometry(0.35, 0.55, 3.2, 8);
+      const canopyGeo = new THREE.ConeGeometry(2.4, 4.6, 8);
+      const upperCrownGeo = new THREE.ConeGeometry(1.7, 3.6, 8);
       const trunkMat = new THREE.MeshStandardMaterial({
         color: 0x3f2e21,
         roughness: 0.9,
@@ -1335,23 +1487,23 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
 
       for (let i = 0; i < instanceCount; i++) {
         const angle = (i / instanceCount) * Math.PI * 2;
-        const radius = 36 + (i % 4) * 7.5;
+        const radius = 62 + (i % 4) * 9.5;
         const px = Math.cos(angle) * radius;
         const pz = Math.sin(angle) * radius;
         const py = getTerrainHeight(px, pz, mapId);
-        const scale = 0.85 + (i % 5) * 0.09;
+        const scale = 0.9 + (i % 5) * 0.11;
 
-        _dummyObj.position.set(px, py + 1.4 * scale, pz);
+        _dummyObj.position.set(px, py + 1.5 * scale, pz);
         _dummyObj.rotation.set(0, angle, 0);
         _dummyObj.scale.set(scale, scale, scale);
         _dummyObj.updateMatrix();
         trunkInstanced.setMatrixAt(i, _dummyObj.matrix);
 
-        _dummyObj.position.set(px, py + 3.8 * scale, pz);
+        _dummyObj.position.set(px, py + 4.1 * scale, pz);
         _dummyObj.updateMatrix();
         canopyInstanced.setMatrixAt(i, _dummyObj.matrix);
 
-        _dummyObj.position.set(px, py + 5.7 * scale, pz);
+        _dummyObj.position.set(px, py + 6.1 * scale, pz);
         _dummyObj.updateMatrix();
         crownInstanced.setMatrixAt(i, _dummyObj.matrix);
 
@@ -1369,7 +1521,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       crownInstanced.computeBoundingSphere();
       environmentGroup.add(trunkInstanced, canopyInstanced, crownInstanced);
 
-      // 5. Salvage Supply Crates for Wall Construction
+      // 5. Salvage Supply Crates for Wall Construction across the Expanded Map
       while (cratesGroup.children.length > 0) {
         cratesGroup.remove(cratesGroup.children[0]);
       }
@@ -1380,6 +1532,9 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         { id: 'crate-3', label: 'Heavy Fortification Supply', x: -10, y: 0, z: -6, amount: 45, cooldown: 0 },
         { id: 'crate-4', label: 'Core Reactor Salvage', x: 10, y: 0, z: -6, amount: 45, cooldown: 0 },
         { id: 'crate-5', label: 'Forward Outpost Cache', x: 0, y: 0, z: -9, amount: 50, cooldown: 0 },
+        { id: 'crate-6', label: 'West Wing Supply Drop', x: -24, y: 0, z: -12, amount: 55, cooldown: 0 },
+        { id: 'crate-7', label: 'East Wing Supply Drop', x: 24, y: 0, z: -12, amount: 55, cooldown: 0 },
+        { id: 'crate-8', label: 'Deep Sector Cache', x: 0, y: 0, z: -34, amount: 65, cooldown: 0 },
       ];
 
       salvageNodes.forEach((node) => {
@@ -1406,12 +1561,17 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         cratesGroup.add(crateG);
         crateMeshMap.set(node.id, crateG);
       });
+
+      syncLobbyAvatars();
     }
 
-    // Rebuild First-Person Weapon Viewmodel
+    // Rebuild First-Person Weapon Viewmodel (Player 1 & Split-Screen Player 2)
     function rebuildWeaponViewModel() {
       while (weaponRigGroup.children.length > 0) {
         weaponRigGroup.remove(weaponRigGroup.children[0]);
+      }
+      while (p2WeaponRigGroup.children.length > 0) {
+        p2WeaponRigGroup.remove(p2WeaponRigGroup.children[0]);
       }
       const p = propsRef.current;
       const vm = buildWeaponViewModel(
@@ -1424,9 +1584,20 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       );
       vm.position.set(0.28, -0.24, -0.48);
       weaponRigGroup.add(vm);
+
+      const vm2 = buildWeaponViewModel(
+        p.weaponId,
+        p.opticId,
+        p.barrelId,
+        p.underbarrelId,
+        p.magId,
+        'alpine-ghost'
+      );
+      vm2.position.set(0.28, -0.24, -0.48);
+      p2WeaponRigGroup.add(vm2);
     }
 
-    // Spawn AI Wave
+    // Spawn AI Wave + Friendly Squadmates based on Battle Mode (1v1..4v4, Co-Op, Practice) & Bot Hardness
     function spawnWaveNpcs(waveNum: number) {
       while (npcsGroup.children.length > 0) {
         npcsGroup.remove(npcsGroup.children[0]);
@@ -1434,23 +1605,31 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       npcMeshMap.clear();
       npcs = [];
 
+      while (alliesGroup.children.length > 0) {
+        alliesGroup.remove(alliesGroup.children[0]);
+      }
+      allyMeshMap.clear();
+      allyNpcs = [];
+
       const p = propsRef.current;
-      const cfg = computeTrainingWaveConfig(p.trainingLevel, waveNum);
+      const roster = computeTeamMatchRoster(p.battleMode, p.botHardness, waveNum);
+      totalWavesInMatch = roster.totalWaves;
       const archetypes: NpcArchetype[] = ['rusher', 'marksman', 'flanker', 'juggernaut'];
 
-      for (let i = 0; i < cfg.totalEnemies; i++) {
-        // Pick archetype deterministically from weights
+      for (let i = 0; i < roster.enemyCount; i++) {
         let arch: NpcArchetype = archetypes[i % 3];
-        if (p.trainingLevel >= 2 && i % 4 === 3) arch = 'juggernaut';
+        if ((p.botHardness === 'master' || p.botHardness === 'legend' || p.trainingLevel >= 2) && i % 4 === 3) {
+          arch = 'juggernaut';
+        }
 
-        const angle = ((i / cfg.totalEnemies) - 0.5) * Math.PI * 0.85;
-        const dist = 24 + (i % 3) * 8;
+        const angle = ((i / Math.max(1, roster.enemyCount)) - 0.5) * Math.PI * 0.92;
+        const dist = 26 + (i % 3) * 11;
         const nx = Math.sin(angle) * dist;
-        const nz = -Math.cos(angle) * dist - 6;
+        const nz = -Math.cos(angle) * dist - 8;
         const ny = getTerrainHeight(nx, nz, p.mapId);
 
         const baseHp = arch === 'juggernaut' ? 190 : arch === 'rusher' ? 95 : 110;
-        const maxHp = Math.round(baseHp * cfg.hpMultiplier);
+        const maxHp = Math.round(baseHp * roster.hpMultiplier);
         const maxShield = arch === 'juggernaut' ? 90 : arch === 'flanker' ? 35 : 0;
 
         const id = `npc-w${waveNum}-${i}`;
@@ -1471,7 +1650,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           maxShield,
           state: 'seek',
           windupTimer: 0.45,
-          attackCooldown: 1.2 + (i % 4) * 0.45,
+          attackCooldown: (1.2 + (i % 4) * 0.45) * roster.fireCooldownMultiplier,
           koTimer: 0,
           hitFlashTimer: 0,
           strafeSign: i % 2 === 0 ? 1 : -1,
@@ -1483,11 +1662,56 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         npcsGroup.add(built.root);
         npcMeshMap.set(id, built);
       }
+
+      // Spawn Friendly Squad AI / Party Allies for 2v2, 3v3, 4v4
+      const fallbackAllies = ['VANGUARD_A1', 'KESTREL_A2', 'NOVA_A3'];
+      for (let a = 0; a < roster.allyCount; a++) {
+        const partyFriend = p.partyMembers[a];
+        const allyCallsign = partyFriend ? partyFriend.username : fallbackAllies[a % fallbackAllies.length];
+        const allySkinId: SkinId = partyFriend ? partyFriend.skinId : 'alpine-ghost';
+        const skinDef = OPERATOR_SKINS[allySkinId] || OPERATOR_SKINS['alpine-ghost'];
+        const ax = (a % 2 === 0 ? -1 : 1) * (4.5 + a * 2.5);
+        const az = 16 - a * 2;
+        const ay = getTerrainHeight(ax, az, p.mapId);
+        const allyId = `ally-w${waveNum}-${a}`;
+
+        const ally: NpcEntity = {
+          id: allyId,
+          callsign: allyCallsign,
+          archetype: 'marksman',
+          x: ax,
+          y: ay,
+          z: az,
+          vx: 0,
+          vz: 0,
+          rotY: Math.PI,
+          hp: 120,
+          maxHp: 120,
+          shield: 60,
+          maxShield: 60,
+          state: 'seek',
+          windupTimer: 0,
+          attackCooldown: 1.1 + a * 0.35,
+          koTimer: 0,
+          hitFlashTimer: 0,
+          strafeSign: a % 2 === 0 ? 1 : -1,
+        };
+        allyNpcs.push(ally);
+
+        const builtAlly = buildOperatorCharacterGroup('SQUAD', contactShadowTex, {
+          primary: skinDef.primaryHex,
+          secondary: skinDef.secondaryHex,
+          visor: skinDef.visorHex,
+        });
+        builtAlly.root.position.set(ax, ay, az);
+        alliesGroup.add(builtAlly.root);
+        allyMeshMap.set(allyId, builtAlly);
+      }
     }
 
     function resetSession() {
       const p = propsRef.current;
-      const cfg = computeTrainingWaveConfig(p.trainingLevel, 1);
+      const roster = computeTeamMatchRoster(p.battleMode, p.botHardness, 1);
       const stats = computeWeaponStats(
         p.weaponId,
         {
@@ -1521,10 +1745,39 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         stamina: 100,
         movementMode: 'WALK',
       };
+      p2State = {
+        x: 3.6,
+        y: getTerrainHeight(3.6, 20, p.mapId),
+        z: 20,
+        vx: 0,
+        vy: 0,
+        vz: 0,
+        yaw: 0,
+        pitch: 0,
+        grounded: true,
+        coyoteTimer: 0.1,
+        jumpBufferTimer: 0,
+        isSliding: false,
+        slideTimer: 0,
+        slideCooldown: 0,
+        isVaulting: false,
+        vaultTimer: 0,
+        isClimbing: false,
+        eyeHeight: 1.72,
+        stamina: 100,
+        movementMode: 'WALK',
+      };
+      p2Hp = p2MaxHp;
+      p2Shield = p2MaxShield;
+      p2Ammo = stats.magSize;
+      p2FireCooldown = 0;
+      p2Eliminations = 0;
+
       playerHp = playerMaxHp;
       playerShield = playerMaxShield;
-      playerSalvage = cfg.startingSalvage;
+      playerSalvage = roster.startingSalvage;
       currentWave = 1;
+      totalWavesInMatch = roster.totalWaves;
       playerScore = 0;
       playerEliminations = 0;
       wallsConstructedCount = 0;
@@ -1560,6 +1813,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     internalRef.current.rebuildBiome = buildBiomeScene;
     internalRef.current.rebuildWeaponMesh = rebuildWeaponViewModel;
     internalRef.current.resetSession = resetSession;
+    internalRef.current.syncLobbyAvatars = syncLobbyAvatars;
     internalRef.current.forceTriggerEnvironmentEvent = () => {
       pendingForceEnvEvent = true;
     };
@@ -2047,24 +2301,46 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       else if (gpFrame.wallSelectSlot === 2) p.onSelectWallType('rampart');
       else if (gpFrame.wallSelectSlot === 3) p.onSelectWallType('bastion');
 
-      // Stage 1: Title Screen Live World Camera Spline Flyover
+      // Stage 1: Title Screen 3D Operator & Party Centerpiece Showcase
       if (p.gameState === 'title') {
         weaponRigGroup.visible = false;
+        p2WeaponRigGroup.visible = false;
         wallPreviewMesh.visible = false;
-        replayOperatorAvatar.root.visible = false;
+        p2OperatorAvatar.root.visible = false;
         weatherInstanced.visible = false;
-        const orbitAngle = elapsed * 0.18;
-        const camRadius = 32;
-        const targetCamX = Math.sin(orbitAngle) * camRadius;
-        const targetCamZ = Math.cos(orbitAngle) * camRadius - 6;
-        const targetCamY = getTerrainHeight(targetCamX, targetCamZ, p.mapId) + 9.5;
-        camera.position.lerp(_vec3A.set(targetCamX, targetCamY, targetCamZ), 1 - Math.exp(-4 * dt));
-        camera.lookAt(0, 4.2, -16);
+        npcsGroup.visible = false;
+        alliesGroup.visible = false;
+        remotePlayersGroup.visible = false;
+        lobbyPartyGroup.visible = true;
+
+        const pedY = getTerrainHeight(0, 16, p.mapId);
+        replayOperatorAvatar.root.visible = true;
+        replayOperatorAvatar.root.position.set(
+          0,
+          pedY + 0.16 + Math.sin(elapsed * 2.1) * 0.025,
+          16
+        );
+        replayOperatorAvatar.root.rotation.y = Math.sin(elapsed * 0.65) * 0.32;
+
+        const camSwayX = Math.sin(elapsed * 0.28) * 0.65;
+        const targetCamX = camSwayX;
+        const targetCamZ = 20.65;
+        const targetCamY = pedY + 1.55;
+        camera.fov = 56;
+        camera.updateProjectionMatrix();
+        camera.position.set(targetCamX, targetCamY, targetCamZ);
+        camera.lookAt(0, pedY + 1.24, 15.8);
       } else if (p.gameState === 'replay') {
         // ===================================================================
         // STAGE 5: 3D TACTICAL MATCH REPLAY ENGINE (FPV / ORBIT / DRONE CAM)
         // ===================================================================
         wallPreviewMesh.visible = false;
+        lobbyPartyGroup.visible = false;
+        npcsGroup.visible = true;
+        alliesGroup.visible = false;
+        remotePlayersGroup.visible = false;
+        p2OperatorAvatar.root.visible = false;
+        p2WeaponRigGroup.visible = false;
         const activeRec = p.replayRecording;
         const frameSnap = activeRec
           ? interpolateReplayFrames(activeRec, p.replayTimeSec)
@@ -2142,8 +2418,15 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           }
         }
       } else if (p.gameState === 'playing') {
-        replayOperatorAvatar.root.visible = false;
+        const isSplitScreen = p.battleMode === 'coop-splitscreen';
+        replayOperatorAvatar.root.visible = isSplitScreen;
+        lobbyPartyGroup.visible = false;
+        npcsGroup.visible = true;
+        alliesGroup.visible = true;
+        remotePlayersGroup.visible = true;
         weaponRigGroup.visible = true;
+        p2WeaponRigGroup.visible = isSplitScreen;
+        p2OperatorAvatar.root.visible = isSplitScreen;
 
         const isAdsActive = rightMouseDown || touch.adsHeld || gpFrame.adsHeld;
         let isFireActive = mouseDown || touch.fireHeld || gpFrame.fireHeld;
@@ -2350,7 +2633,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           if (scene.fog instanceof THREE.FogExp2) {
             const targetFogDensity = activeEnvEvent
               ? biome.fogDensity * activeEnvEvent.fogDensityMult
-              : biome.fogDensity;
+              : biome.fogDensity * 0.82;
             scene.fog.density = THREE.MathUtils.damp(
               scene.fog.density,
               targetFogDensity,
@@ -2437,12 +2720,15 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
             });
           }
 
-          const kbForward =
-            (keysHeld.has('KeyW') || keysHeld.has('ArrowUp') ? 1 : 0) -
-            (keysHeld.has('KeyS') || keysHeld.has('ArrowDown') ? 1 : 0);
-          const kbRight =
-            (keysHeld.has('KeyD') || keysHeld.has('ArrowRight') ? 1 : 0) -
-            (keysHeld.has('KeyA') || keysHeld.has('ArrowLeft') ? 1 : 0);
+          // When in Split-Screen Co-Op, Arrow keys control Player 2; otherwise WASD + Arrows control P1
+          const kbForward = isSplitScreen
+            ? (keysHeld.has('KeyW') ? 1 : 0) - (keysHeld.has('KeyS') ? 1 : 0)
+            : (keysHeld.has('KeyW') || keysHeld.has('ArrowUp') ? 1 : 0) -
+              (keysHeld.has('KeyS') || keysHeld.has('ArrowDown') ? 1 : 0);
+          const kbRight = isSplitScreen
+            ? (keysHeld.has('KeyD') ? 1 : 0) - (keysHeld.has('KeyA') ? 1 : 0)
+            : (keysHeld.has('KeyD') || keysHeld.has('ArrowRight') ? 1 : 0) -
+              (keysHeld.has('KeyA') || keysHeld.has('ArrowLeft') ? 1 : 0);
 
           const forwardInput = THREE.MathUtils.clamp(
             kbForward + touch.moveY + gpFrame.moveForward,
@@ -2502,6 +2788,97 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
             if (playerState.movementMode === 'SLIDE') soundEngine.playMovementAction('slide');
             else if (playerState.movementMode === 'VAULT') soundEngine.playMovementAction('vault');
             else if (playerState.movementMode === 'CLIMB') soundEngine.playMovementAction('climb');
+          }
+
+          // Step Split-Screen Player 2 (Arrow keys + IJKL / Enter or Smart Co-Op Wingman Assist)
+          if (isSplitScreen) {
+            p2FireCooldown = Math.max(0, p2FireCooldown - simDt);
+            p2Hp = Math.min(p2MaxHp, p2Hp + 1.8 * simDt);
+            p2Shield = Math.min(p2MaxShield, p2Shield + 2.5 * simDt);
+
+            const p2ManualFwd =
+              (keysHeld.has('ArrowUp') ? 1 : 0) - (keysHeld.has('ArrowDown') ? 1 : 0);
+            const p2ManualRight =
+              (keysHeld.has('ArrowRight') ? 1 : 0) - (keysHeld.has('ArrowLeft') ? 1 : 0);
+            const p2LookYaw =
+              (keysHeld.has('KeyJ') ? 1 : 0) - (keysHeld.has('KeyL') ? 1 : 0);
+            const p2LookPitch =
+              (keysHeld.has('KeyI') ? 1 : 0) - (keysHeld.has('KeyK') ? 1 : 0);
+
+            if (p2LookYaw !== 0 || p2LookPitch !== 0) {
+              p2State.yaw += p2LookYaw * 2.1 * simDt;
+              p2State.pitch = THREE.MathUtils.clamp(
+                p2State.pitch + p2LookPitch * 1.4 * simDt,
+                -1.1,
+                1.1
+              );
+            }
+
+            // Smart Co-Op Assist when P2 isn't manually steering
+            const p2Assist = evaluateSmartAimAssist(p2State, npcs, stats.range, simDt, 6.5);
+            if (p2LookYaw === 0 && p2LookPitch === 0) {
+              p2State.yaw = p2Assist.nextYaw;
+              p2State.pitch = p2Assist.nextPitch;
+            }
+
+            const p2AutoFwd =
+              p2ManualFwd !== 0
+                ? p2ManualFwd
+                : Math.hypot(p2State.x - playerState.x, p2State.z - playerState.z) > 9
+                  ? 0.65
+                  : Math.sin(elapsed * 0.9) * 0.35;
+            const p2AutoRight =
+              p2ManualRight !== 0 ? p2ManualRight : Math.cos(elapsed * 1.1) * 0.45;
+
+            p2State = evaluateMovementPhysics(
+              p2State,
+              {
+                forward: p2AutoFwd,
+                right: p2AutoRight,
+                sprintHeld: Math.abs(p2AutoFwd) > 0.75,
+                slideJustPressed: keysJustPressed.has('Slash'),
+                jumpJustPressed: keysJustPressed.has('ShiftRight'),
+                jumpHeld: keysHeld.has('ShiftRight'),
+                speedMultiplier: eventSpeedMult,
+                jumpMultiplier: eventJumpMult,
+                smartParkour: true,
+              },
+              simDt,
+              allObstacles,
+              p.mapId
+            );
+
+            // P2 weapon fire (Enter / Numpad0 or auto-fire when locked onto target)
+            const p2WantsFire =
+              keysHeld.has('Enter') ||
+              keysHeld.has('Numpad0') ||
+              (p2Assist.shouldAutoFire && p2Assist.lockedTargetId !== null);
+            if (p2WantsFire && p2FireCooldown <= 0) {
+              p2FireCooldown = stats.fireIntervalSec * 1.35;
+              p2Ammo = p2Ammo > 1 ? p2Ammo - 1 : stats.magSize;
+              p2WeaponRigGroup.position.z = 0.05;
+              const targetNpc = npcs.find(
+                (n) => n.id === p2Assist.lockedTargetId && n.hp > 0
+              );
+              if (targetNpc) {
+                const p2Dmg = Math.round(stats.damage * 0.75);
+                if (targetNpc.shield > 0) {
+                  const sa = Math.min(targetNpc.shield, p2Dmg);
+                  targetNpc.shield -= sa;
+                } else {
+                  targetNpc.hp = Math.max(0, targetNpc.hp - p2Dmg);
+                }
+                targetNpc.hitFlashTimer = 0.08;
+                spawnParticles(targetNpc.x, targetNpc.y + 1.2, targetNpc.z, 4, 0x38bdf8, 4);
+                if (targetNpc.hp <= 0 && targetNpc.state !== 'ko') {
+                  targetNpc.state = 'ko';
+                  targetNpc.koTimer = 0.42;
+                  p2Eliminations += 1;
+                  playerEliminations += 1;
+                  playerScore += 100;
+                }
+              }
+            }
           }
 
           // Harvest Salvage Crates (auto-collect within 3.2m with Smart Controls or press E / X / Loot within 4.5m)
@@ -2565,8 +2942,64 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
             }
           }
 
-          // Step AI NPCs with Crowd Attack Token Pool (max 3 simultaneous windups)
-          const cfg = computeTrainingWaveConfig(p.trainingLevel, currentWave);
+          // Step Friendly AI / Party Squadmates (for 2v2, 3v3, 4v4)
+          for (const ally of allyNpcs) {
+            const allyMesh = allyMeshMap.get(ally.id);
+            if (!allyMesh || ally.hp <= 0) continue;
+            ally.attackCooldown = Math.max(0, ally.attackCooldown - simDt);
+
+            // Find closest alive enemy
+            let targetEnemy: NpcEntity | null = null;
+            let bestDist = 999;
+            for (const enemy of npcs) {
+              if (enemy.hp <= 0 || enemy.state === 'ko') continue;
+              const d = Math.hypot(enemy.x - ally.x, enemy.z - ally.z);
+              if (d < bestDist) {
+                bestDist = d;
+                targetEnemy = enemy;
+              }
+            }
+
+            if (targetEnemy) {
+              const dx = targetEnemy.x - ally.x;
+              const dz = targetEnemy.z - ally.z;
+              ally.rotY = Math.atan2(dx, dz);
+              const moveSpeed = 3.8;
+              if (bestDist > 18) {
+                ally.x += (dx / bestDist) * moveSpeed * simDt;
+                ally.z += (dz / bestDist) * moveSpeed * simDt;
+              } else {
+                const perpX = (-dz / Math.max(1, bestDist)) * ally.strafeSign;
+                const perpZ = (dx / Math.max(1, bestDist)) * ally.strafeSign;
+                ally.x += perpX * 2.4 * simDt;
+                ally.z += perpZ * 2.4 * simDt;
+              }
+              ally.y = getTerrainHeight(ally.x, ally.z, p.mapId);
+              allyMesh.root.position.set(ally.x, ally.y, ally.z);
+              allyMesh.root.rotation.y = ally.rotY;
+
+              if (ally.attackCooldown <= 0 && bestDist < 42) {
+                ally.attackCooldown = 1.45 + Math.random() * 0.6;
+                const allyDmg = 18;
+                if (targetEnemy.shield > 0) {
+                  targetEnemy.shield = Math.max(0, targetEnemy.shield - allyDmg);
+                } else {
+                  targetEnemy.hp = Math.max(0, targetEnemy.hp - allyDmg);
+                }
+                targetEnemy.hitFlashTimer = 0.07;
+                spawnParticles(targetEnemy.x, targetEnemy.y + 1.2, targetEnemy.z, 4, 0x38bdf8, 4);
+                if (targetEnemy.hp <= 0 && targetEnemy.state !== 'ko') {
+                  targetEnemy.state = 'ko';
+                  targetEnemy.koTimer = 0.42;
+                  playerScore += 65;
+                  playerEliminations += 1;
+                }
+              }
+            }
+          }
+
+          // Step Enemy AI NPCs with Bot Hardness Scaling & Crowd Attack Token Pool
+          const roster = computeTeamMatchRoster(p.battleMode, p.botHardness, currentWave);
           let activeWindups = npcs.filter((n) => n.state === 'windup' && n.hp > 0).length;
 
           for (const npc of npcs) {
@@ -2595,8 +3028,8 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
               npc,
               playerState,
               simDt,
-              cfg.speedMultiplier,
-              activeWindups < 3
+              roster.speedMultiplier,
+              activeWindups < roster.maxConcurrentWindups
             );
 
             npc.vx = decision.nextVx;
@@ -2605,7 +3038,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
             npc.state = decision.nextState;
 
             if (npc.state === 'windup' && prevState !== 'windup') {
-              npc.windupTimer = 0.52;
+              npc.windupTimer = 0.52 * roster.fireCooldownMultiplier;
               activeWindups += 1;
               soundEngine.playTelegraphAlert();
             } else if (npc.state === 'windup') {
@@ -2629,7 +3062,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
               // NPC attacks the blocking defensive wall
               if (npc.attackCooldown <= 0) {
                 blockedByWall.hp = Math.max(0, blockedByWall.hp - 22);
-                npc.attackCooldown = 1.1;
+                npc.attackCooldown = 1.1 * roster.fireCooldownMultiplier;
                 spawnParticles(blockedByWall.x, blockedByWall.y + 1.2, blockedByWall.z, 5, 0xf59e0b, 3);
                 if (blockedByWall.hp <= 0) {
                   localBuiltWalls = localBuiltWalls.filter((lw) => lw.id !== blockedByWall!.id);
@@ -2643,7 +3076,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
 
             // Execute telegraphed NPC attack if not blocked by a defensive wall along line of sight
             if (decision.triggerFire) {
-              npc.attackCooldown = 1.65 + Math.random() * 0.7;
+              npc.attackCooldown = (1.65 + Math.random() * 0.7) * roster.fireCooldownMultiplier;
               let wallIntercepted = false;
               for (const w of mergedWallsMap.values()) {
                 // Check if wall lies between NPC and player
@@ -2667,7 +3100,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
               }
 
               if (!wallIntercepted) {
-                const rawEnemyDmg = Math.round(11 * cfg.damageMultiplier);
+                const rawEnemyDmg = Math.round(11 * roster.damageMultiplier);
                 const shieldAbsorb = Math.min(playerShield, rawEnemyDmg);
                 playerShield -= shieldAbsorb;
                 const hpDmg = rawEnemyDmg - shieldAbsorb;
@@ -2687,6 +3120,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
                     eliminations: playerEliminations,
                     wallsConstructed: wallsConstructedCount,
                     waveReached: currentWave,
+                    durationSec: Math.max(1, Math.round(matchElapsedSec)),
                   });
                 }
               }
@@ -2717,11 +3151,11 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           // Check Wave Completion / Victory
           const aliveCount = npcs.filter((n) => n.hp > 0).length;
           if (aliveCount === 0 && !sessionEnded) {
-            if (currentWave < 2) {
+            if (currentWave < totalWavesInMatch) {
               currentWave += 1;
               playerSalvage += 45;
               playerHp = Math.min(playerMaxHp, playerHp + 35);
-              recordReplayHighlight('WAVE_CLEAR', `Cleared Wave 1`, '#10b981');
+              recordReplayHighlight('WAVE_CLEAR', `Cleared Wave ${currentWave - 1}`, '#10b981');
               spawnWaveNpcs(currentWave);
               captureReplayFrame(true);
             } else {
@@ -2737,6 +3171,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
                 eliminations: playerEliminations,
                 wallsConstructed: wallsConstructedCount,
                 waveReached: currentWave,
+                durationSec: Math.max(1, Math.round(matchElapsedSec)),
               });
             }
           }
@@ -2757,6 +3192,29 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         camera.rotation.y = playerState.yaw + shakeYaw;
         camera.rotation.x = playerState.pitch + shakePitch;
         camera.rotation.z = THREE.MathUtils.damp(camera.rotation.z, slideRoll, 12, dt);
+
+        if (isSplitScreen) {
+          replayOperatorAvatar.root.position.set(playerState.x, playerState.y, playerState.z);
+          replayOperatorAvatar.root.rotation.y = playerState.yaw + Math.PI;
+
+          p2OperatorAvatar.root.position.set(p2State.x, p2State.y, p2State.z);
+          p2OperatorAvatar.root.rotation.y = p2State.yaw + Math.PI;
+
+          p2Camera.position.set(p2State.x, p2State.y + p2State.eyeHeight, p2State.z);
+          p2Camera.rotation.order = 'YXZ';
+          p2Camera.rotation.y = p2State.yaw;
+          p2Camera.rotation.x = p2State.pitch;
+          p2Camera.rotation.z = 0;
+
+          p2WeaponRigGroup.position.x = 0.26;
+          p2WeaponRigGroup.position.y = -0.23;
+          p2WeaponRigGroup.position.z = THREE.MathUtils.damp(
+            p2WeaponRigGroup.position.z,
+            -0.46,
+            18,
+            dt
+          );
+        }
 
         // Update First-Person Weapon Viewmodel Gait Bob & ADS Offset
         const horizSpeed = Math.hypot(playerState.vx, playerState.vz);
@@ -2828,13 +3286,54 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       touch.harvestJustPressed = false;
       touch.stimJustPressed = false;
       touch.emoteJustPressed = false;
-      renderer.render(scene, camera);
+
+      // Render Full Viewport or Dual Split-Screen Co-Op Viewports
+      const canvasW = container?.clientWidth || window.innerWidth;
+      const canvasH = Math.max(1, container?.clientHeight || window.innerHeight);
+      if (p.battleMode === 'coop-splitscreen' && p.gameState === 'playing') {
+        const halfW = Math.floor(canvasW * 0.5);
+        camera.aspect = halfW / canvasH;
+        camera.updateProjectionMatrix();
+        p2Camera.aspect = (canvasW - halfW) / canvasH;
+        p2Camera.updateProjectionMatrix();
+
+        renderer.setScissorTest(true);
+        // Left Viewport: Player 1
+        replayOperatorAvatar.root.visible = false;
+        p2OperatorAvatar.root.visible = true;
+        weaponRigGroup.visible = true;
+        p2WeaponRigGroup.visible = false;
+        renderer.setViewport(0, 0, halfW, canvasH);
+        renderer.setScissor(0, 0, halfW, canvasH);
+        renderer.render(scene, camera);
+
+        // Right Viewport: Player 2
+        replayOperatorAvatar.root.visible = true;
+        p2OperatorAvatar.root.visible = false;
+        weaponRigGroup.visible = false;
+        p2WeaponRigGroup.visible = true;
+        renderer.setViewport(halfW, 0, canvasW - halfW, canvasH);
+        renderer.setScissor(halfW, 0, canvasW - halfW, canvasH);
+        renderer.render(scene, p2Camera);
+        renderer.setScissorTest(false);
+        renderer.setViewport(0, 0, canvasW, canvasH);
+      } else {
+        camera.aspect = canvasW / canvasH;
+        camera.updateProjectionMatrix();
+        renderer.setScissorTest(false);
+        renderer.setViewport(0, 0, canvasW, canvasH);
+        renderer.render(scene, camera);
+      }
 
       // Throttle HUD telemetry & 3D-to-2D Over-The-Head HP Bar Projections to ~15Hz
       if (elapsed - lastHudSyncTime >= 0.065) {
         lastHudSyncTime = elapsed;
         const rect = renderer.domElement.getBoundingClientRect();
-        const width = rect.width || window.innerWidth;
+        const fullWidth = rect.width || window.innerWidth;
+        const width =
+          p.battleMode === 'coop-splitscreen' && p.gameState === 'playing'
+            ? fullWidth * 0.5
+            : fullWidth;
         const height = rect.height || window.innerHeight;
 
         const opponentsOverlay: ProjectedOpponentOverlay[] = [];
@@ -2842,7 +3341,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           if (npc.hp <= 0) continue;
           _projVec.set(npc.x, npc.y + 2.38, npc.z);
           const dist = camera.position.distanceTo(_projVec);
-          if (dist > 68) continue;
+          if (dist > 85) continue;
           _projVec.project(camera);
           // Guard 3D world-to-screen projection with v.z >= -1 && v.z <= 1
           if (_projVec.z >= -1 && _projVec.z <= 1 && Math.abs(_projVec.x) <= 0.96 && Math.abs(_projVec.y) <= 0.92) {
@@ -2859,6 +3358,31 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
               isWindup: npc.state === 'windup',
               distance: Math.round(dist),
               isSquadmate: false,
+            });
+          }
+        }
+
+        // Project friendly AI / Party squadmates' overhead HP bars
+        for (const ally of allyNpcs) {
+          if (ally.hp <= 0) continue;
+          _projVec.set(ally.x, ally.y + 2.38, ally.z);
+          const dist = camera.position.distanceTo(_projVec);
+          if (dist > 85) continue;
+          _projVec.project(camera);
+          if (_projVec.z >= -1 && _projVec.z <= 1 && Math.abs(_projVec.x) <= 0.96 && Math.abs(_projVec.y) <= 0.92) {
+            opponentsOverlay.push({
+              id: ally.id,
+              callsign: ally.callsign,
+              archetype: 'SQUAD',
+              screenX: ((_projVec.x + 1) * 0.5) * width,
+              screenY: ((-_projVec.y + 1) * 0.5) * height,
+              hp: Math.round(ally.hp),
+              maxHp: Math.round(ally.maxHp),
+              shield: Math.round(ally.shield),
+              maxShield: Math.round(ally.maxShield),
+              isWindup: false,
+              distance: Math.round(dist),
+              isSquadmate: true,
             });
           }
         }
@@ -2926,6 +3450,8 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           stimCooldown,
           stimActiveTimer,
           wave: currentWave,
+          totalWaves: totalWavesInMatch,
+          matchElapsedSec: Math.round(matchElapsedSec),
           enemiesRemaining: npcs.filter((n) => n.hp > 0).length,
           totalEnemiesInWave: npcs.length,
           score: Math.round(playerScore),
@@ -2947,6 +3473,21 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
               }
             : null,
           nextEventCooldownSec: envEventCooldownTimer,
+          splitScreenP2:
+            p.battleMode === 'coop-splitscreen'
+              ? {
+                  active: true,
+                  callsign: p.partyMembers[0]?.username || `${p.callsign}_P2`,
+                  hp: Math.round(p2Hp),
+                  maxHp: p2MaxHp,
+                  shield: Math.round(p2Shield),
+                  maxShield: p2MaxShield,
+                  ammo: p2Ammo,
+                  magSize: stats.magSize,
+                  eliminations: p2Eliminations,
+                  movementMode: p2State.movementMode,
+                }
+              : null,
           opponentsOverlay,
           minimapEntities: {
             playerX: playerState.x,
@@ -2970,11 +3511,16 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
               z: c.z,
               ready: c.cooldown <= 0,
             })),
-            squadmates: p.remoteOperators.map((r) => ({
-              x: r.x,
-              z: r.z,
-              callsign: r.callsign,
-            })),
+            squadmates: [
+              ...allyNpcs
+                .filter((a) => a.hp > 0)
+                .map((a) => ({ x: a.x, z: a.z, callsign: a.callsign })),
+              ...p.remoteOperators.map((r) => ({
+                x: r.x,
+                z: r.z,
+                callsign: r.callsign,
+              })),
+            ],
           },
         });
       }

@@ -351,4 +351,62 @@ test('evaluateSmartAimAssist, stepDynamicEnvironmentEventState, and interpolateR
   assert.equal(interp.playerZ, 10);
 });
 
+test('calculateMatchXpAndCredits rewards faster kills-per-minute and victory credits across 1v1 to 4v4 and bot hardness', async () => {
+  const {
+    calculateMatchXpAndCredits,
+    computeOperatorLevelFromXp,
+    computeTeamMatchRoster,
+  } = await import('./rules');
+
+  // Same number of kills (8) in 60s vs 180s -> 60s has higher KPM (8.0 vs 2.67) and earns higher KPM velocity bonus
+  const fastRun = calculateMatchXpAndCredits({
+    durationSec: 60,
+    eliminations: 8,
+    wallsConstructed: 2,
+    victory: true,
+    battleMode: '4v4',
+    botHardness: 'legend',
+  });
+  const slowRun = calculateMatchXpAndCredits({
+    durationSec: 180,
+    eliminations: 8,
+    wallsConstructed: 2,
+    victory: true,
+    battleMode: '4v4',
+    botHardness: 'legend',
+  });
+  assert.ok(
+    fastRun.kpmVelocityBonusXp > slowRun.kpmVelocityBonusXp,
+    'Higher kills per minute must grant a larger KPM velocity bonus'
+  );
+
+  // Winning grants significantly more credits than losing
+  const lossRun = calculateMatchXpAndCredits({
+    durationSec: 60,
+    eliminations: 2,
+    wallsConstructed: 0,
+    victory: false,
+    battleMode: '2v2',
+    botHardness: 'beginner',
+  });
+  assert.ok(fastRun.creditsEarned > lossRun.creditsEarned);
+
+  // Level calculation
+  const lvl = computeOperatorLevelFromXp(2450);
+  assert.equal(lvl.level, 3);
+  assert.equal(lvl.xpIntoLevel, 450);
+  assert.equal(lvl.progressPct, 45);
+
+  // Team roster for 1v1 vs 4v4
+  const r1v1 = computeTeamMatchRoster('1v1', 'beginner', 1);
+  assert.equal(r1v1.allyCount, 0);
+  assert.equal(r1v1.enemyCount, 1);
+
+  const r4v4 = computeTeamMatchRoster('4v4', 'legend', 1);
+  assert.equal(r4v4.allyCount, 3);
+  assert.equal(r4v4.enemyCount, 4);
+  assert.ok(r4v4.hpMultiplier > r1v1.hpMultiplier);
+});
+
+
 

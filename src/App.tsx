@@ -10,8 +10,15 @@ import {
   OPERATOR_SKINS,
   OPERATOR_EMOTES,
   TRAINING_LEVELS,
+  BATTLE_MODES,
+  BOT_HARDNESS_TIERS,
   GameState,
   MapId,
+  BattleModeId,
+  BotHardnessId,
+  LobbyPageId,
+  FriendProfile,
+  FriendRequestRecord,
   WeaponId,
   OpticId,
   BarrelId,
@@ -25,11 +32,14 @@ import {
   ActiveInputDevice,
   VirtualTouchInputState,
   SmartControlConfig,
-  DYNAMIC_ENVIRONMENT_EVENTS,
   ReplayCameraMode,
   MatchReplayRecording,
 } from './game/types';
-import { computeWeaponStats } from './game/rules';
+import {
+  computeWeaponStats,
+  calculateMatchXpAndCredits,
+  computeOperatorLevelFromXp,
+} from './game/rules';
 import { soundEngine } from './game/sound';
 import {
   ThreeArena,
@@ -49,11 +59,18 @@ import {
   loadOrCreateOperatorProfile,
   saveOperatorCustomization,
   recordMatchAndProgression,
+  sendFirestoreFriendRequest,
   User,
   OperatorProfileData,
 } from './firebase';
 
-type LobbyTab = 'biomes' | 'weaponsmith' | 'cosmetics' | 'bioscience' | 'squad';
+const STARTER_UNLOCKED_SKINS: SkinId[] = [
+  'vanguard-obsidian',
+  'alpine-ghost',
+  'dune-stalker',
+  'emerald-recon',
+  'cryo-sentinel',
+];
 
 export default function App() {
   // Support ?autostart=1 to boot directly into 'playing'
@@ -64,13 +81,64 @@ export default function App() {
   const [gameState, setGameState] = useState<GameState>(
     initialAutostart ? 'playing' : 'title'
   );
+  const [lobbyPage, setLobbyPage] = useState<LobbyPageId>('play');
+  const [accountMinimized, setAccountMinimized] = useState<boolean>(true);
+
+  // Match Mode, Bot Hardness & Map State
   const [mapId, setMapId] = useState<MapId>('alpine-outpost');
+  const [battleMode, setBattleMode] = useState<BattleModeId>('2v2');
+  const [botHardness, setBotHardness] = useState<BotHardnessId>('veteran');
   const [trainingLevel, setTrainingLevel] = useState<number>(1);
   const [highestReachedLevel, setHighestReachedLevel] = useState<number>(4);
 
-  // Operator Customization State
-  const [callsign, setCallsign] = useState<string>('VANGUARD-01');
+  // Operator Account, XP, Credits & Customization State
+  const [callsign, setCallsign] = useState<string>(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('apex_username') || 'VANGUARD_01';
+    }
+    return 'VANGUARD_01';
+  });
+  const [accountRegistered, setAccountRegistered] = useState<boolean>(true);
+  const [usernameDraft, setUsernameDraft] = useState<string>(callsign);
+  const [accountToast, setAccountToast] = useState<string | null>(null);
+
+  const [localXp, setLocalXp] = useState<number>(() => {
+    if (typeof window !== 'undefined') {
+      const raw = localStorage.getItem('apex_xp');
+      const saved = raw !== null ? Number(raw) : NaN;
+      return Number.isFinite(saved) && saved > 0 ? saved : 650;
+    }
+    return 650;
+  });
+  const [localCredits, setLocalCredits] = useState<number>(() => {
+    if (typeof window !== 'undefined') {
+      const raw = localStorage.getItem('apex_credits');
+      const saved = raw !== null ? Number(raw) : NaN;
+      return Number.isFinite(saved) && saved > 0 ? saved : 950;
+    }
+    return 950;
+  });
+  const [unlockedSkins, setUnlockedSkins] = useState<SkinId[]>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const raw = localStorage.getItem('apex_unlocked_skins');
+        if (raw) {
+          const parsed = JSON.parse(raw) as SkinId[];
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            return Array.from(new Set([...STARTER_UNLOCKED_SKINS, ...parsed]));
+          }
+        }
+      } catch {
+        // Ignore parse error
+      }
+    }
+    return STARTER_UNLOCKED_SKINS;
+  });
+
   const [skinId, setSkinId] = useState<SkinId>('vanguard-obsidian');
+  const [shopPreviewSkinId, setShopPreviewSkinId] =
+    useState<SkinId>('solaris-valkyrie');
+  const [shopToast, setShopToast] = useState<string | null>(null);
   const [emoteId, setEmoteId] = useState<EmoteId>('salute');
   const [weaponId, setWeaponId] = useState<WeaponId>('vx-carbine');
   const [opticId, setOpticId] = useState<OpticId>('holo-reflex');
@@ -89,9 +157,15 @@ export default function App() {
     damageBonus: 0.05,
   });
 
-  // Lobby Dock Controls
-  const [lobbyTab, setLobbyTab] = useState<LobbyTab>('biomes');
-  const [dockCollapsed, setDockCollapsed] = useState<boolean>(false);
+  // Friends & Party State
+  const [friendsList, setFriendsList] = useState<FriendProfile[]>([]);
+  const [friendRequests, setFriendRequests] = useState<FriendRequestRecord[]>(
+    []
+  );
+  const [partyMembers, setPartyMembers] = useState<FriendProfile[]>([]);
+  const [friendSearchUsername, setFriendSearchUsername] = useState<string>('');
+  const [friendStatusMsg, setFriendStatusMsg] = useState<string | null>(null);
+
   const [muted, setMuted] = useState<boolean>(false);
   const [restartNonce, setRestartNonce] = useState<number>(0);
 
@@ -126,7 +200,7 @@ export default function App() {
   const effectiveInputDevice: ActiveInputDevice =
     controlScheme === 'auto' ? detectedDevice : controlScheme;
 
-  // Smart Control Assist Configuration (Aim Magnetism, Auto-Fire on Lock, Auto-Parkour)
+  // Smart Control Assist Configuration
   const [smartControl, setSmartControl] = useState<SmartControlConfig>({
     enabled: true,
     aimAssistMagnetism: true,
@@ -162,13 +236,15 @@ export default function App() {
     `op_${Math.random().toString(36).slice(2, 10)}`
   );
 
-  // Outcome Snapshot for Victory / Defeat Modal
+  // Outcome Snapshot & Custom XP/Credits Breakdown for Victory / Defeat Modal
   const [outcomeSnapshot, setOutcomeSnapshot] = useState<{
     victory: boolean;
     score: number;
     eliminations: number;
     wallsConstructed: number;
     waveReached: number;
+    durationSec: number;
+    rewards: ReturnType<typeof calculateMatchXpAndCredits>;
   } | null>(null);
 
   // Live HUD Telemetry Snapshot
@@ -190,8 +266,10 @@ export default function App() {
     stimCooldown: 0,
     stimActiveTimer: 0,
     wave: 1,
-    enemiesRemaining: 6,
-    totalEnemiesInWave: 6,
+    totalWaves: 2,
+    matchElapsedSec: 0,
+    enemiesRemaining: 4,
+    totalEnemiesInWave: 4,
     score: 0,
     eliminations: 0,
     wallsConstructed: 0,
@@ -203,6 +281,7 @@ export default function App() {
     smartTargetLocked: false,
     activeEnvironmentEvent: null,
     nextEventCooldownSec: 6.5,
+    splitScreenP2: null,
     opponentsOverlay: [],
     minimapEntities: {
       playerX: 0,
@@ -215,13 +294,63 @@ export default function App() {
     },
   });
 
+  // Persist local XP, Credits, Username, and Unlocked Skins
+  useEffect(() => {
+    try {
+      localStorage.setItem('apex_xp', String(localXp));
+      localStorage.setItem('apex_credits', String(localCredits));
+      localStorage.setItem('apex_username', callsign);
+      localStorage.setItem(
+        'apex_unlocked_skins',
+        JSON.stringify(unlockedSkins)
+      );
+    } catch {
+      // Ignore storage quota issues
+    }
+  }, [localXp, localCredits, callsign, unlockedSkins]);
+
   // Mirror game state to document.body.dataset.state
   useEffect(() => {
     document.body.dataset.state = gameState;
   }, [gameState]);
 
-  // Automatic Hardware Input Mutual-Exclusion Listener:
-  // Detecting Keyboard, Touch, or Gamepad immediately switches active controls and hides other devices' overlays
+  // Sync Online Account & Friends State with Backend API
+  const syncFriendsAndAccount = async (usernameToSync: string) => {
+    const levelInfo = computeOperatorLevelFromXp(localXp);
+    try {
+      await fetch('/api/accounts/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: usernameToSync,
+          skinId,
+          level: levelInfo.level,
+          xp: localXp,
+          credits: localCredits,
+        }),
+      });
+      const res = await fetch(
+        `/api/friends/state?username=${encodeURIComponent(usernameToSync)}`
+      );
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.friends)) {
+          setFriendsList(data.friends);
+        }
+        if (Array.isArray(data.requests)) {
+          setFriendRequests(data.requests);
+        }
+      }
+    } catch {
+      // Offline fallback if needed
+    }
+  };
+
+  useEffect(() => {
+    syncFriendsAndAccount(callsign);
+  }, [callsign]);
+
+  // Automatic Hardware Input Mutual-Exclusion Listener
   useEffect(() => {
     const onKeyDown = () => {
       setDetectedDevice('pc');
@@ -282,13 +411,15 @@ export default function App() {
             underbarrelId,
             magId,
             stimCompoundCid,
-            xp: 0,
+            xp: localXp,
+            credits: localCredits,
             highestTrainingLevel: 4,
             totalEliminations: 0,
             wallsBuilt: 0,
           });
           setOperatorProfile(loaded);
           setCallsign(loaded.callsign);
+          setUsernameDraft(loaded.callsign);
           setSkinId(loaded.skinId as SkinId);
           setEmoteId(loaded.emoteId as EmoteId);
           setWeaponId(loaded.primaryWeaponId as WeaponId);
@@ -297,6 +428,8 @@ export default function App() {
           setUnderbarrelId(loaded.underbarrelId as UnderbarrelId);
           setMagId(loaded.magId as MagId);
           setStimCompoundCid(loaded.stimCompoundCid);
+          setLocalXp((prev) => Math.max(prev, loaded.xp));
+          setLocalCredits((prev) => Math.max(prev, loaded.credits ?? 600));
           setHighestReachedLevel(Math.max(4, loaded.highestTrainingLevel));
         } catch {
           // Handled via handleFirestoreError
@@ -407,10 +540,148 @@ export default function App() {
       underbarrelId: overrides?.underbarrelId ?? underbarrelId,
       magId: overrides?.magId ?? magId,
       stimCompoundCid: overrides?.stimCompoundCid ?? stimCompoundCid,
+      credits: overrides?.credits ?? localCredits,
     }).catch(() => {});
   };
 
-  const handleStartDeployment = () => {
+  const handleSaveUsernameAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleaned = usernameDraft
+      .trim()
+      .replace(/[^a-zA-Z0-9_-]/g, '_')
+      .slice(0, 20);
+    if (cleaned.length < 2) {
+      setAccountToast('Username must be at least 2 characters.');
+      return;
+    }
+    setCallsign(cleaned);
+    setUsernameDraft(cleaned);
+    setAccountRegistered(true);
+    persistLoadoutIfSignedIn({ callsign: cleaned });
+    await syncFriendsAndAccount(cleaned);
+    setAccountToast(`Online Account [${cleaned}] synced!`);
+    setTimeout(() => setAccountToast(null), 3200);
+  };
+
+  const handleSendFriendRequest = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const target = friendSearchUsername.trim();
+    if (target.length < 2) {
+      setFriendStatusMsg('Enter a valid username (2+ characters).');
+      return;
+    }
+    setFriendStatusMsg(null);
+    try {
+      const res = await fetch('/api/friends/request', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fromUsername: callsign,
+          toUsername: target,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setFriendStatusMsg(data.error || 'Could not send friend request.');
+        return;
+      }
+      if (Array.isArray(data.friends)) setFriendsList(data.friends);
+      if (Array.isArray(data.requests)) setFriendRequests(data.requests);
+      setFriendSearchUsername('');
+      setFriendStatusMsg(
+        `Friend request sent to ${target.toUpperCase()} — accepted and added to Friends!`
+      );
+      if (currentUser) {
+        sendFirestoreFriendRequest(currentUser, callsign, target).catch(
+          () => {}
+        );
+      }
+    } catch {
+      setFriendStatusMsg('Network error sending friend request.');
+    }
+  };
+
+  const handleRespondToFriendRequest = async (
+    requestId: string,
+    action: 'accept' | 'decline'
+  ) => {
+    try {
+      const res = await fetch('/api/friends/respond', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: callsign,
+          requestId,
+          action,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.friends)) setFriendsList(data.friends);
+        if (Array.isArray(data.requests)) setFriendRequests(data.requests);
+      }
+    } catch {
+      // Ignore network error
+    }
+  };
+
+  const handleTogglePartyMember = (friend: FriendProfile) => {
+    setPartyMembers((prev) => {
+      const exists = prev.some(
+        (p) => p.username.toUpperCase() === friend.username.toUpperCase()
+      );
+      if (exists) {
+        return prev.filter(
+          (p) => p.username.toUpperCase() !== friend.username.toUpperCase()
+        );
+      }
+      if (prev.length >= 3) {
+        return [...prev.slice(1), friend];
+      }
+      return [...prev, friend];
+    });
+  };
+
+  const handleBuyOrEquipSkin = (targetSkinId: SkinId) => {
+    const skinDef = OPERATOR_SKINS[targetSkinId];
+    if (!skinDef) return;
+    const isOwned = unlockedSkins.includes(targetSkinId);
+
+    if (isOwned) {
+      setSkinId(targetSkinId);
+      setShopPreviewSkinId(targetSkinId);
+      persistLoadoutIfSignedIn({ skinId: targetSkinId });
+      setShopToast(`Equipped ${skinDef.name}!`);
+      setTimeout(() => setShopToast(null), 2500);
+      return;
+    }
+
+    if (localCredits < skinDef.priceCredits) {
+      setShopToast(
+        `Need ${skinDef.priceCredits - localCredits} more Credits (CR). Win matches to earn Credits!`
+      );
+      setTimeout(() => setShopToast(null), 3200);
+      return;
+    }
+
+    const nextCredits = localCredits - skinDef.priceCredits;
+    const nextUnlocked = Array.from(new Set([...unlockedSkins, targetSkinId]));
+    setLocalCredits(nextCredits);
+    setUnlockedSkins(nextUnlocked);
+    setSkinId(targetSkinId);
+    setShopPreviewSkinId(targetSkinId);
+    persistLoadoutIfSignedIn({ skinId: targetSkinId, credits: nextCredits });
+    soundEngine.playMovementAction('pickup');
+    setShopToast(
+      `Unlocked & Equipped ${skinDef.name} (-${skinDef.priceCredits} CR)!`
+    );
+    setTimeout(() => setShopToast(null), 3200);
+  };
+
+  const handleStartDeployment = (modeOverride?: BattleModeId) => {
+    if (modeOverride) {
+      setBattleMode(modeOverride);
+    }
     if (document.activeElement instanceof HTMLElement) {
       document.activeElement.blur();
     }
@@ -427,20 +698,49 @@ export default function App() {
       eliminations: number;
       wallsConstructed: number;
       waveReached: number;
+      durationSec: number;
     }
   ) => {
     document.body.dataset.state = nextState;
     if (outcome) {
-      setOutcomeSnapshot(outcome);
+      const rewards = calculateMatchXpAndCredits({
+        victory: outcome.victory,
+        eliminations: outcome.eliminations,
+        durationSec: outcome.durationSec,
+        wallsConstructed: outcome.wallsConstructed,
+        battleMode,
+        botHardness,
+      });
+
+      const nextXp = localXp + rewards.totalXpEarned;
+      const nextCredits = localCredits + rewards.creditsEarned;
+      setLocalXp(nextXp);
+      setLocalCredits(nextCredits);
+
+      setOutcomeSnapshot({
+        ...outcome,
+        rewards,
+      });
+
       if (currentUser && operatorProfile) {
-        recordMatchAndProgression(currentUser, operatorProfile, {
-          mapId,
-          trainingLevel,
-          score: outcome.score,
-          eliminations: outcome.eliminations,
-          wallsConstructed: outcome.wallsConstructed,
-          outcome: outcome.victory ? 'victory' : 'defeat',
-        })
+        recordMatchAndProgression(
+          currentUser,
+          {
+            ...operatorProfile,
+            xp: localXp,
+            credits: localCredits,
+          },
+          {
+            mapId,
+            trainingLevel,
+            score: outcome.score,
+            eliminations: outcome.eliminations,
+            wallsConstructed: outcome.wallsConstructed,
+            outcome: outcome.victory ? 'victory' : 'defeat',
+            xpEarned: rewards.totalXpEarned,
+            creditsEarned: rewards.creditsEarned,
+          }
+        )
           .then((updated) => {
             setOperatorProfile(updated);
             setHighestReachedLevel(Math.max(4, updated.highestTrainingLevel));
@@ -458,8 +758,15 @@ export default function App() {
     { opticId, barrelId, underbarrelId, magId },
     stimBuff
   );
-  const currentSkin = OPERATOR_SKINS[skinId];
+  const activeVisualSkinId =
+    gameState === 'title' && lobbyPage === 'shop' ? shopPreviewSkinId : skinId;
+  const currentSkin =
+    OPERATOR_SKINS[skinId] || OPERATOR_SKINS['vanguard-obsidian'];
   const currentEmote = OPERATOR_EMOTES[emoteId];
+  const currentModeDef = BATTLE_MODES[battleMode] || BATTLE_MODES['2v2'];
+  const currentHardnessDef =
+    BOT_HARDNESS_TIERS[botHardness] || BOT_HARDNESS_TIERS.veteran;
+  const levelInfo = computeOperatorLevelFromXp(localXp);
 
   return (
     <main className="relative w-screen h-screen overflow-hidden select-none">
@@ -467,9 +774,12 @@ export default function App() {
       <ThreeArena
         gameState={gameState}
         mapId={mapId}
+        battleMode={battleMode}
+        botHardness={botHardness}
+        partyMembers={partyMembers}
         trainingLevel={trainingLevel}
         callsign={callsign}
-        skinId={skinId}
+        skinId={activeVisualSkinId}
         emoteId={emoteId}
         weaponId={weaponId}
         opticId={opticId}
@@ -489,7 +799,6 @@ export default function App() {
         replayCameraMode={replayCameraMode}
         onDetectedInputDevice={(device, gpName) => {
           setDetectedDevice(device);
-          // Mutual-exclusion input switching: automatically switch to detected hardware & hide other controls
           setControlScheme('auto');
           if (gpName !== undefined) setGamepadLabel(gpName);
         }}
@@ -501,37 +810,28 @@ export default function App() {
       />
 
       {/* ===================================================================== */}
-      {/* STATE 1: TITLE SCREEN & TACTICAL LOBBY SHELL                          */}
+      {/* STATE 1: MULTI-PAGE GAME LOBBY SHELL                                  */}
       {/* ===================================================================== */}
       {gameState === 'title' && (
-        <div className="fixed inset-0 z-20 pointer-events-none flex flex-col justify-between p-6 md:p-8">
-          {/* Upper Left Negative-Space Hero Title Lockup + Primary Start CTA */}
-          <div className="flex flex-col md:flex-row items-start justify-between gap-6">
-            <div
-              className="pointer-events-auto max-w-xl p-6 rounded-xl border border-white/15 shadow-2xl"
-              style={{
-                background:
-                  'linear-gradient(165deg, rgba(9,13,22,0.92) 0%, rgba(15,23,42,0.84) 100%)',
-              }}
-            >
-              {/* Bespoke Inline SVG Tactical Crest & Title Lockup */}
-              <div className="flex items-center gap-4 mb-3">
+        <div className="fixed inset-0 z-20 pointer-events-none flex flex-col justify-between p-4 md:p-6">
+          {/* TOP NAVIGATION BAR: Game Crest + Dedicated Lobby Pages + Account Icon Toggle */}
+          <header className="pointer-events-auto flex flex-wrap items-center justify-between gap-3">
+            {/* Left: Game Brand + Multi-Page Navigation Tabs */}
+            <div className="flex flex-wrap items-center gap-2">
+              <div
+                className="flex items-center gap-2.5 px-3.5 py-2 rounded-xl border border-white/15"
+                style={{ backgroundColor: 'rgba(9,13,22,0.92)' }}
+              >
                 <svg
                   viewBox="0 0 64 64"
-                  className="w-14 h-14 shrink-0"
+                  className="w-8 h-8 shrink-0"
                   aria-hidden="true"
                 >
                   <polygon
                     points="32,4 58,18 58,46 32,60 6,46 6,18"
                     fill="#0f172a"
                     stroke="#f59e0b"
-                    strokeWidth="2.5"
-                  />
-                  <polygon
-                    points="32,11 51,21 51,43 32,53 13,43 13,21"
-                    fill="#1e293b"
-                    stroke="#38bdf8"
-                    strokeWidth="1.5"
+                    strokeWidth="3"
                   />
                   <path
                     d="M20 42 L32 16 L44 42 L37 42 L32 30 L27 42 Z"
@@ -540,752 +840,1206 @@ export default function App() {
                   <circle cx="32" cy="39" r="3.5" fill="#f59e0b" />
                 </svg>
                 <div>
-                  <div className="text-xs font-mono tracking-wider text-amber-400">
-                    {currentBiome.regionCode} · {TRAINING_LEVELS[trainingLevel - 1]?.name}
-                  </div>
-                  <h1 className="text-3xl md:text-4xl font-display font-bold tracking-tight text-white">
+                  <div className="text-sm font-display font-bold tracking-wider text-white leading-none">
                     APEX VANGUARD
-                  </h1>
-                  <p className="text-xs text-slate-300 mt-0.5">
-                    Bio-Tactical Multiplayer FPS · Custom Weaponsmith · Fortification Engineering
-                  </p>
+                  </div>
+                  <div className="text-[10px] font-mono text-amber-400">
+                    ONLINE MULTIPLAYER FPS
+                  </div>
                 </div>
               </div>
 
-              {/* Active Operator Summary Line (Unboxed Metadata with Separators) */}
-              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-300 mb-4 pb-3 border-b border-white/10">
-                <span className="font-semibold text-white">{callsign}</span>
-                <span aria-hidden="true">·</span>
-                <span className="text-sky-300">{currentWeapon.name}</span>
-                <span aria-hidden="true">·</span>
-                <span>Skin: {currentSkin.name}</span>
-                <span aria-hidden="true">·</span>
-                <span>Emote: {currentEmote.name}</span>
-              </div>
-
-              {/* Primary CTA & Secondary Lobby Actions (<= 3 Menu Actions) */}
-              <div className="flex flex-wrap items-center gap-3">
-                <button
-                  type="button"
-                  data-start="true"
-                  onClick={handleStartDeployment}
-                  className="px-6 py-3 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-base tracking-wide transition-colors cursor-pointer whitespace-nowrap shrink-0 shadow-lg"
-                >
-                  Deploy To {currentBiome.name} [Enter]
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setDockCollapsed((prev) => !prev)}
-                  className="px-4 py-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-100 border border-white/15 text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0"
-                >
-                  {dockCollapsed ? 'Show Loadout & Maps' : 'Hide Loadout Dock'}
-                </button>
-
-                <button
-                  type="button"
-                  data-testid="lobby-watch-replay-btn"
-                  onClick={() => {
-                    setReplayTimeSec(0);
-                    setReplayPlaying(true);
-                    handleStateChange('replay');
-                  }}
-                  className="px-4 py-3 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0"
-                >
-                  Watch 3D Replay
-                </button>
-
-                {currentUser ? (
-                  <button
-                    type="button"
-                    onClick={() => signOutOperator()}
-                    className="px-3.5 py-3 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-300 border border-white/10 text-xs font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0"
-                  >
-                    Sign Out ({currentUser.displayName || 'Operator'})
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      try {
-                        setAuthStatusText(null);
-                        await signInOperator();
-                      } catch {
-                        setAuthStatusText(
-                          'Cloud Sign-In popup closed. Local profile active.'
-                        );
-                      }
-                    }}
-                    className="px-3.5 py-3 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0"
-                  >
-                    Google Cloud Sync
-                  </button>
-                )}
-              </div>
-
-              {authStatusText && (
-                <p className="text-[11px] text-amber-300 mt-2">{authStatusText}</p>
-              )}
-            </div>
-
-            {/* Top-Right Cross-Platform Input Mode Switcher, Smart Controls, Audio & Cloud Telemetry */}
-            <div className="pointer-events-auto flex flex-col items-end gap-2">
-              <div
-                className="flex items-center gap-3 px-4 py-2.5 rounded-lg border border-white/15 text-xs"
-                style={{ backgroundColor: 'rgba(9,13,22,0.88)' }}
-              >
-                <div className="font-mono tabular-nums text-slate-300">
-                  <span>XP {operatorProfile?.xp ?? 0}</span>
-                  <span className="mx-2 text-slate-600">·</span>
-                  <span>ELIMS {operatorProfile?.totalEliminations ?? 0}</span>
-                  <span className="mx-2 text-slate-600">·</span>
-                  <span>SQUAD ONLINE {remoteOperators.length + 1}</span>
-                </div>
-                <button
-                  type="button"
-                  aria-label={muted ? 'Unmute Audio' : 'Mute Audio'}
-                  onClick={(e) => {
-                    e.currentTarget.blur();
-                    setMuted(soundEngine.toggleMute());
-                  }}
-                  className="px-2.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono text-xs cursor-pointer"
-                >
-                  {muted ? 'AUDIO: OFF' : 'AUDIO: ON'}
-                </button>
-              </div>
-
-              {/* Cross-Platform Input Scheme Selector (AUTO / PC / TOUCH / CONSOLE) + Smart Assist */}
-              <div
-                className="flex flex-wrap items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/15 text-xs"
+              {/* Dedicated Lobby Pages Navigation */}
+              <nav
+                aria-label="Lobby Pages"
+                className="flex flex-wrap items-center gap-1 p-1 rounded-xl border border-white/15"
                 style={{ backgroundColor: 'rgba(9,13,22,0.92)' }}
-                role="group"
-                aria-label="Control Input Scheme"
               >
-                <span className="text-[11px] font-mono text-slate-400 mr-1">
-                  CONTROLS:
-                </span>
                 {(
                   [
-                    { id: 'auto', label: `AUTO (${detectedDevice.toUpperCase()})` },
-                    { id: 'pc', label: 'PC KBM' },
-                    { id: 'touch', label: 'TOUCH HUD' },
-                    { id: 'console', label: 'CONSOLE PAD' },
+                    { id: 'play', label: 'PLAY' },
+                    { id: 'operator', label: 'OPERATOR' },
+                    { id: 'shop', label: 'SKIN SHOP' },
+                    { id: 'maps', label: 'MAPS & MODES' },
+                    {
+                      id: 'friends',
+                      label: `FRIENDS (${friendsList.length})`,
+                    },
+                    { id: 'practice', label: 'PRACTICE' },
                   ] as const
-                ).map((mode) => {
-                  const active = controlScheme === mode.id;
+                ).map((tab) => {
+                  const active = lobbyPage === tab.id;
                   return (
                     <button
-                      key={mode.id}
+                      key={tab.id}
                       type="button"
-                      data-testid={`control-mode-${mode.id}`}
-                      onClick={() => setControlScheme(mode.id)}
-                      className={`px-2.5 py-1 rounded font-mono text-[11px] font-semibold transition-colors cursor-pointer ${
+                      data-testid={`lobby-nav-${tab.id}`}
+                      onClick={() => setLobbyPage(tab.id)}
+                      className={`px-3.5 py-2 rounded-lg text-xs font-display font-bold tracking-wide transition-colors cursor-pointer whitespace-nowrap ${
                         active
-                          ? 'bg-amber-500 text-slate-950'
-                          : 'bg-slate-900 text-slate-300 hover:text-white'
+                          ? 'bg-amber-500 text-slate-950 shadow'
+                          : 'text-slate-300 hover:text-white hover:bg-slate-800/80'
                       }`}
                     >
-                      {mode.label}
+                      {tab.label}
                     </button>
                   );
                 })}
+              </nav>
+            </div>
+
+            {/* Right: Level Badge + Credits + Collapsible Account Icon Button */}
+            <div className="relative flex items-center gap-2">
+              <div
+                className="hidden sm:flex items-center gap-3 px-3.5 py-2 rounded-xl border border-white/15 font-mono text-xs"
+                style={{ backgroundColor: 'rgba(9,13,22,0.92)' }}
+              >
+                <span className="text-amber-400 font-bold">
+                  CR {localCredits}
+                </span>
+                <span className="text-slate-600">·</span>
+                <span className="text-sky-300 font-bold">
+                  LVL {levelInfo.level}
+                </span>
+                <span className="text-slate-600">·</span>
+                <span className="text-emerald-400">{callsign}</span>
+              </div>
+
+              {/* Account Icon Button to Show or Minimize Account Drawer */}
+              <button
+                type="button"
+                data-testid="lobby-account-toggle"
+                aria-expanded={!accountMinimized}
+                aria-label={
+                  accountMinimized
+                    ? 'Show Account & Controls Panel'
+                    : 'Minimize Account Panel'
+                }
+                onClick={() => setAccountMinimized((prev) => !prev)}
+                className={`flex items-center gap-2 px-3 py-2 rounded-xl border transition-colors cursor-pointer ${
+                  !accountMinimized
+                    ? 'bg-amber-500 text-slate-950 border-amber-400 font-bold'
+                    : 'bg-slate-900/95 text-white border-white/15 hover:border-amber-400/60'
+                }`}
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  className="w-5 h-5 fill-current"
+                  aria-hidden="true"
+                >
+                  <path d="M12 12c2.76 0 5-2.24 5-5s-2.24-5-5-5-5 2.24-5 5 2.24 5 5 5zm0 2c-3.33 0-10 1.67-10 5v3h20v-3c0-3.33-6.67-5-10-5z" />
+                </svg>
+                <span className="text-xs font-mono font-bold">
+                  {accountMinimized ? 'ACCOUNT' : 'MINIMIZE'}
+                </span>
+              </button>
+
+              {/* Collapsible Account Creation, Level, Credits & Controls Popover */}
+              {!accountMinimized && (
+                <div
+                  data-testid="lobby-account-drawer"
+                  className="absolute right-0 top-13 w-84 sm:w-96 rounded-2xl border border-white/20 p-4 shadow-2xl z-40 space-y-3"
+                  style={{ backgroundColor: 'rgba(9,13,22,0.97)' }}
+                >
+                  <div className="flex items-center justify-between border-b border-white/10 pb-2.5">
+                    <div>
+                      <div className="text-[10px] font-mono text-amber-400 uppercase">
+                        ONLINE OPERATOR ACCOUNT
+                      </div>
+                      <div className="text-base font-display font-bold text-white">
+                        {callsign}{' '}
+                        <span className="text-xs font-mono text-sky-400">
+                          (LVL {levelInfo.level})
+                        </span>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setAccountMinimized(true)}
+                      className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-mono text-slate-300 cursor-pointer"
+                    >
+                      Minimize [–]
+                    </button>
+                  </div>
+
+                  {/* Level & XP Progress Bar + Credits */}
+                  <div className="p-2.5 rounded-xl bg-slate-950 border border-white/10 space-y-1.5 font-mono text-xs">
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-300">
+                        LEVEL {levelInfo.level} PROGRESS
+                      </span>
+                      <span className="text-sky-400">
+                        {levelInfo.xpIntoLevel} / {levelInfo.xpForNextLevel} XP
+                      </span>
+                    </div>
+                    <div className="w-full h-2 bg-slate-900 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-sky-400"
+                        style={{
+                          width: `${levelInfo.progressPct}%`,
+                        }}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between pt-1 text-[11px]">
+                      <span className="text-amber-400 font-bold">
+                        CREDITS: {localCredits} CR
+                      </span>
+                      <span className="text-slate-400">
+                        TOTAL XP: {localXp}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Online Account Username Form */}
+                  <form
+                    onSubmit={handleSaveUsernameAccount}
+                    className="space-y-1.5"
+                  >
+                    <label
+                      htmlFor="account-username-input"
+                      className="block text-[11px] font-mono text-slate-300"
+                    >
+                      Online Account Username (Used for Friend Requests)
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        id="account-username-input"
+                        data-testid="account-username-input"
+                        type="text"
+                        maxLength={20}
+                        value={usernameDraft}
+                        onChange={(e) => setUsernameDraft(e.target.value)}
+                        placeholder="Enter username..."
+                        className="w-full bg-slate-950 border border-white/15 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                      />
+                      <button
+                        type="submit"
+                        data-testid="account-save-username-btn"
+                        className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-mono font-bold text-xs cursor-pointer shrink-0"
+                      >
+                        Save
+                      </button>
+                    </div>
+                    {accountToast && (
+                      <div className="text-[11px] font-mono text-emerald-400">
+                        {accountToast}
+                      </div>
+                    )}
+                  </form>
+
+                  {/* Cloud Sync + Audio + Input Mode Switcher */}
+                  <div className="pt-2 border-t border-white/10 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      {currentUser ? (
+                        <button
+                          type="button"
+                          onClick={() => signOutOperator()}
+                          className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-mono cursor-pointer"
+                        >
+                          Sign Out Cloud ({currentUser.displayName || 'Synced'})
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            try {
+                              setAuthStatusText(null);
+                              await signInOperator();
+                            } catch {
+                              setAuthStatusText(
+                                'Local Online Account active (' + callsign + ').'
+                              );
+                            }
+                          }}
+                          className="px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-mono font-semibold cursor-pointer"
+                        >
+                          Link Google Cloud
+                        </button>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => setMuted(soundEngine.toggleMute())}
+                        className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-mono cursor-pointer"
+                      >
+                        {muted ? 'AUDIO: OFF' : 'AUDIO: ON'}
+                      </button>
+                    </div>
+
+                    {authStatusText && (
+                      <div className="text-[11px] font-mono text-amber-300">
+                        {authStatusText}
+                      </div>
+                    )}
+
+                    {/* Input Hardware Mode & Smart Assist */}
+                    <div className="flex flex-wrap items-center gap-1 pt-1">
+                      {(
+                        [
+                          {
+                            id: 'auto',
+                            label: `AUTO (${detectedDevice.toUpperCase()})`,
+                          },
+                          { id: 'pc', label: 'PC' },
+                          { id: 'touch', label: 'TOUCH' },
+                          { id: 'console', label: 'PAD' },
+                        ] as const
+                      ).map((mode) => (
+                        <button
+                          key={mode.id}
+                          type="button"
+                          data-testid={`control-mode-${mode.id}`}
+                          onClick={() => setControlScheme(mode.id)}
+                          className={`px-2 py-1 rounded font-mono text-[10px] font-bold cursor-pointer ${
+                            controlScheme === mode.id
+                              ? 'bg-amber-500 text-slate-950'
+                              : 'bg-slate-900 text-slate-300'
+                          }`}
+                        >
+                          {mode.label}
+                        </button>
+                      ))}
+                      <button
+                        type="button"
+                        data-testid="lobby-smart-control-toggle"
+                        onClick={() =>
+                          setSmartControl((prev) => ({
+                            ...prev,
+                            enabled: !prev.enabled,
+                          }))
+                        }
+                        className={`px-2 py-1 rounded font-mono text-[10px] font-bold cursor-pointer ${
+                          smartControl.enabled
+                            ? 'bg-emerald-500 text-slate-950'
+                            : 'bg-slate-900 text-slate-400'
+                        }`}
+                      >
+                        SMART:{smartControl.enabled ? 'ON' : 'OFF'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </header>
+
+          {/* =============================================================== */}
+          {/* PAGE 1: MAIN PAGE (`play`) — ONLY Play Button, 3D Skin, Level,   */}
+          {/* Account Icon, and `+` Sign to Add Friends to Party!              */}
+          {/* =============================================================== */}
+          {lobbyPage === 'play' && (
+            <div className="flex-1 flex flex-col justify-between pointer-events-none py-2">
+              {/* Center-Top Floating Operator Level & Skin Tag + `+` Party Slots */}
+              <div className="flex flex-col items-center mt-1 gap-3">
+                {/* Operator Level + Skin Badge over 3D Character */}
+                <div
+                  className="pointer-events-auto flex items-center gap-3 px-4 py-2 rounded-full border border-white/20 shadow-xl"
+                  style={{ backgroundColor: 'rgba(9,13,22,0.88)' }}
+                >
+                  <span
+                    data-testid="main-operator-level"
+                    className="px-2.5 py-0.5 rounded-full bg-amber-500 text-slate-950 font-mono font-bold text-xs"
+                  >
+                    LVL {levelInfo.level}
+                  </span>
+                  <span className="text-sm font-display font-bold text-white">
+                    {callsign}
+                  </span>
+                  <span className="text-slate-500">·</span>
+                  <span className="text-xs font-mono text-sky-300">
+                    {currentSkin.name}
+                  </span>
+                </div>
+
+                {/* `+` Signs to Add Friends to Party (Up to 3 Squad Slots for 4v4) */}
+                <div
+                  className="pointer-events-auto flex items-center gap-2.5"
+                  aria-label="Party Squad Slots"
+                >
+                  {[0, 1, 2].map((slotIdx) => {
+                    const member = partyMembers[slotIdx];
+                    return member ? (
+                      <div
+                        key={member.username}
+                        className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-emerald-400/50 text-xs font-mono text-white shadow-lg"
+                        style={{ backgroundColor: 'rgba(9,13,22,0.9)' }}
+                      >
+                        <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                        <span className="font-bold">{member.username}</span>
+                        <span className="text-[10px] text-amber-400">
+                          LVL {member.level}
+                        </span>
+                        <button
+                          type="button"
+                          aria-label={`Remove ${member.username} from party`}
+                          onClick={() => handleTogglePartyMember(member)}
+                          className="ml-1 text-slate-400 hover:text-rose-400 font-bold cursor-pointer"
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        key={slotIdx}
+                        type="button"
+                        data-testid={`party-plus-slot-${slotIdx}`}
+                        onClick={() => {
+                          // If there is an available friend not yet in party, quick-add or open Friends page
+                          const availableFriend = friendsList.find(
+                            (f) =>
+                              !partyMembers.some(
+                                (pm) => pm.username === f.username
+                              )
+                          );
+                          if (availableFriend && slotIdx === 0) {
+                            handleTogglePartyMember(availableFriend);
+                          } else {
+                            setLobbyPage('friends');
+                          }
+                        }}
+                        title="Add Friend to Party"
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-dashed border-white/30 hover:border-amber-400 text-xs font-mono text-slate-200 hover:text-amber-300 transition-colors cursor-pointer shadow-lg"
+                        style={{ backgroundColor: 'rgba(9,13,22,0.82)' }}
+                      >
+                        <span className="w-5 h-5 rounded-full bg-amber-500/20 border border-amber-400 flex items-center justify-center text-amber-300 font-bold text-sm leading-none">
+                          +
+                        </span>
+                        <span>Invite Friend</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Bottom Bar: Minimalist Play Button + Current Mode/Map Pill */}
+              <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-4">
                 <button
                   type="button"
-                  data-testid="lobby-smart-control-toggle"
-                  onClick={() =>
-                    setSmartControl((prev) => ({
-                      ...prev,
-                      enabled: !prev.enabled,
-                    }))
-                  }
-                  className={`ml-1 px-2.5 py-1 rounded font-mono text-[11px] font-semibold transition-colors cursor-pointer ${
-                    smartControl.enabled
-                      ? 'bg-emerald-500 text-slate-950'
-                      : 'bg-slate-900 text-slate-400 hover:text-white'
-                  }`}
+                  onClick={() => setLobbyPage('maps')}
+                  className="pointer-events-auto px-4 py-2.5 rounded-xl border border-white/15 hover:border-sky-400/60 text-left transition-colors cursor-pointer"
+                  style={{ backgroundColor: 'rgba(9,13,22,0.88)' }}
                 >
-                  SMART ASSIST: {smartControl.enabled ? 'ON' : 'OFF'}
+                  <div className="text-[10px] font-mono text-sky-400 uppercase">
+                    SELECTED MODE &amp; SECTOR (CLICK TO CHANGE)
+                  </div>
+                  <div className="text-sm font-display font-bold text-white">
+                    {currentModeDef.name} · {currentHardnessDef.name} Bots ·{' '}
+                    {currentBiome.name}
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  data-start="true"
+                  data-testid="lobby-main-play-btn"
+                  onClick={() => handleStartDeployment()}
+                  className="pointer-events-auto px-10 py-4 rounded-2xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-xl tracking-wider uppercase shadow-2xl transition-transform active:scale-95 cursor-pointer"
+                >
+                  PLAY [{currentModeDef.shortLabel}]
                 </button>
               </div>
             </div>
-          </div>
+          )}
 
-          {/* Unified Collapsible Bottom Customization Dock */}
-          <div className="pointer-events-auto w-full max-w-[1060px] mx-auto">
-            <div className="flex items-center justify-between mb-1.5">
-              <div
-                className="flex items-center gap-1 p-1 rounded-lg border border-white/15"
-                style={{ backgroundColor: 'rgba(9,13,22,0.92)' }}
-                role="tablist"
-                aria-label="Lobby Customization Categories"
-              >
-                {(
-                  [
-                    { id: 'biomes', label: '1. Maps & Training Tiers' },
-                    { id: 'weaponsmith', label: '2. Weaponsmith & Attachments' },
-                    { id: 'cosmetics', label: '3. Operator Skins & Emotes' },
-                    { id: 'bioscience', label: '4. Bioscience Stim Lab' },
-                    { id: 'squad', label: '5. Fortifications & Squad' },
-                  ] as const
-                ).map((tab) => (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    role="tab"
-                    aria-selected={lobbyTab === tab.id}
-                    onClick={() => {
-                      setLobbyTab(tab.id);
-                      setDockCollapsed(false);
-                    }}
-                    className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
-                      lobbyTab === tab.id && !dockCollapsed
-                        ? 'bg-amber-500 text-slate-950'
-                        : 'text-slate-300 hover:text-white hover:bg-slate-800'
-                    }`}
-                  >
-                    {tab.label}
-                  </button>
-                ))}
+          {/* =============================================================== */}
+          {/* PAGE 2: OPERATOR PAGE (`operator`) — Your Skin, Loadout & Walls */}
+          {/* =============================================================== */}
+          {lobbyPage === 'operator' && (
+            <div
+              data-testid="lobby-page-operator"
+              className="pointer-events-auto w-full max-w-5xl mx-auto my-auto rounded-2xl border border-white/15 p-5 shadow-2xl space-y-4 max-h-[80vh] overflow-y-auto"
+              style={{ backgroundColor: 'rgba(9,13,22,0.94)' }}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 pb-3">
+                <div>
+                  <div className="text-xs font-mono text-amber-400">
+                    PERSONAL OPERATOR ARMORY
+                  </div>
+                  <h2 className="text-xl font-display font-bold text-white">
+                    {callsign} · {currentSkin.name} · {currentWeapon.name}
+                  </h2>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setLobbyPage('shop')}
+                  className="px-3.5 py-1.5 rounded-lg bg-amber-500/20 border border-amber-400 text-amber-300 text-xs font-mono font-bold cursor-pointer"
+                >
+                  Unlock More Skins in Shop ({localCredits} CR) →
+                </button>
               </div>
 
-              <button
-                type="button"
-                onClick={() => setDockCollapsed((prev) => !prev)}
-                className="px-3 py-1.5 rounded-lg border border-white/15 text-xs font-mono text-slate-300 hover:text-white cursor-pointer whitespace-nowrap shrink-0 flex items-center gap-1.5"
-                style={{ backgroundColor: 'rgba(9,13,22,0.92)' }}
-              >
-                <span>{dockCollapsed ? 'Expand Lobby Dock' : 'Collapse Dock'}</span>
-              </button>
-            </div>
+              {/* Owned Skins Selector */}
+              <div>
+                <div className="text-xs font-semibold text-slate-300 mb-2">
+                  Owned Exosuit Skins ({unlockedSkins.length} /{' '}
+                  {Object.keys(OPERATOR_SKINS).length} Unlocked)
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
+                  {unlockedSkins.map((id) => {
+                    const s = OPERATOR_SKINS[id];
+                    if (!s) return null;
+                    const active = skinId === id;
+                    return (
+                      <button
+                        key={id}
+                        type="button"
+                        onClick={() => {
+                          setSkinId(id);
+                          persistLoadoutIfSignedIn({ skinId: id });
+                        }}
+                        className={`p-2.5 rounded-xl border text-left cursor-pointer transition-colors ${
+                          active
+                            ? 'bg-slate-800 border-amber-400 text-white'
+                            : 'bg-slate-900 border-white/10 text-slate-300 hover:border-white/25'
+                        }`}
+                      >
+                        <div className="flex items-center gap-1.5 mb-1">
+                          <span
+                            className="w-3.5 h-3.5 rounded-sm border border-white/20"
+                            style={{ backgroundColor: s.primaryHex }}
+                          />
+                          <span
+                            className="w-3.5 h-3.5 rounded-sm"
+                            style={{ backgroundColor: s.visorHex }}
+                          />
+                          <span className="ml-auto text-[10px] font-mono text-amber-400">
+                            {s.rarity}
+                          </span>
+                        </div>
+                        <div className="text-xs font-bold truncate">
+                          {s.name}
+                        </div>
+                        <div className="text-[10px] text-slate-400 truncate">
+                          {s.roleTag}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
 
-            {!dockCollapsed && (
-              <div
-                className="rounded-xl border border-white/15 p-4 shadow-2xl"
-                style={{ backgroundColor: 'rgba(9,13,22,0.94)' }}
-              >
-                {/* TAB 1: 5 MAPS / BIOMES & 4 AI TRAINING LEVELS */}
-                {lobbyTab === 'biomes' && (
-                  <div className="space-y-3">
-                    <div>
-                      <div className="text-xs font-semibold text-slate-300 mb-2">
-                        Select Deployment Biome (5 Photorealistic Sectors)
-                      </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-5 gap-2.5">
-                        {(Object.keys(BIOMES) as MapId[]).map((id) => {
-                          const b = BIOMES[id];
-                          const active = mapId === id;
-                          return (
-                            <button
-                              key={id}
-                              type="button"
-                              onClick={() => setMapId(id)}
-                              className={`text-left p-2.5 rounded-lg border transition-colors cursor-pointer flex flex-col justify-between ${
-                                active
-                                  ? 'bg-slate-800 border-amber-400 text-white'
-                                  : 'bg-slate-900/90 border-white/10 text-slate-300 hover:border-white/25'
-                              }`}
-                            >
-                              <div>
-                                <div className="flex items-center justify-between gap-1 mb-1">
-                                  <span
-                                    className="w-3 h-3 rounded-sm shrink-0"
-                                    style={{ backgroundColor: b.accentHex }}
-                                  />
-                                  <span className="text-[10px] font-mono text-slate-400 truncate">
-                                    {b.regionCode.split('·')[0]}
-                                  </span>
-                                </div>
-                                <div className="text-xs font-bold leading-snug">
-                                  {b.name}
-                                </div>
-                              </div>
-                              <p className="text-[11px] text-slate-400 mt-1.5 line-clamp-2">
-                                {b.tagline}
-                              </p>
-                            </button>
-                          );
-                        })}
-                      </div>
+              {/* Primary Weapon & 4 Realistic Attachments */}
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 pt-2 border-t border-white/10">
+                <div className="lg:col-span-8 space-y-3">
+                  <div>
+                    <div className="text-xs font-semibold text-slate-300 mb-1.5">
+                      Primary Weapon &amp; Tactical Ability [Q]
                     </div>
-
-                    <div className="pt-2 border-t border-white/10">
-                      <div className="text-xs font-semibold text-slate-300 mb-2">
-                        Select AI Combat Training Level
-                      </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-4 gap-2.5">
-                        {TRAINING_LEVELS.map((tier) => {
-                          const locked = tier.level > highestReachedLevel;
-                          const active = trainingLevel === tier.level;
-                          return (
-                            <button
-                              key={tier.level}
-                              type="button"
-                              disabled={locked}
-                              onClick={() => setTrainingLevel(tier.level)}
-                              className={`text-left p-2.5 rounded-lg border transition-colors cursor-pointer ${
-                                active
-                                  ? 'bg-amber-500/15 border-amber-400 text-white'
-                                  : locked
-                                    ? 'bg-slate-950 border-white/5 text-slate-600 cursor-not-allowed'
-                                    : 'bg-slate-900 border-white/10 text-slate-300 hover:border-white/25'
-                              }`}
-                            >
-                              <div className="flex items-center justify-between text-xs font-bold">
-                                <span>{tier.name}</span>
-                                <span className="font-mono tabular-nums text-[11px] text-amber-400">
-                                  {tier.enemyCount} Hostiles
-                                </span>
-                              </div>
-                              <p className="text-[11px] text-slate-400 mt-1">
-                                {tier.subtitle}
-                              </p>
-                            </button>
-                          );
-                        })}
-                      </div>
+                    <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                      {(Object.keys(WEAPONS) as WeaponId[]).map((id) => {
+                        const w = WEAPONS[id];
+                        const active = weaponId === id;
+                        return (
+                          <button
+                            key={id}
+                            type="button"
+                            onClick={() => {
+                              setWeaponId(id);
+                              persistLoadoutIfSignedIn({ primaryWeaponId: id });
+                            }}
+                            className={`p-2 rounded-lg border text-left cursor-pointer ${
+                              active
+                                ? 'bg-sky-500/20 border-sky-400 text-white'
+                                : 'bg-slate-900 border-white/10 text-slate-300'
+                            }`}
+                          >
+                            <div className="text-xs font-bold truncate">
+                              {w.name}
+                            </div>
+                            <div className="text-[10px] text-sky-300 truncate">
+                              {w.abilityName}
+                            </div>
+                          </button>
+                        );
+                      })}
                     </div>
                   </div>
-                )}
 
-                {/* TAB 2: WEAPONSMITH & REALISTIC ATTACHMENTS */}
-                {lobbyTab === 'weaponsmith' && (
-                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
-                    <div className="lg:col-span-8 space-y-2.5">
-                      <div>
-                        <div className="text-xs font-semibold text-slate-300 mb-1.5">
-                          Primary Weapon Platform &amp; Active Ability [Q]
-                        </div>
-                        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
-                          {(Object.keys(WEAPONS) as WeaponId[]).map((id) => {
-                            const w = WEAPONS[id];
-                            const active = weaponId === id;
-                            return (
-                              <button
-                                key={id}
-                                type="button"
-                                onClick={() => {
-                                  setWeaponId(id);
-                                  persistLoadoutIfSignedIn({
-                                    primaryWeaponId: id,
-                                  });
-                                }}
-                                className={`p-2 rounded-lg border text-left transition-colors cursor-pointer ${
-                                  active
-                                    ? 'bg-sky-500/20 border-sky-400 text-white'
-                                    : 'bg-slate-900 border-white/10 text-slate-300 hover:border-white/25'
-                                }`}
-                              >
-                                <div className="text-xs font-bold truncate">
-                                  {w.name}
-                                </div>
-                                <div className="text-[10px] text-sky-300 mt-0.5 truncate">
-                                  {w.abilityName}
-                                </div>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </div>
-
-                      {/* 4 Attachment Slots */}
-                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-1">
-                        {/* Optic */}
-                        <div>
-                          <label
-                            htmlFor="select-optic"
-                            className="block text-[11px] font-medium text-slate-400 mb-1"
-                          >
-                            Optic Sight
-                          </label>
-                          <select
-                            id="select-optic"
-                            value={opticId}
-                            onChange={(e) => {
-                              const v = e.target.value as OpticId;
-                              setOpticId(v);
-                              persistLoadoutIfSignedIn({ opticId: v });
-                            }}
-                            className="w-full bg-slate-900 border border-white/15 rounded-md px-2.5 py-1.5 text-xs text-white"
-                          >
-                            {(Object.keys(OPTIC_ATTACHMENTS) as OpticId[]).map(
-                              (k) => (
-                                <option key={k} value={k}>
-                                  {OPTIC_ATTACHMENTS[k].name}
-                                </option>
-                              )
-                            )}
-                          </select>
-                        </div>
-
-                        {/* Barrel */}
-                        <div>
-                          <label
-                            htmlFor="select-barrel"
-                            className="block text-[11px] font-medium text-slate-400 mb-1"
-                          >
-                            Muzzle / Barrel
-                          </label>
-                          <select
-                            id="select-barrel"
-                            value={barrelId}
-                            onChange={(e) => {
-                              const v = e.target.value as BarrelId;
-                              setBarrelId(v);
-                              persistLoadoutIfSignedIn({ barrelId: v });
-                            }}
-                            className="w-full bg-slate-900 border border-white/15 rounded-md px-2.5 py-1.5 text-xs text-white"
-                          >
-                            {(
-                              Object.keys(BARREL_ATTACHMENTS) as BarrelId[]
-                            ).map((k) => (
-                              <option key={k} value={k}>
-                                {BARREL_ATTACHMENTS[k].name}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-
-                        {/* Underbarrel */}
-                        <div>
-                          <label
-                            htmlFor="select-underbarrel"
-                            className="block text-[11px] font-medium text-slate-400 mb-1"
-                          >
-                            Underbarrel Rail
-                          </label>
-                          <select
-                            id="select-underbarrel"
-                            value={underbarrelId}
-                            onChange={(e) => {
-                              const v = e.target.value as UnderbarrelId;
-                              setUnderbarrelId(v);
-                              persistLoadoutIfSignedIn({ underbarrelId: v });
-                            }}
-                            className="w-full bg-slate-900 border border-white/15 rounded-md px-2.5 py-1.5 text-xs text-white"
-                          >
-                            {(
-                              Object.keys(
-                                UNDERBARREL_ATTACHMENTS
-                              ) as UnderbarrelId[]
-                            ).map((k) => (
-                              <option key={k} value={k}>
-                                {UNDERBARREL_ATTACHMENTS[k].name}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-
-                        {/* Magazine */}
-                        <div>
-                          <label
-                            htmlFor="select-mag"
-                            className="block text-[11px] font-medium text-slate-400 mb-1"
-                          >
-                            Magazine / Payload
-                          </label>
-                          <select
-                            id="select-mag"
-                            value={magId}
-                            onChange={(e) => {
-                              const v = e.target.value as MagId;
-                              setMagId(v);
-                              persistLoadoutIfSignedIn({ magId: v });
-                            }}
-                            className="w-full bg-slate-900 border border-white/15 rounded-md px-2.5 py-1.5 text-xs text-white"
-                          >
-                            {(Object.keys(MAG_ATTACHMENTS) as MagId[]).map(
-                              (k) => (
-                                <option key={k} value={k}>
-                                  {MAG_ATTACHMENTS[k].name}
-                                </option>
-                              )
-                            )}
-                          </select>
-                        </div>
-                      </div>
+                  {/* 4 Attachments */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                    <div>
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Optic Sight
+                      </label>
+                      <select
+                        value={opticId}
+                        onChange={(e) => {
+                          const v = e.target.value as OpticId;
+                          setOpticId(v);
+                          persistLoadoutIfSignedIn({ opticId: v });
+                        }}
+                        className="w-full bg-slate-900 border border-white/15 rounded-lg px-2.5 py-1.5 text-xs text-white"
+                      >
+                        {(Object.keys(OPTIC_ATTACHMENTS) as OpticId[]).map(
+                          (k) => (
+                            <option key={k} value={k}>
+                              {OPTIC_ATTACHMENTS[k].name}
+                            </option>
+                          )
+                        )}
+                      </select>
                     </div>
+                    <div>
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Barrel
+                      </label>
+                      <select
+                        value={barrelId}
+                        onChange={(e) => {
+                          const v = e.target.value as BarrelId;
+                          setBarrelId(v);
+                          persistLoadoutIfSignedIn({ barrelId: v });
+                        }}
+                        className="w-full bg-slate-900 border border-white/15 rounded-lg px-2.5 py-1.5 text-xs text-white"
+                      >
+                        {(Object.keys(BARREL_ATTACHMENTS) as BarrelId[]).map(
+                          (k) => (
+                            <option key={k} value={k}>
+                              {BARREL_ATTACHMENTS[k].name}
+                            </option>
+                          )
+                        )}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Underbarrel
+                      </label>
+                      <select
+                        value={underbarrelId}
+                        onChange={(e) => {
+                          const v = e.target.value as UnderbarrelId;
+                          setUnderbarrelId(v);
+                          persistLoadoutIfSignedIn({ underbarrelId: v });
+                        }}
+                        className="w-full bg-slate-900 border border-white/15 rounded-lg px-2.5 py-1.5 text-xs text-white"
+                      >
+                        {(
+                          Object.keys(
+                            UNDERBARREL_ATTACHMENTS
+                          ) as UnderbarrelId[]
+                        ).map((k) => (
+                          <option key={k} value={k}>
+                            {UNDERBARREL_ATTACHMENTS[k].name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-slate-400 mb-1">
+                        Magazine
+                      </label>
+                      <select
+                        value={magId}
+                        onChange={(e) => {
+                          const v = e.target.value as MagId;
+                          setMagId(v);
+                          persistLoadoutIfSignedIn({ magId: v });
+                        }}
+                        className="w-full bg-slate-900 border border-white/15 rounded-lg px-2.5 py-1.5 text-xs text-white"
+                      >
+                        {(Object.keys(MAG_ATTACHMENTS) as MagId[]).map((k) => (
+                          <option key={k} value={k}>
+                            {MAG_ATTACHMENTS[k].name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                </div>
 
-                    {/* Live Ballistic Telemetry Readout */}
-                    <div className="lg:col-span-4 bg-slate-900/90 border border-white/10 rounded-lg p-3 flex flex-col justify-between">
+                {/* Emote & Wall Blueprints */}
+                <div className="lg:col-span-4 space-y-2.5">
+                  <div>
+                    <div className="text-xs font-semibold text-slate-300 mb-1">
+                      Equipped Emote [V]
+                    </div>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      {(Object.keys(OPERATOR_EMOTES) as EmoteId[]).map((id) => {
+                        const em = OPERATOR_EMOTES[id];
+                        return (
+                          <button
+                            key={id}
+                            type="button"
+                            onClick={() => {
+                              setEmoteId(id);
+                              persistLoadoutIfSignedIn({ emoteId: id });
+                            }}
+                            className={`px-2.5 py-1.5 rounded-lg border text-xs font-semibold text-left cursor-pointer ${
+                              emoteId === id
+                                ? 'bg-emerald-500/20 border-emerald-400 text-white'
+                                : 'bg-slate-900 border-white/10 text-slate-300'
+                            }`}
+                          >
+                            {em.name}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="text-xs font-semibold text-slate-300 mb-1">
+                      Default Fortification Wall [F]
+                    </div>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {(Object.keys(WALL_BLUEPRINTS) as WallType[]).map(
+                        (wt) => (
+                          <button
+                            key={wt}
+                            type="button"
+                            onClick={() => setSelectedWallType(wt)}
+                            className={`p-2 rounded-lg border text-left text-xs cursor-pointer ${
+                              selectedWallType === wt
+                                ? 'bg-sky-500/20 border-sky-400 text-white'
+                                : 'bg-slate-900 border-white/10 text-slate-300'
+                            }`}
+                          >
+                            <div className="font-bold">
+                              {WALL_BLUEPRINTS[wt].name.split(' ')[0]}
+                            </div>
+                            <div className="text-[10px] font-mono text-amber-400">
+                              {WALL_BLUEPRINTS[wt].salvageCost} Salvage
+                            </div>
+                          </button>
+                        )
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* =============================================================== */}
+          {/* PAGE 3: SKIN SHOP PAGE (`shop`) — Buy Skins with Credits (CR)   */}
+          {/* =============================================================== */}
+          {lobbyPage === 'shop' && (
+            <div
+              data-testid="lobby-page-shop"
+              className="pointer-events-auto w-full max-w-5xl mx-auto my-auto rounded-2xl border border-white/15 p-5 shadow-2xl space-y-4 max-h-[80vh] overflow-y-auto"
+              style={{ backgroundColor: 'rgba(9,13,22,0.94)' }}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-3">
+                <div>
+                  <div className="text-xs font-mono text-amber-400 uppercase">
+                    EXOSUIT COSMETICS STORE · EARN CREDITS BY WINNING MATCHES
+                  </div>
+                  <h2 className="text-xl font-display font-bold text-white">
+                    Operator Skin Shop
+                  </h2>
+                </div>
+                <div className="flex items-center gap-3">
+                  <div
+                    data-testid="shop-credits-balance"
+                    className="px-4 py-2 rounded-xl bg-amber-500/15 border border-amber-400 text-amber-300 font-mono font-bold text-sm"
+                  >
+                    BALANCE: {localCredits} CR
+                  </div>
+                </div>
+              </div>
+
+              {shopToast && (
+                <div
+                  data-testid="shop-toast-banner"
+                  className="px-4 py-2 rounded-xl bg-emerald-500/20 border border-emerald-400 text-emerald-200 text-xs font-mono font-bold"
+                >
+                  {shopToast}
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+                {(Object.keys(OPERATOR_SKINS) as SkinId[]).map((id) => {
+                  const s = OPERATOR_SKINS[id];
+                  const owned = unlockedSkins.includes(id);
+                  const equipped = skinId === id;
+                  return (
+                    <div
+                      key={id}
+                      onClick={() => setShopPreviewSkinId(id)}
+                      className={`p-3.5 rounded-xl border flex flex-col justify-between transition-colors cursor-pointer ${
+                        equipped
+                          ? 'bg-slate-800/95 border-amber-400'
+                          : shopPreviewSkinId === id
+                            ? 'bg-slate-800/80 border-sky-400'
+                            : 'bg-slate-900/90 border-white/10 hover:border-white/25'
+                      }`}
+                    >
                       <div>
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-bold text-white">
-                            {currentWeapon.name}
-                          </span>
-                          <span className="text-[11px] font-mono text-amber-400">
-                            {computedStats.suppressed
-                              ? 'SUPPRESSED'
-                              : 'UNSUPPRESSED'}
+                        <div className="flex items-center justify-between gap-1 mb-2">
+                          <div className="flex items-center gap-1.5">
+                            <span
+                              className="w-4 h-4 rounded-sm border border-white/20"
+                              style={{ backgroundColor: s.primaryHex }}
+                            />
+                            <span
+                              className="w-4 h-4 rounded-sm"
+                              style={{ backgroundColor: s.visorHex }}
+                            />
+                          </div>
+                          <span
+                            className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded ${
+                              s.rarity === 'Mythic'
+                                ? 'bg-amber-500/20 text-amber-300'
+                                : s.rarity === 'Legendary'
+                                  ? 'bg-rose-500/20 text-rose-300'
+                                  : s.rarity === 'Epic'
+                                    ? 'bg-purple-500/20 text-purple-300'
+                                    : 'bg-slate-800 text-slate-300'
+                            }`}
+                          >
+                            {s.rarity}
                           </span>
                         </div>
-                        <p className="text-[11px] text-slate-400 mt-0.5">
-                          {currentWeapon.abilityName}:{' '}
-                          {currentWeapon.abilityDescription}
+
+                        <div className="text-sm font-display font-bold text-white">
+                          {s.name}
+                        </div>
+                        <div className="text-[10px] font-mono text-sky-300 mb-1.5">
+                          {s.roleTag}
+                        </div>
+                        <p className="text-[11px] text-slate-400 line-clamp-2 mb-3">
+                          {s.description}
                         </p>
                       </div>
 
-                      <div className="grid grid-cols-3 gap-2 my-2 text-center font-mono tabular-nums">
-                        <div className="bg-slate-950 p-1.5 rounded border border-white/5">
-                          <div className="text-[10px] text-slate-400">DMG</div>
-                          <div className="text-sm font-bold text-white">
-                            {computedStats.damage}
-                          </div>
-                        </div>
-                        <div className="bg-slate-950 p-1.5 rounded border border-white/5">
-                          <div className="text-[10px] text-slate-400">MAG</div>
-                          <div className="text-sm font-bold text-sky-400">
-                            {computedStats.magSize}
-                          </div>
-                        </div>
-                        <div className="bg-slate-950 p-1.5 rounded border border-white/5">
-                          <div className="text-[10px] text-slate-400">RANGE</div>
-                          <div className="text-sm font-bold text-emerald-400">
-                            {computedStats.range}m
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="text-[11px] font-mono text-slate-400 flex items-center justify-between">
-                        <span>Reload: {computedStats.reloadSec}s</span>
-                        <span>ADS FOV: {computedStats.adsFov}°</span>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {/* TAB 3: OPERATOR SKINS, CALLSIGN & TACTICAL EMOTES */}
-                {lobbyTab === 'cosmetics' && (
-                  <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
-                    <div className="md:col-span-3">
-                      <label
-                        htmlFor="operator-callsign-input"
-                        className="block text-xs font-semibold text-slate-300 mb-1.5"
-                      >
-                        Operator Callsign
-                      </label>
-                      <input
-                        id="operator-callsign-input"
-                        type="text"
-                        maxLength={24}
-                        value={callsign}
-                        onChange={(e) => {
-                          setCallsign(e.target.value);
-                          persistLoadoutIfSignedIn({
-                            callsign: e.target.value,
-                          });
+                      <button
+                        type="button"
+                        data-testid={`shop-action-${id}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleBuyOrEquipSkin(id);
                         }}
-                        className="w-full bg-slate-900 border border-white/15 rounded-lg px-3 py-2 text-xs font-mono text-white"
-                      />
-                      <p className="text-[11px] text-slate-400 mt-1.5">
-                        Displayed over your operator in squad multiplayer and match logs.
-                      </p>
+                        className={`w-full py-2 rounded-lg font-mono font-bold text-xs cursor-pointer transition-colors ${
+                          equipped
+                            ? 'bg-emerald-500 text-slate-950'
+                            : owned
+                              ? 'bg-slate-700 hover:bg-slate-600 text-white'
+                              : localCredits >= s.priceCredits
+                                ? 'bg-amber-500 hover:bg-amber-400 text-slate-950'
+                                : 'bg-slate-950 text-slate-500 border border-white/10'
+                        }`}
+                      >
+                        {equipped
+                          ? 'EQUIPPED'
+                          : owned
+                            ? 'EQUIP SKIN'
+                            : `BUY · ${s.priceCredits} CR`}
+                      </button>
                     </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
-                    <div className="md:col-span-5">
-                      <div className="text-xs font-semibold text-slate-300 mb-1.5">
-                        Exosuit Armor Skin (5 Material Finishes)
-                      </div>
-                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                        {(Object.keys(OPERATOR_SKINS) as SkinId[]).map((id) => {
-                          const s = OPERATOR_SKINS[id];
-                          const active = skinId === id;
-                          return (
-                            <button
-                              key={id}
-                              type="button"
-                              onClick={() => {
-                                setSkinId(id);
-                                persistLoadoutIfSignedIn({ skinId: id });
-                              }}
-                              className={`p-2 rounded-lg border text-left cursor-pointer transition-colors ${
-                                active
-                                  ? 'bg-slate-800 border-amber-400 text-white'
-                                  : 'bg-slate-900 border-white/10 text-slate-300 hover:border-white/25'
-                              }`}
-                            >
-                              <div className="flex items-center gap-1.5 mb-1">
-                                <span
-                                  className="w-3 h-3 rounded-sm border border-white/20"
-                                  style={{ backgroundColor: s.primaryHex }}
-                                />
-                                <span
-                                  className="w-3 h-3 rounded-sm"
-                                  style={{ backgroundColor: s.visorHex }}
-                                />
-                              </div>
-                              <div className="text-xs font-bold truncate">
-                                {s.name}
-                              </div>
-                              <div className="text-[10px] text-slate-400 truncate">
-                                {s.roleTag}
-                              </div>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    <div className="md:col-span-4">
-                      <div className="text-xs font-semibold text-slate-300 mb-1.5">
-                        Equipped Squad Emote [V]
-                      </div>
-                      <div className="grid grid-cols-1 gap-1.5">
-                        {(Object.keys(OPERATOR_EMOTES) as EmoteId[]).map(
-                          (id) => {
-                            const em = OPERATOR_EMOTES[id];
-                            const active = emoteId === id;
-                            return (
-                              <button
-                                key={id}
-                                type="button"
-                                onClick={() => {
-                                  setEmoteId(id);
-                                  persistLoadoutIfSignedIn({ emoteId: id });
-                                }}
-                                className={`px-3 py-1.5 rounded-lg border text-left flex items-center justify-between cursor-pointer ${
-                                  active
-                                    ? 'bg-emerald-500/20 border-emerald-400 text-white'
-                                    : 'bg-slate-900 border-white/10 text-slate-300 hover:border-white/25'
-                                }`}
-                              >
-                                <span className="text-xs font-semibold">
-                                  {em.name}
-                                </span>
-                                <span className="text-[10px] font-mono text-emerald-300">
-                                  [{em.iconLabel}]
-                                </span>
-                              </button>
-                            );
-                          }
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {/* TAB 4: BIOSCIENCE COMBAT STIMULANT WORKBENCH */}
-                {lobbyTab === 'bioscience' && (
-                  <BioSciencePanel
-                    selectedCid={stimCompoundCid}
-                    onSelectCompound={(comp: BioCompoundRecord) => {
-                      setStimCompoundCid(comp.cid);
-                      setStimBuff(comp.combatBuff);
-                      persistLoadoutIfSignedIn({ stimCompoundCid: comp.cid });
-                    }}
-                  />
-                )}
-
-                {/* TAB 5: DEFENSIVE FORTIFICATIONS & MULTIPLAYER SQUAD */}
-                {lobbyTab === 'squad' && (
-                  <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
-                    <div className="md:col-span-7">
-                      <div className="text-xs font-semibold text-slate-300 mb-2">
-                        Defensive Wall Blueprints (Collect Salvage Crates [E] &amp; Build [B] / [F])
-                      </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-                        {(Object.keys(WALL_BLUEPRINTS) as WallType[]).map(
-                          (type) => {
-                            const bp = WALL_BLUEPRINTS[type];
-                            const active = selectedWallType === type;
-                            return (
-                              <button
-                                key={type}
-                                type="button"
-                                onClick={() => setSelectedWallType(type)}
-                                className={`p-2.5 rounded-lg border text-left cursor-pointer ${
-                                  active
-                                    ? 'bg-sky-500/20 border-sky-400 text-white'
-                                    : 'bg-slate-900 border-white/10 text-slate-300 hover:border-white/25'
-                                }`}
-                              >
-                                <div className="flex items-center justify-between text-xs font-bold">
-                                  <span>
-                                    [{bp.keyHint}] {bp.name}
-                                  </span>
-                                  <span className="font-mono text-amber-400">
-                                    {bp.salvageCost} Salvage
-                                  </span>
-                                </div>
-                                <div className="text-[11px] font-mono text-sky-300 mt-0.5">
-                                  Integrity: {bp.maxHp} HP
-                                </div>
-                                <p className="text-[11px] text-slate-400 mt-1">
-                                  {bp.description}
-                                </p>
-                              </button>
-                            );
-                          }
-                        )}
-                      </div>
-                    </div>
-
-                    <div className="md:col-span-5 bg-slate-900 border border-white/10 rounded-lg p-3 flex flex-col justify-between gap-2">
-                      <div>
-                        <div className="flex items-center justify-between mb-1.5">
-                          <span className="text-xs font-bold text-white">
-                            Cross-Platform Controls ({effectiveInputDevice.toUpperCase()})
-                          </span>
-                          <span className="text-[10px] font-mono text-sky-400">
-                            {gamepadLabel ? 'Controller Linked' : 'PC · Touch · Gamepad'}
-                          </span>
-                        </div>
-                        <div className="text-[11px] font-mono text-slate-300 space-y-1 bg-slate-950 p-2 rounded border border-white/5">
-                          <div>
-                            <span className="text-amber-400 font-bold">PC:</span> WASD Move · C Slide · Space Jump/Vault/Climb · LMB/RMB Fire/ADS · Q Ability · F Build
-                          </div>
-                          <div>
-                            <span className="text-sky-400 font-bold">TOUCH:</span> Left Stick Move/Sprint · Right Drag Aim · Dedicated Fire/ADS/Jump/Slide/Build Pad
-                          </div>
-                          <div>
-                            <span className="text-emerald-400 font-bold">CONSOLE:</span> LS Move/Sprint · RS Aim · RT/LT Fire/ADS · A Jump/Vault · B Slide · RB Build · Y Ability
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="pt-1.5 border-t border-white/10">
-                        <div className="flex items-center justify-between mb-1">
-                          <span className="text-[11px] font-bold text-white">
-                            Live Multiplayer Sector Roster
-                          </span>
-                          <span className="text-[10px] font-mono text-emerald-400">
-                            WS Synced · {remoteOperators.length + 1} Online
-                          </span>
-                        </div>
-                        <div className="space-y-1 text-xs font-mono">
-                          <div className="flex items-center justify-between py-1 px-2 rounded bg-slate-950 text-white">
-                            <span>{callsign} (YOU)</span>
-                            <span className="text-amber-400">
-                              {WEAPONS[weaponId].name}
+          {/* =============================================================== */}
+          {/* PAGE 4: MAPS, MODES (1v1..4v4, Co-Op) & BOT HARDNESS (`maps`)   */}
+          {/* =============================================================== */}
+          {lobbyPage === 'maps' && (
+            <div
+              data-testid="lobby-page-maps"
+              className="pointer-events-auto w-full max-w-5xl mx-auto my-auto rounded-2xl border border-white/15 p-5 shadow-2xl space-y-4 max-h-[80vh] overflow-y-auto"
+              style={{ backgroundColor: 'rgba(9,13,22,0.94)' }}
+            >
+              {/* Team Modes (1v1, 2v2, 3v3, 4v4, Offline Co-Op Split-Screen) */}
+              <div>
+                <div className="text-xs font-mono text-amber-400 uppercase mb-1">
+                  1. SELECT MATCH MODE (1V1 TO MAXIMUM 4V4 &amp; OFFLINE CO-OP
+                  SPLIT-SCREEN)
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
+                  {Object.values(BATTLE_MODES).map((m) => {
+                    const active = battleMode === m.id;
+                    return (
+                      <button
+                        key={m.id}
+                        type="button"
+                        data-testid={`select-battle-mode-${m.id}`}
+                        onClick={() => setBattleMode(m.id)}
+                        className={`p-3 rounded-xl border text-left cursor-pointer transition-colors flex flex-col justify-between ${
+                          active
+                            ? 'bg-amber-500/20 border-amber-400 text-white'
+                            : 'bg-slate-900 border-white/10 text-slate-300 hover:border-white/25'
+                        }`}
+                      >
+                        <div>
+                          <div className="flex items-center justify-between gap-1 mb-1">
+                            <span className="text-xs font-bold">{m.name}</span>
+                            <span className="px-1.5 py-0.5 rounded bg-slate-950 text-[10px] font-mono text-amber-400">
+                              {m.shortLabel}
                             </span>
                           </div>
-                          {remoteOperators.slice(0, 2).map((ro) => (
-                            <div
-                              key={ro.id}
-                              className="flex items-center justify-between py-1 px-2 rounded bg-slate-950 text-sky-300"
-                            >
-                              <span>{ro.callsign}</span>
-                              <span>
-                                HP {ro.hp}/{ro.maxHp} · Score {ro.score}
-                              </span>
-                            </div>
-                          ))}
+                          <p className="text-[11px] text-slate-400">
+                            {m.description}
+                          </p>
                         </div>
-                      </div>
-                    </div>
-                  </div>
-                )}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
-            )}
 
-            {/* Flat Borderless Single-Line Control Hint in Bottom Safe Margin */}
-            <div className="text-center text-xs font-mono text-slate-200 mt-2 hud-stroke whitespace-nowrap overflow-hidden text-ellipsis">
-              {effectiveInputDevice === 'touch'
-                ? 'TOUCH MODE ACTIVE: Left Thumb Virtual Stick Move/Sprint · Right Screen Drag Look · Tap FIRE / AIM / JUMP-VAULT / SLIDE / BUILD / ABILITY'
-                : effectiveInputDevice === 'console'
-                  ? 'CONSOLE CONTROLLER: Left Stick Move/Sprint · Right Stick Aim · RT Fire · LT ADS · [A/Cross] Jump/Vault/Climb · [B/Circle] Slide · [RB/R1] Build Wall · [Y/Triangle] Ability · [LB/L1] Bio-Stim'
-                  : 'PC + CONSOLE + TOUCH READY: WASD/Left-Stick Move · Shift/L3 Sprint · C/[B] Slide · Space/[A] Jump/Vault/Climb · LMB/RT Fire · Q/[Y] Ability · F/[RB] Build Wall · G/[LB] Bio-Stim'}
+              {/* Bot Hardness Levels (Beginner to Legend) */}
+              <div className="pt-2 border-t border-white/10">
+                <div className="text-xs font-mono text-sky-400 uppercase mb-1">
+                  2. SELECT BOT HARDNESS LEVEL (BEGINNER TO LEGEND)
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-5 gap-2.5">
+                  {Object.values(BOT_HARDNESS_TIERS).map((tier) => {
+                    const active = botHardness === tier.id;
+                    return (
+                      <button
+                        key={tier.id}
+                        type="button"
+                        data-testid={`select-bot-hardness-${tier.id}`}
+                        onClick={() => setBotHardness(tier.id)}
+                        className={`p-3 rounded-xl border text-left cursor-pointer transition-colors ${
+                          active
+                            ? 'bg-sky-500/20 border-sky-400 text-white'
+                            : 'bg-slate-900 border-white/10 text-slate-300 hover:border-white/25'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-xs font-bold">{tier.name}</span>
+                          <span className="text-[10px] font-mono text-emerald-400">
+                            {tier.xpCreditMultiplier}x XP/CR
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-400">
+                          {tier.description}
+                        </p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* 5 Expanded 192m x 192m Maps / Biomes */}
+              <div className="pt-2 border-t border-white/10">
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-xs font-mono text-emerald-400 uppercase">
+                    3. CHOOSE EXPANDED DEPLOYMENT MAP (192M × 192M LARGE SECTORS)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => handleStartDeployment()}
+                    className="px-4 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-xs cursor-pointer"
+                  >
+                    Deploy Now →
+                  </button>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-5 gap-2.5">
+                  {(Object.keys(BIOMES) as MapId[]).map((id) => {
+                    const b = BIOMES[id];
+                    const active = mapId === id;
+                    return (
+                      <button
+                        key={id}
+                        type="button"
+                        data-testid={`map-select-${id}`}
+                        onClick={() => setMapId(id)}
+                        className={`text-left p-3 rounded-xl border transition-colors cursor-pointer flex flex-col justify-between ${
+                          active
+                            ? 'bg-slate-800 border-amber-400 text-white'
+                            : 'bg-slate-900/90 border-white/10 text-slate-300 hover:border-white/25'
+                        }`}
+                      >
+                        <div>
+                          <div className="flex items-center justify-between gap-1 mb-1">
+                            <span
+                              className="w-3 h-3 rounded-sm shrink-0"
+                              style={{ backgroundColor: b.accentHex }}
+                            />
+                            <span className="text-[10px] font-mono text-amber-300">
+                              192m × 192m
+                            </span>
+                          </div>
+                          <div className="text-xs font-bold leading-snug">
+                            {b.name}
+                          </div>
+                        </div>
+                        <p className="text-[11px] text-slate-400 mt-1.5 line-clamp-2">
+                          {b.tagline}
+                        </p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
-          </div>
+          )}
+
+          {/* =============================================================== */}
+          {/* PAGE 5: FRIENDS & PARTY PAGE (`friends`) — Add by Username      */}
+          {/* =============================================================== */}
+          {lobbyPage === 'friends' && (
+            <div
+              data-testid="lobby-page-friends"
+              className="pointer-events-auto w-full max-w-4xl mx-auto my-auto rounded-2xl border border-white/15 p-5 shadow-2xl space-y-4 max-h-[80vh] overflow-y-auto"
+              style={{ backgroundColor: 'rgba(9,13,22,0.94)' }}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 pb-3">
+                <div>
+                  <div className="text-xs font-mono text-amber-400 uppercase">
+                    ONLINE SOCIAL &amp; SQUAD PARTY NETWORK
+                  </div>
+                  <h2 className="text-xl font-display font-bold text-white">
+                    Add Friends by Username &amp; Build Your 4v4 Party
+                  </h2>
+                </div>
+                <div className="text-xs font-mono text-slate-300">
+                  Your Username:{' '}
+                  <span className="text-amber-400 font-bold">{callsign}</span>
+                </div>
+              </div>
+
+              {/* Send Friend Request by Username */}
+              <form
+                onSubmit={handleSendFriendRequest}
+                className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5 bg-slate-950 p-3.5 rounded-xl border border-white/10"
+              >
+                <input
+                  type="text"
+                  data-testid="friend-username-input"
+                  value={friendSearchUsername}
+                  onChange={(e) => setFriendSearchUsername(e.target.value)}
+                  placeholder="Enter operator username (e.g. APEX_ZERO, SHADOW_LYNX)..."
+                  className="flex-1 bg-slate-900 border border-white/15 rounded-lg px-3.5 py-2 text-xs font-mono text-white"
+                />
+                <button
+                  type="submit"
+                  data-testid="send-friend-request-btn"
+                  className="px-5 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-xs cursor-pointer shrink-0"
+                >
+                  Send Friend Request
+                </button>
+              </form>
+
+              {friendStatusMsg && (
+                <div
+                  data-testid="friend-status-banner"
+                  className="px-3.5 py-2 rounded-lg bg-emerald-500/20 border border-emerald-400 text-emerald-200 text-xs font-mono"
+                >
+                  {friendStatusMsg}
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
+                {/* Friends Roster + Add to Party */}
+                <div className="md:col-span-7 space-y-2">
+                  <div className="text-xs font-semibold text-slate-300">
+                    Friends List ({friendsList.length}) · Click [+] to Add to
+                    Party ({partyMembers.length}/3)
+                  </div>
+                  <div className="space-y-2">
+                    {friendsList.map((f) => {
+                      const inParty = partyMembers.some(
+                        (pm) => pm.username === f.username
+                      );
+                      return (
+                        <div
+                          key={f.username}
+                          className="flex items-center justify-between p-2.5 rounded-xl bg-slate-900 border border-white/10"
+                        >
+                          <div className="flex items-center gap-2.5">
+                            <span
+                              className={`w-2.5 h-2.5 rounded-full ${
+                                f.status === 'online'
+                                  ? 'bg-emerald-400'
+                                  : 'bg-amber-400'
+                              }`}
+                            />
+                            <div>
+                              <div className="text-xs font-mono font-bold text-white">
+                                {f.username}{' '}
+                                <span className="text-sky-400">
+                                  LVL {f.level}
+                                </span>
+                              </div>
+                              <div className="text-[10px] font-mono text-slate-400">
+                                Skin:{' '}
+                                {OPERATOR_SKINS[f.skinId]?.name ||
+                                  'Vanguard Obsidian'}
+                              </div>
+                            </div>
+                          </div>
+
+                          <button
+                            type="button"
+                            data-testid={`friend-party-toggle-${f.username}`}
+                            onClick={() => handleTogglePartyMember(f)}
+                            className={`px-3 py-1.5 rounded-lg font-mono text-xs font-bold cursor-pointer ${
+                              inParty
+                                ? 'bg-emerald-500 text-slate-950'
+                                : 'bg-slate-800 hover:bg-amber-500 hover:text-slate-950 text-slate-200'
+                            }`}
+                          >
+                            {inParty ? '✓ IN PARTY' : '+ ADD TO PARTY'}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Incoming & Outgoing Friend Requests */}
+                <div className="md:col-span-5 space-y-2">
+                  <div className="text-xs font-semibold text-slate-300">
+                    Friend Requests ({friendRequests.length})
+                  </div>
+                  <div className="space-y-2">
+                    {friendRequests.length === 0 ? (
+                      <div className="p-3 rounded-xl bg-slate-950 border border-white/5 text-xs text-slate-400 font-mono">
+                        No pending requests. Enter any username above to send a
+                        friend request!
+                      </div>
+                    ) : (
+                      friendRequests.map((req) => (
+                        <div
+                          key={req.id}
+                          className="p-2.5 rounded-xl bg-slate-900 border border-white/10 flex items-center justify-between gap-2"
+                        >
+                          <div>
+                            <div className="text-xs font-mono font-bold text-white">
+                              {req.fromUsername === callsign
+                                ? `To: ${req.toUsername}`
+                                : `From: ${req.fromUsername}`}
+                            </div>
+                            <div className="text-[10px] font-mono text-amber-400 uppercase">
+                              {req.status}
+                            </div>
+                          </div>
+                          {req.status === 'pending' &&
+                            req.fromUsername !== callsign && (
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  data-testid={`accept-request-${req.id}`}
+                                  onClick={() =>
+                                    handleRespondToFriendRequest(
+                                      req.id,
+                                      'accept'
+                                    )
+                                  }
+                                  className="px-2.5 py-1 rounded bg-emerald-500 text-slate-950 font-mono font-bold text-[11px] cursor-pointer"
+                                >
+                                  Accept
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleRespondToFriendRequest(
+                                      req.id,
+                                      'decline'
+                                    )
+                                  }
+                                  className="px-2 py-1 rounded bg-slate-800 text-slate-300 font-mono text-[11px] cursor-pointer"
+                                >
+                                  Decline
+                                </button>
+                              </div>
+                            )}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* =============================================================== */}
+          {/* PAGE 6: PRACTICE & BIOSCIENCE STIM LAB PAGE (`practice`)        */}
+          {/* =============================================================== */}
+          {lobbyPage === 'practice' && (
+            <div
+              data-testid="lobby-page-practice"
+              className="pointer-events-auto w-full max-w-5xl mx-auto my-auto rounded-2xl border border-white/15 p-5 shadow-2xl space-y-4 max-h-[80vh] overflow-y-auto"
+              style={{ backgroundColor: 'rgba(9,13,22,0.94)' }}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-3">
+                <div>
+                  <div className="text-xs font-mono text-emerald-400 uppercase">
+                    COMBAT TRAINING RANGE &amp; BIOSCIENCE STIMULANT LAB
+                  </div>
+                  <h2 className="text-xl font-display font-bold text-white">
+                    Practice Target Range, AI Tiers &amp; 3D Replay Theater
+                  </h2>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    data-testid="lobby-watch-replay-btn"
+                    onClick={() => {
+                      setReplayTimeSec(0);
+                      setReplayPlaying(true);
+                      handleStateChange('replay');
+                    }}
+                    className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-emerald-400/30 text-xs font-mono font-bold cursor-pointer"
+                  >
+                    Watch 3D Match Replay
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="start-practice-btn"
+                    onClick={() => handleStartDeployment('practice')}
+                    className="px-5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-display font-bold text-xs cursor-pointer"
+                  >
+                    Launch Practice Range →
+                  </button>
+                </div>
+              </div>
+
+              {/* 4 AI Training Progression Tiers */}
+              <div>
+                <div className="text-xs font-semibold text-slate-300 mb-2">
+                  Select AI Combat Training Tier
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-2.5">
+                  {TRAINING_LEVELS.map((tier) => {
+                    const locked = tier.level > highestReachedLevel;
+                    const active = trainingLevel === tier.level;
+                    return (
+                      <button
+                        key={tier.level}
+                        type="button"
+                        disabled={locked}
+                        onClick={() => setTrainingLevel(tier.level)}
+                        className={`text-left p-2.5 rounded-xl border transition-colors cursor-pointer ${
+                          active
+                            ? 'bg-amber-500/15 border-amber-400 text-white'
+                            : 'bg-slate-900 border-white/10 text-slate-300'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between text-xs font-bold">
+                          <span>{tier.name}</span>
+                          <span className="font-mono text-[11px] text-amber-400">
+                            {tier.enemyCount} Bots
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-400 mt-1">
+                          {tier.subtitle}
+                        </p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Bioscience Combat Stimulant Workbench */}
+              <div className="pt-2 border-t border-white/10">
+                <BioSciencePanel
+                  selectedCid={stimCompoundCid}
+                  onSelectCompound={(comp: BioCompoundRecord) => {
+                    setStimCompoundCid(comp.cid);
+                    setStimBuff(comp.combatBuff);
+                    persistLoadoutIfSignedIn({ stimCompoundCid: comp.cid });
+                  }}
+                />
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -1294,6 +2048,39 @@ export default function App() {
       {/* ===================================================================== */}
       {gameState === 'playing' && (
         <div className="fixed inset-0 z-10 pointer-events-none overflow-hidden">
+          {/* Split-Screen Center Divider Line & Player 2 Overlay when in Offline Co-Op Split-Screen */}
+          {battleMode === 'coop-splitscreen' && hud.splitScreenP2 && (
+            <>
+              <div className="fixed inset-y-0 left-1/2 -translate-x-1/2 w-0.5 bg-amber-400/70 pointer-events-none z-20" />
+              <div
+                data-testid="splitscreen-p2-hud"
+                className="fixed top-4 left-[51.5%] max-w-[290px] rounded-xl border border-sky-400/40 px-3 py-2 text-[11px] font-mono pointer-events-none z-20"
+                style={{ backgroundColor: 'rgba(9,13,22,0.88)' }}
+              >
+                <div className="text-[10px] text-sky-400 font-bold truncate">
+                  P2 CO-OP · {hud.splitScreenP2.callsign}
+                </div>
+                <div className="flex items-center gap-2 mt-0.5 text-white whitespace-nowrap">
+                  <span>
+                    HP {hud.splitScreenP2.hp}/{hud.splitScreenP2.maxHp}
+                  </span>
+                  <span className="text-sky-300">
+                    SH {hud.splitScreenP2.shield}
+                  </span>
+                  <span className="text-amber-400">
+                    AMMO {hud.splitScreenP2.ammo}
+                  </span>
+                  <span className="text-emerald-400">
+                    {hud.splitScreenP2.eliminations}K
+                  </span>
+                </div>
+                <div className="text-[9px] text-slate-400 mt-0.5 truncate">
+                  Arrows Move · IJKL Aim · Enter Fire
+                </div>
+              </div>
+            </>
+          )}
+
           {/* Peripheral Critical Damage Vignette */}
           {hud.damageVignetteIntensity > 0.02 && (
             <div
@@ -1344,7 +2131,6 @@ export default function App() {
                   </span>
                 </div>
 
-                {/* Shield Bar if present */}
                 {opp.maxShield > 0 && (
                   <div className="w-full h-1 bg-slate-950/90 rounded-sm overflow-hidden mb-0.5 border border-black/60">
                     <div
@@ -1354,7 +2140,6 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Primary Over-Head Health Bar */}
                 <div className="w-full h-2 bg-slate-950/90 rounded-sm overflow-hidden border border-black/70">
                   <div
                     className={`h-full transition-transform duration-75 origin-left ${
@@ -1375,260 +2160,145 @@ export default function App() {
                     ▲ INCOMING FIRE ▲
                   </div>
                 )}
-                {opp.activeEmote && (
-                  <div className="text-[10px] font-mono font-bold text-emerald-300 text-center mt-0.5 hud-stroke">
-                    [{opp.activeEmote.toUpperCase()}]
-                  </div>
-                )}
               </div>
             );
           })}
 
-          {/* Exact (50%, 50%) Center Reticle, Smart Target Lock & Hit/Kill Confirmation */}
+          {/* Precision Crosshair + Hit/Kill Reticle */}
           <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none">
-            <svg viewBox="0 0 48 48" className="w-11 h-11">
+            <div className="relative w-8 h-8 flex items-center justify-center">
+              <div className="w-1 h-1 rounded-full bg-amber-400" />
+              <div className="absolute top-0 w-0.5 h-2 bg-white/80" />
+              <div className="absolute bottom-0 w-0.5 h-2 bg-white/80" />
+              <div className="absolute left-0 h-0.5 w-2 bg-white/80" />
+              <div className="absolute right-0 h-0.5 w-2 bg-white/80" />
               {hud.smartTargetLocked && (
-                <polygon
-                  points="24,6 42,24 24,42 6,24"
-                  fill="none"
-                  stroke="#10b981"
-                  strokeWidth="1.6"
-                  strokeDasharray="4 2"
-                />
+                <div className="absolute inset-0 rounded-full border border-emerald-400/80 scale-110" />
               )}
-              <circle
-                cx="24"
-                cy="24"
-                r="2.2"
-                fill={
-                  hud.killMarkerActive
-                    ? '#ef4444'
-                    : hud.smartTargetLocked
-                      ? '#10b981'
-                      : '#38bdf8'
-                }
-              />
-              <line
-                x1="24"
-                y1="10"
-                x2="24"
-                y2="17"
-                stroke={hud.smartTargetLocked ? '#10b981' : '#f8fafc'}
-                strokeWidth="1.8"
-              />
-              <line
-                x1="24"
-                y1="31"
-                x2="24"
-                y2="38"
-                stroke={hud.smartTargetLocked ? '#10b981' : '#f8fafc'}
-                strokeWidth="1.8"
-              />
-              <line
-                x1="10"
-                y1="24"
-                x2="17"
-                y2="24"
-                stroke={hud.smartTargetLocked ? '#10b981' : '#f8fafc'}
-                strokeWidth="1.8"
-              />
-              <line
-                x1="31"
-                y1="24"
-                x2="38"
-                y2="24"
-                stroke={hud.smartTargetLocked ? '#10b981' : '#f8fafc'}
-                strokeWidth="1.8"
-              />
-              {hud.hitMarkerActive && (
-                <g
-                  stroke={hud.killMarkerActive ? '#ef4444' : '#f59e0b'}
+              {(hud.hitMarkerActive || hud.killMarkerActive) && (
+                <svg
+                  viewBox="0 0 32 32"
+                  className={`absolute inset-0 w-8 h-8 ${
+                    hud.killMarkerActive ? 'stroke-rose-500' : 'stroke-amber-400'
+                  }`}
+                  fill="none"
                   strokeWidth="2.2"
                 >
-                  <line x1="15" y1="15" x2="20" y2="20" />
-                  <line x1="33" y1="15" x2="28" y2="20" />
-                  <line x1="15" y1="33" x2="20" y2="28" />
-                  <line x1="33" y1="33" x2="28" y2="28" />
-                </g>
+                  <line x1="4" y1="4" x2="11" y2="11" />
+                  <line x1="28" y1="4" x2="21" y2="11" />
+                  <line x1="4" y1="28" x2="11" y2="21" />
+                  <line x1="28" y1="28" x2="21" y2="21" />
+                </svg>
               )}
-            </svg>
+            </div>
           </div>
 
-          {/* TOP-CENTER DYNAMIC ENVIRONMENT EVENT BANNER */}
-          <div className="fixed top-4 left-1/2 -translate-x-1/2 pointer-events-none flex flex-col items-center">
-            {hud.activeEnvironmentEvent ? (
+          {/* Dynamic Environment Event Banner */}
+          {hud.activeEnvironmentEvent && (
+            <div
+              data-testid="active-env-event-banner"
+              className="fixed top-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded-xl border text-center pointer-events-none"
+              style={{
+                backgroundColor: 'rgba(9,13,22,0.9)',
+                borderColor: hud.activeEnvironmentEvent.accentColor,
+              }}
+            >
               <div
-                data-testid="active-env-event-banner"
-                className="px-4 py-1.5 rounded-lg border shadow-lg text-center"
-                style={{
-                  backgroundColor: 'rgba(9,13,22,0.9)',
-                  borderColor: hud.activeEnvironmentEvent.accentColor,
-                }}
+                className="text-xs font-mono font-bold tracking-wider uppercase"
+                style={{ color: hud.activeEnvironmentEvent.accentColor }}
               >
-                <div className="flex items-center justify-center gap-2 text-xs font-mono font-bold">
-                  <span
-                    className="w-2 h-2 rounded-full animate-pulse"
-                    style={{
-                      backgroundColor: hud.activeEnvironmentEvent.accentColor,
-                    }}
-                  />
-                  <span className="text-white">
-                    {hud.activeEnvironmentEvent.name}
-                  </span>
-                  <span className="text-amber-300 tabular-nums">
-                    {hud.activeEnvironmentEvent.remainingSec.toFixed(1)}s
-                  </span>
-                </div>
-                <div className="text-[10px] font-mono text-slate-300 mt-0.5">
-                  {hud.activeEnvironmentEvent.subtitle}
-                </div>
+                ⚡ {hud.activeEnvironmentEvent.name} (
+                {hud.activeEnvironmentEvent.remainingSec.toFixed(0)}s)
               </div>
-            ) : (
-              <div
-                data-testid="upcoming-env-event-pill"
-                className="px-3 py-1 rounded-md border border-white/10 text-[10px] font-mono text-slate-300"
-                style={{ backgroundColor: 'rgba(9,13,22,0.78)' }}
-              >
-                SECTOR WEATHER · NEXT ANOMALY IN{' '}
-                <span className="text-amber-300 font-bold tabular-nums">
-                  {hud.nextEventCooldownSec.toFixed(0)}s
-                </span>{' '}
-                [H]
+              <div className="text-[11px] font-mono text-slate-200">
+                {hud.activeEnvironmentEvent.subtitle}
               </div>
-            )}
-          </div>
-
-          {/* Contextual Salvage / Emote Callout near Gaze Center */}
-          {(hud.interactionPrompt || hud.activeEmoteBanner) && (
-            <div className="fixed left-1/2 top-[58%] -translate-x-1/2 pointer-events-none text-center">
-              {hud.interactionPrompt && (
-                <div
-                  className="px-3 py-1 rounded border border-amber-400/50 text-xs font-mono font-semibold text-amber-300 mb-1"
-                  style={{ backgroundColor: 'rgba(9,13,22,0.88)' }}
-                >
-                  {hud.interactionPrompt}
-                </div>
-              )}
-              {hud.activeEmoteBanner && (
-                <div
-                  className="px-3 py-1 rounded border border-emerald-400/50 text-xs font-mono font-semibold text-emerald-300"
-                  style={{ backgroundColor: 'rgba(9,13,22,0.88)' }}
-                >
-                  {hud.activeEmoteBanner}: {currentEmote.calloutText}
-                </div>
-              )}
             </div>
           )}
 
-          {/* CORNER CLUSTER 1 (TOP-LEFT): Tactical Minimap + Wave / Score Telemetry */}
-          <div className="fixed top-4 left-4 flex items-start gap-3">
-            {/* Live Radar Minimap */}
-            <div
-              className="w-28 h-28 rounded-lg border border-white/20 p-1.5 relative overflow-hidden"
-              style={{ backgroundColor: 'rgba(9,13,22,0.86)' }}
-            >
-              <svg viewBox="-70 -70 140 140" className="w-full h-full">
-                <circle
-                  cx="0"
-                  cy="0"
-                  r="64"
-                  fill="none"
-                  stroke="rgba(148,163,184,0.25)"
-                  strokeWidth="1.5"
-                />
-                <circle
-                  cx="0"
-                  cy="0"
-                  r="32"
-                  fill="none"
-                  stroke="rgba(148,163,184,0.18)"
-                  strokeWidth="1"
-                />
-                {/* Salvage Crates */}
-                {hud.minimapEntities.crates.map(
-                  (c, idx) =>
-                    c.ready && (
-                      <rect
-                        key={`mc-${idx}`}
-                        x={c.x - 2}
-                        y={c.z - 2}
-                        width="4"
-                        height="4"
-                        fill="#f59e0b"
-                      />
-                    )
-                )}
-                {/* Built Defensive Walls */}
-                {hud.minimapEntities.walls.map((w, idx) => (
-                  <rect
-                    key={`mw-${idx}`}
-                    x={w.x - 3}
-                    y={w.z - 1.5}
-                    width="6"
-                    height="3"
-                    fill="#38bdf8"
+          {/* Contextual Salvage Pickup Prompt */}
+          {hud.interactionPrompt && (
+            <div className="fixed left-1/2 top-[58%] -translate-x-1/2 px-3 py-1 rounded bg-slate-950/90 border border-amber-400/50 text-xs font-mono text-amber-300">
+              {hud.interactionPrompt}
+            </div>
+          )}
+
+          {/* CORNER CLUSTER 1 (TOP-LEFT): Tactical Radar + Mode/Hardness/Time/Kills */}
+          <div
+            className="fixed top-4 left-4 rounded-xl border border-white/15 p-3 flex items-center gap-3.5"
+            style={{ backgroundColor: 'rgba(9,13,22,0.86)' }}
+          >
+            <div className="relative w-20 h-20 rounded-full bg-slate-950 border border-sky-400/40 overflow-hidden shrink-0">
+              <div className="absolute inset-2 rounded-full border border-white/10" />
+              <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-2 h-2 rounded-full bg-white" />
+              {hud.minimapEntities.enemies.map((e, idx) => {
+                const dx = (e.x - hud.minimapEntities.playerX) * 0.65;
+                const dz = (e.z - hud.minimapEntities.playerZ) * 0.65;
+                const cx = Math.max(-34, Math.min(34, dx));
+                const cz = Math.max(-34, Math.min(34, dz));
+                return (
+                  <span
+                    key={idx}
+                    style={{
+                      transform: `translate3d(${40 + cx}px, ${40 + cz}px, 0)`,
+                    }}
+                    className={`absolute left-0 top-0 w-1.5 h-1.5 -ml-0.5 -mt-0.5 rounded-full ${
+                      e.isWindup ? 'bg-amber-400' : 'bg-rose-500'
+                    }`}
                   />
-                ))}
-                {/* Hostile NPCs */}
-                {hud.minimapEntities.enemies.map((e, idx) => (
-                  <circle
-                    key={`me-${idx}`}
-                    cx={e.x}
-                    cy={e.z}
-                    r={e.isWindup ? 4.2 : 3}
-                    fill={e.isWindup ? '#f59e0b' : '#ef4444'}
+                );
+              })}
+              {hud.minimapEntities.squadmates.map((sq, idx) => {
+                const dx = (sq.x - hud.minimapEntities.playerX) * 0.65;
+                const dz = (sq.z - hud.minimapEntities.playerZ) * 0.65;
+                const cx = Math.max(-34, Math.min(34, dx));
+                const cz = Math.max(-34, Math.min(34, dz));
+                return (
+                  <span
+                    key={idx}
+                    style={{
+                      transform: `translate3d(${40 + cx}px, ${40 + cz}px, 0)`,
+                    }}
+                    className="absolute left-0 top-0 w-1.5 h-1.5 -ml-0.5 -mt-0.5 rounded-full bg-emerald-400"
                   />
-                ))}
-                {/* Player Arrow */}
-                <g
-                  transform={`translate(${hud.minimapEntities.playerX}, ${hud.minimapEntities.playerZ}) rotate(${
-                    (-hud.minimapEntities.playerYaw * 180) / Math.PI
-                  })`}
-                >
-                  <polygon points="0,-6 4.5,5 -4.5,5" fill="#10b981" />
-                </g>
-              </svg>
+                );
+              })}
             </div>
 
-            {/* Wave, Hostiles & Score Readout */}
-            <div
-              className="px-3.5 py-2 rounded-lg border border-white/15 flex items-center gap-4"
-              style={{ backgroundColor: 'rgba(9,13,22,0.84)' }}
-            >
+            <div className="flex items-center gap-4 pr-1">
               <div>
-                <div className="text-[10px] font-mono uppercase text-slate-400">
-                  TRAINING WAVE
+                <div className="text-[10px] font-mono uppercase text-sky-400">
+                  {currentModeDef.shortLabel} · {currentHardnessDef.name}
                 </div>
-                <div className="text-xl font-display font-bold tabular-nums text-white">
-                  {hud.wave} / 2
+                <div className="text-lg font-display font-bold tabular-nums text-white">
+                  WAVE {hud.wave}/{hud.totalWaves}
                 </div>
               </div>
               <div>
                 <div className="text-[10px] font-mono uppercase text-slate-400">
                   HOSTILES
                 </div>
-                <div className="text-xl font-display font-bold tabular-nums text-rose-400">
+                <div className="text-lg font-display font-bold tabular-nums text-rose-400">
                   {hud.enemiesRemaining}
                 </div>
               </div>
               <div>
                 <div className="text-[10px] font-mono uppercase text-slate-400">
-                  SCORE
+                  TIME · KILLS
                 </div>
-                <div className="text-xl font-display font-bold tabular-nums text-amber-400">
-                  {hud.score}
+                <div className="text-lg font-display font-bold tabular-nums text-amber-400">
+                  {hud.matchElapsedSec}s · {hud.eliminations}K
                 </div>
               </div>
             </div>
           </div>
 
-          {/* CORNER CLUSTER 2 (TOP-RIGHT): Compact Utility Buttons (Event, Smart Assist, Mute, Restart, Replay, Pause) */}
+          {/* CORNER CLUSTER 2 (TOP-RIGHT): Compact Utility Buttons */}
           <div className="fixed top-4 right-4 pointer-events-auto flex items-center gap-1.5">
             <button
               type="button"
               tabIndex={-1}
               data-testid="hud-trigger-event-btn"
-              aria-label="Trigger Dynamic Environment Event"
               onClick={(e) => {
                 e.currentTarget.blur();
                 setTriggerEventNonce((n) => n + 1);
@@ -1642,7 +2312,6 @@ export default function App() {
               type="button"
               tabIndex={-1}
               data-testid="hud-smart-assist-btn"
-              aria-label="Toggle Smart Control Assist"
               onClick={(e) => {
                 e.currentTarget.blur();
                 setSmartControl((prev) => ({
@@ -1663,7 +2332,6 @@ export default function App() {
               type="button"
               tabIndex={-1}
               data-testid="hud-open-replay-btn"
-              aria-label="Open 3D Match Replay"
               onClick={(e) => {
                 e.currentTarget.blur();
                 document.exitPointerLock?.();
@@ -1679,37 +2347,7 @@ export default function App() {
             <button
               type="button"
               tabIndex={-1}
-              aria-label={muted ? 'Unmute Audio' : 'Mute Audio'}
-              onClick={(e) => {
-                e.currentTarget.blur();
-                setMuted(soundEngine.toggleMute());
-              }}
-              className="w-9 h-9 rounded-lg border border-white/15 flex items-center justify-center text-slate-200 hover:bg-slate-800 cursor-pointer"
-              style={{ backgroundColor: 'rgba(9,13,22,0.85)' }}
-            >
-              <span className="text-[10px] font-mono font-bold">
-                {muted ? 'MUTE' : 'SND'}
-              </span>
-            </button>
-            <button
-              type="button"
-              tabIndex={-1}
-              aria-label="Restart Wave"
-              onClick={(e) => {
-                e.currentTarget.blur();
-                setRestartNonce((n) => n + 1);
-              }}
-              className="w-9 h-9 rounded-lg border border-white/15 flex items-center justify-center text-slate-200 hover:bg-slate-800 cursor-pointer"
-              style={{ backgroundColor: 'rgba(9,13,22,0.85)' }}
-            >
-              <span className="text-[10px] font-mono font-bold">RST</span>
-            </button>
-            {/* Button to cycle Input Mode directly in top-right utility cluster */}
-            <button
-              type="button"
-              tabIndex={-1}
               data-testid="hud-cycle-controls-btn"
-              aria-label="Cycle Input Controls Mode"
               onClick={(e) => {
                 e.currentTarget.blur();
                 setControlScheme((prev) =>
@@ -1741,18 +2379,11 @@ export default function App() {
               className="px-3 h-9 rounded-lg border border-white/15 flex items-center justify-center text-xs font-mono font-bold text-amber-400 hover:bg-slate-800 cursor-pointer"
               style={{ backgroundColor: 'rgba(9,13,22,0.85)' }}
             >
-              {effectiveInputDevice === 'console'
-                ? 'START · PAUSE'
-                : effectiveInputDevice === 'touch'
-                  ? 'PAUSE'
-                  : 'ESC · PAUSE'}
+              ESC · PAUSE
             </button>
           </div>
 
-          {/* MUTUALLY EXCLUSIVE ACTIVE INPUT OVERLAY:
-              - When effectiveInputDevice === 'touch', ONLY the TouchControlsOverlay is rendered (PC & Console prompts hidden).
-              - When effectiveInputDevice === 'console', TouchControlsOverlay & PC prompts are hidden, and Console Pad bar is shown.
-              - When effectiveInputDevice === 'pc', TouchControlsOverlay & Console prompts are hidden, and PC KBM bar is shown. */}
+          {/* MUTUALLY EXCLUSIVE ACTIVE INPUT OVERLAY */}
           {effectiveInputDevice === 'touch' ? (
             <TouchControlsOverlay
               touchInputRef={touchInputRef}
@@ -1772,7 +2403,7 @@ export default function App() {
             </div>
           )}
 
-          {/* CORNER CLUSTER 3 (BOTTOM-LEFT): Clean Unobtrusive Operator HP, Shield, Stamina & Movement State */}
+          {/* CORNER CLUSTER 3 (BOTTOM-LEFT): Operator HP, Shield, Stamina & Movement State */}
           <div
             className="fixed bottom-4 left-4 w-72 rounded-xl border border-white/15 p-3.5"
             style={{ backgroundColor: 'rgba(9,13,22,0.86)' }}
@@ -1800,7 +2431,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Shield Bar */}
             <div className="w-full h-1.5 bg-slate-950 rounded-sm overflow-hidden mb-1">
               <div
                 className="h-full bg-sky-400 transition-transform duration-75 origin-left"
@@ -1813,7 +2443,6 @@ export default function App() {
               />
             </div>
 
-            {/* Primary Health Bar */}
             <div className="w-full h-3 bg-slate-950 rounded-sm overflow-hidden mb-2 border border-white/10">
               <div
                 className={`h-full transition-transform duration-75 origin-left ${
@@ -1832,19 +2461,12 @@ export default function App() {
               />
             </div>
 
-            {/* Stamina + Bio-Stim Status */}
             <div className="flex items-center justify-between text-[11px] font-mono text-slate-300">
               <span>STAMINA {hud.stamina}%</span>
               <span className="text-emerald-300">
                 {hud.stimActiveTimer > 0
-                  ? `BIO-STIM ACTIVE (${hud.stimActiveTimer.toFixed(1)}s)`
-                  : hud.stimCooldown > 0
-                    ? `STIM CD ${hud.stimCooldown.toFixed(0)}s`
-                    : effectiveInputDevice === 'console'
-                      ? '[LB] BIO-STIM READY'
-                      : effectiveInputDevice === 'touch'
-                        ? '[TAP] BIO-STIM READY'
-                        : '[G] BIO-STIM READY'}
+                  ? `BIO-STIM (${hud.stimActiveTimer.toFixed(1)}s)`
+                  : '[G] BIO-STIM READY'}
               </span>
             </div>
           </div>
@@ -1861,16 +2483,8 @@ export default function App() {
                 </div>
                 <div className="text-xs font-mono text-sky-300">
                   {hud.abilityActiveTimer > 0
-                    ? `${currentWeapon.abilityName} ACTIVE (${hud.abilityActiveTimer.toFixed(1)}s)`
-                    : hud.abilityCooldown > 0
-                      ? `${currentWeapon.abilityName} (${hud.abilityCooldown.toFixed(0)}s)`
-                      : `${currentWeapon.abilityName} · ${
-                          effectiveInputDevice === 'console'
-                            ? '[Y]'
-                            : effectiveInputDevice === 'touch'
-                              ? '[TAP]'
-                              : '[Q]'
-                        } READY`}
+                    ? `${currentWeapon.abilityName} ACTIVE`
+                    : `${currentWeapon.abilityName} · [Q] READY`}
                 </div>
               </div>
               <div className="text-right">
@@ -1886,7 +2500,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Salvage & Wall Construction Strip */}
             <div className="pt-2 border-t border-white/10 flex items-center justify-between gap-2 text-xs font-mono">
               <div>
                 <span className="text-slate-400">SALVAGE: </span>
@@ -1911,15 +2524,6 @@ export default function App() {
                     </span>
                   );
                 })}
-                <span className="text-emerald-400 font-semibold ml-1">
-                  {hud.buildModeActive
-                    ? 'PLACE WALL'
-                    : effectiveInputDevice === 'console'
-                      ? '[RB] BUILD'
-                      : effectiveInputDevice === 'touch'
-                        ? '[BUILD]'
-                        : '[F/B] BUILD'}
-                </span>
               </div>
             </div>
           </div>
@@ -1956,90 +2560,10 @@ export default function App() {
                 </div>
               </div>
               <div className="p-2.5 rounded-lg bg-slate-950 border border-white/10">
-                <div className="text-[10px] text-slate-400">WALLS BUILT</div>
+                <div className="text-[10px] text-slate-400">TIME</div>
                 <div className="text-lg font-bold text-sky-400">
-                  {hud.wallsConstructed}
+                  {hud.matchElapsedSec}s
                 </div>
-              </div>
-            </div>
-
-            {/* In-Match Control Scheme & Smart Assist Switcher */}
-            <div className="mb-4 p-2.5 rounded-lg bg-slate-950 border border-white/10 space-y-2">
-              <div className="text-[10px] font-mono text-slate-400">
-                ACTIVE INPUT SCHEME (AUTO-HIDES OTHER DEVICE CONTROLS)
-              </div>
-              <div className="grid grid-cols-4 gap-1.5">
-                {(
-                  [
-                    { id: 'auto', label: 'AUTO' },
-                    { id: 'pc', label: 'PC KBM' },
-                    { id: 'touch', label: 'TOUCH' },
-                    { id: 'console', label: 'CONSOLE' },
-                  ] as const
-                ).map((mode) => (
-                  <button
-                    key={mode.id}
-                    type="button"
-                    onClick={() => setControlScheme(mode.id)}
-                    className={`py-1.5 rounded text-[11px] font-mono font-bold cursor-pointer ${
-                      controlScheme === mode.id
-                        ? 'bg-amber-500 text-slate-950'
-                        : 'bg-slate-900 text-slate-300 hover:text-white'
-                    }`}
-                  >
-                    {mode.label}
-                  </button>
-                ))}
-              </div>
-              <div className="grid grid-cols-3 gap-1.5 pt-1 border-t border-white/10">
-                <button
-                  type="button"
-                  onClick={() =>
-                    setSmartControl((p) => ({
-                      ...p,
-                      aimAssistMagnetism: !p.aimAssistMagnetism,
-                    }))
-                  }
-                  className={`py-1 rounded text-[10px] font-mono font-semibold cursor-pointer ${
-                    smartControl.aimAssistMagnetism
-                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/40'
-                      : 'bg-slate-900 text-slate-400'
-                  }`}
-                >
-                  AIM MAGNET: {smartControl.aimAssistMagnetism ? 'ON' : 'OFF'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    setSmartControl((p) => ({
-                      ...p,
-                      autoFireOnLock: !p.autoFireOnLock,
-                    }))
-                  }
-                  className={`py-1 rounded text-[10px] font-mono font-semibold cursor-pointer ${
-                    smartControl.autoFireOnLock
-                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/40'
-                      : 'bg-slate-900 text-slate-400'
-                  }`}
-                >
-                  AUTO-FIRE: {smartControl.autoFireOnLock ? 'ON' : 'OFF'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    setSmartControl((p) => ({
-                      ...p,
-                      autoSprintAndParkour: !p.autoSprintAndParkour,
-                    }))
-                  }
-                  className={`py-1 rounded text-[10px] font-mono font-semibold cursor-pointer ${
-                    smartControl.autoSprintAndParkour
-                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/40'
-                      : 'bg-slate-900 text-slate-400'
-                  }`}
-                >
-                  AUTO-PARKOUR: {smartControl.autoSprintAndParkour ? 'ON' : 'OFF'}
-                </button>
               </div>
             </div>
 
@@ -2049,7 +2573,7 @@ export default function App() {
                 onClick={() => handleStateChange('playing')}
                 className="w-full py-2.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-sm cursor-pointer"
               >
-                Resume Combat [Esc / Start]
+                Resume Combat [Esc]
               </button>
               <button
                 type="button"
@@ -2065,20 +2589,10 @@ export default function App() {
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  setRestartNonce((n) => n + 1);
-                  handleStateChange('playing');
-                }}
-                className="w-full py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-white text-xs font-semibold cursor-pointer"
-              >
-                Restart Training Wave
-              </button>
-              <button
-                type="button"
                 onClick={() => handleStateChange('title')}
                 className="w-full py-2.5 rounded-lg bg-slate-950 hover:bg-slate-800 text-slate-300 border border-white/10 text-xs font-semibold cursor-pointer"
               >
-                Return to Customization Lobby
+                Return to Lobby
               </button>
             </div>
           </div>
@@ -2086,85 +2600,106 @@ export default function App() {
       )}
 
       {/* ===================================================================== */}
-      {/* STATE 4: VICTORY / DEFEAT OUTCOME MODAL                               */}
+      {/* STATE 4: VICTORY / DEFEAT MODAL WITH CUSTOM TIME + KPM XP & CREDITS   */}
       {/* ===================================================================== */}
       {gameState === 'gameover' && (
         <div
           className="fixed inset-0 z-30 flex items-center justify-center p-6"
-          style={{ backgroundColor: 'rgba(9,13,22,0.86)' }}
+          style={{ backgroundColor: 'rgba(9,13,22,0.88)' }}
         >
-          <div className="w-full max-w-md rounded-xl border border-white/15 bg-slate-900 p-6 shadow-2xl">
-            <div
-              className={`text-xs font-mono font-bold mb-1 ${
-                outcomeSnapshot?.victory ? 'text-emerald-400' : 'text-rose-400'
-              }`}
-            >
-              {outcomeSnapshot?.victory
-                ? 'SECTOR SECURED · TRAINING TIER CLEARED'
-                : 'OPERATOR DOWN · MISSION TERMINATED'}
+          <div className="w-full max-w-lg rounded-2xl border border-white/15 bg-slate-900 p-6 shadow-2xl space-y-4">
+            <div>
+              <div
+                className={`text-xs font-mono font-bold mb-1 ${
+                  outcomeSnapshot?.victory
+                    ? 'text-emerald-400'
+                    : 'text-rose-400'
+                }`}
+              >
+                {outcomeSnapshot?.victory
+                  ? 'SECTOR SECURED · VICTORY CREDITS AWARDED'
+                  : 'OPERATOR DOWN · MATCH COMPLETED'}
+              </div>
+              <h2 className="text-2xl font-display font-bold text-white">
+                {outcomeSnapshot?.victory
+                  ? 'Tactical Victory'
+                  : 'Combat Defeat'}
+              </h2>
             </div>
-            <h2 className="text-2xl font-display font-bold text-white mb-4">
-              {outcomeSnapshot?.victory
-                ? 'Tactical Victory'
-                : 'Combat Defeat'}
-            </h2>
 
-            <div className="grid grid-cols-3 gap-2.5 mb-5 text-center font-mono tabular-nums">
-              <div className="p-2.5 rounded-lg bg-slate-950 border border-white/10">
-                <div className="text-[10px] text-slate-400">FINAL SCORE</div>
-                <div className="text-lg font-bold text-amber-400">
-                  {outcomeSnapshot?.score ?? hud.score}
+            {/* Custom XP (Time + Kills-Per-Minute Velocity) & Credits Breakdown */}
+            {outcomeSnapshot?.rewards && (
+              <div
+                data-testid="match-rewards-breakdown"
+                className="p-3.5 rounded-xl bg-slate-950 border border-white/10 space-y-2 font-mono text-xs"
+              >
+                <div className="flex items-center justify-between text-slate-300">
+                  <span>
+                    Match Time ({outcomeSnapshot.durationSec}s) +{' '}
+                    {outcomeSnapshot.eliminations} Kills (
+                    {outcomeSnapshot.rewards.killsPerMinute} KPM)
+                  </span>
+                  <span className="text-sky-400 font-bold">
+                    +{outcomeSnapshot.rewards.timeXp + outcomeSnapshot.rewards.eliminationXp} XP
+                  </span>
+                </div>
+                <div className="flex items-center justify-between text-slate-300">
+                  <span>Kills-Per-Minute Velocity Bonus XP</span>
+                  <span className="text-emerald-400 font-bold">
+                    +{outcomeSnapshot.rewards.kpmVelocityBonusXp} XP
+                  </span>
+                </div>
+                <div className="flex items-center justify-between pt-2 border-t border-white/10 text-sm font-bold">
+                  <span className="text-white">TOTAL CUSTOM XP EARNED</span>
+                  <span className="text-sky-300">
+                    +{outcomeSnapshot.rewards.totalXpEarned} XP (LVL{' '}
+                    {levelInfo.level})
+                  </span>
+                </div>
+                <div className="flex items-center justify-between pt-2 border-t border-white/10 text-sm font-bold">
+                  <span className="text-amber-300">
+                    SHOP CREDITS EARNED{' '}
+                    {outcomeSnapshot.victory ? '(WIN BONUS!)' : ''}
+                  </span>
+                  <span className="text-amber-400">
+                    +{outcomeSnapshot.rewards.creditsEarned} CR (Total:{' '}
+                    {localCredits} CR)
+                  </span>
                 </div>
               </div>
-              <div className="p-2.5 rounded-lg bg-slate-950 border border-white/10">
-                <div className="text-[10px] text-slate-400">ELIMINATIONS</div>
-                <div className="text-lg font-bold text-white">
-                  {outcomeSnapshot?.eliminations ?? hud.eliminations}
-                </div>
-              </div>
-              <div className="p-2.5 rounded-lg bg-slate-950 border border-white/10">
-                <div className="text-[10px] text-slate-400">WALLS BUILT</div>
-                <div className="text-lg font-bold text-sky-400">
-                  {outcomeSnapshot?.wallsConstructed ?? hud.wallsConstructed}
-                </div>
-              </div>
-            </div>
+            )}
 
             <div className="flex flex-col gap-2.5">
               <button
                 type="button"
                 data-start="true"
                 onClick={() => {
-                  if (outcomeSnapshot?.victory && trainingLevel < 4) {
-                    setTrainingLevel((lvl) => Math.min(4, lvl + 1));
-                  }
                   setRestartNonce((n) => n + 1);
                   handleStartDeployment();
                 }}
                 className="w-full py-2.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-sm cursor-pointer"
               >
-                {outcomeSnapshot?.victory && trainingLevel < 4
-                  ? `Advance to Level ${trainingLevel + 1}`
-                  : 'Deploy Again'}
+                Play Again ({currentModeDef.name})
               </button>
               <button
                 type="button"
-                data-testid="gameover-watch-replay-btn"
                 onClick={() => {
-                  setReplayTimeSec(0);
-                  setReplayPlaying(true);
-                  handleStateChange('replay');
+                  setLobbyPage('shop');
+                  handleStateChange('title');
                 }}
-                className="w-full py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold cursor-pointer"
+                className="w-full py-2.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold cursor-pointer"
               >
-                Watch 3D Match Replay ({replayRecording?.frames.length ?? 0} Frames)
+                Spend Credits in Skin Shop ({localCredits} CR)
               </button>
               <button
                 type="button"
-                onClick={() => handleStateChange('title')}
+                onClick={() => {
+                  setLobbyPage('play');
+                  handleStateChange('title');
+                }}
                 className="w-full py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold cursor-pointer"
               >
-                Return to Lobby &amp; Weaponsmith
+                Return to Main Lobby
               </button>
             </div>
           </div>
@@ -2179,7 +2714,6 @@ export default function App() {
           data-testid="replay-viewer-overlay"
           className="fixed inset-0 z-30 pointer-events-none flex flex-col justify-between p-5"
         >
-          {/* Top Bar: Replay Header + Camera Perspective Switcher + Exit */}
           <div className="pointer-events-auto flex flex-wrap items-center justify-between gap-3">
             <div
               className="px-4 py-2.5 rounded-xl border border-emerald-400/40 flex items-center gap-3"
@@ -2192,22 +2726,18 @@ export default function App() {
                 </div>
                 <div className="text-[11px] font-mono text-slate-300">
                   Operator {replayRecording?.callsign ?? callsign} · Score{' '}
-                  {replayRecording?.finalScore ?? hud.score} · Elims{' '}
-                  {replayRecording?.finalEliminations ?? hud.eliminations}
+                  {replayRecording?.finalScore ?? hud.score}
                 </div>
               </div>
             </div>
 
-            {/* 3D Replay Camera Perspective Selector */}
             <div
               className="flex items-center gap-1.5 p-1.5 rounded-xl border border-white/15"
               style={{ backgroundColor: 'rgba(9,13,22,0.9)' }}
-              role="group"
-              aria-label="Replay Camera Mode"
             >
               {(
                 [
-                  { id: 'first-person', label: '1ST-PERSON POV' },
+                  { id: 'fpv', label: '1ST-PERSON POV' },
                   { id: 'orbit', label: '3RD-PERSON ORBIT' },
                   { id: 'drone', label: 'TACTICAL DRONE' },
                 ] as const
@@ -2217,10 +2747,10 @@ export default function App() {
                   type="button"
                   data-testid={`replay-cam-${cam.id}`}
                   onClick={() => setReplayCameraMode(cam.id)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold cursor-pointer transition-colors ${
+                  className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold cursor-pointer ${
                     replayCameraMode === cam.id
                       ? 'bg-amber-500 text-slate-950'
-                      : 'bg-slate-900 text-slate-300 hover:text-white'
+                      : 'bg-slate-900 text-slate-300'
                   }`}
                 >
                   {cam.label}
@@ -2248,31 +2778,10 @@ export default function App() {
             </div>
           </div>
 
-          {/* Bottom Timeline Scrubber, Speed Controls & Combat Highlight Markers */}
           <div
             className="pointer-events-auto w-full max-w-4xl mx-auto rounded-xl border border-white/15 p-4 shadow-2xl space-y-3"
             style={{ backgroundColor: 'rgba(9,13,22,0.92)' }}
           >
-            {/* Highlight Markers Strip */}
-            {replayRecording && replayRecording.highlights.length > 0 && (
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-[10px] font-mono text-slate-400 mr-1">
-                  HIGHLIGHTS:
-                </span>
-                {replayRecording.highlights.map((hl) => (
-                  <button
-                    key={hl.id}
-                    type="button"
-                    onClick={() => setReplayTimeSec(hl.timestamp ?? 0)}
-                    className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-white/10 text-[10px] font-mono text-amber-300 cursor-pointer"
-                  >
-                    [{(hl.timestamp ?? 0).toFixed(1)}s] {hl.label}
-                  </button>
-                ))}
-              </div>
-            )}
-
-            {/* Scrubber Slider + Play/Pause + Speed */}
             <div className="flex items-center gap-3">
               <button
                 type="button"
@@ -2300,23 +2809,6 @@ export default function App() {
               <div className="text-xs font-mono tabular-nums text-white shrink-0 w-24 text-right">
                 {replayTimeSec.toFixed(1)}s /{' '}
                 {(replayRecording?.durationSec ?? 12).toFixed(1)}s
-              </div>
-
-              <div className="flex items-center gap-1 shrink-0">
-                {[0.5, 1, 2].map((spd) => (
-                  <button
-                    key={spd}
-                    type="button"
-                    onClick={() => setReplaySpeed(spd)}
-                    className={`px-2 py-1 rounded text-[11px] font-mono font-bold cursor-pointer ${
-                      replaySpeed === spd
-                        ? 'bg-sky-500 text-slate-950'
-                        : 'bg-slate-800 text-slate-300 hover:text-white'
-                    }`}
-                  >
-                    {spd}x
-                  </button>
-                ))}
               </div>
             </div>
           </div>

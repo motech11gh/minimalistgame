@@ -62,7 +62,35 @@ export type SkinId =
   | 'alpine-ghost'
   | 'dune-stalker'
   | 'emerald-recon'
-  | 'cryo-sentinel';
+  | 'cryo-sentinel'
+  | 'solaris-valkyrie'
+  | 'void-walker'
+  | 'crimson-ronin'
+  | 'nebula-titan'
+  | 'apex-sovereign';
+
+export type BattleModeId =
+  | '1v1'
+  | '2v2'
+  | '3v3'
+  | '4v4'
+  | 'coop-splitscreen'
+  | 'practice';
+
+export type BotHardnessId =
+  | 'beginner'
+  | 'recruit'
+  | 'veteran'
+  | 'master'
+  | 'legend';
+
+export type LobbyPageId =
+  | 'play'
+  | 'operator'
+  | 'shop'
+  | 'maps'
+  | 'friends'
+  | 'practice';
 
 export type EmoteId =
   | 'salute'
@@ -614,10 +642,19 @@ export const WALL_BLUEPRINTS: Record<WallType, WallBlueprint> = {
   },
 };
 
-export const OPERATOR_SKINS: Record<
-  SkinId,
-  { id: SkinId; name: string; primaryHex: string; secondaryHex: string; visorHex: string; roleTag: string }
-> = {
+export interface OperatorSkinDef {
+  id: SkinId;
+  name: string;
+  primaryHex: string;
+  secondaryHex: string;
+  visorHex: string;
+  roleTag: string;
+  priceCredits: number;
+  rarity: 'Starter' | 'Epic' | 'Legendary' | 'Mythic';
+  description: string;
+}
+
+export const OPERATOR_SKINS: Record<SkinId, OperatorSkinDef> = {
   'vanguard-obsidian': {
     id: 'vanguard-obsidian',
     name: 'Vanguard Obsidian',
@@ -625,6 +662,9 @@ export const OPERATOR_SKINS: Record<
     secondaryHex: '#334155',
     visorHex: '#f59e0b',
     roleTag: 'Spec-Ops Carbonweave',
+    priceCredits: 0,
+    rarity: 'Starter',
+    description: 'Standard-issue matte carbonweave exosuit with amber tactical HUD visor.',
   },
   'alpine-ghost': {
     id: 'alpine-ghost',
@@ -633,6 +673,9 @@ export const OPERATOR_SKINS: Record<
     secondaryHex: '#64748b',
     visorHex: '#38bdf8',
     roleTag: 'Arctic Recon Exosuit',
+    priceCredits: 0,
+    rarity: 'Starter',
+    description: 'Glacial white thermal-baffled armor plated for high-altitude snow sectors.',
   },
   'dune-stalker': {
     id: 'dune-stalker',
@@ -641,6 +684,9 @@ export const OPERATOR_SKINS: Record<
     secondaryHex: '#78350f',
     visorHex: '#fde047',
     roleTag: 'Desert Thermal Rig',
+    priceCredits: 0,
+    rarity: 'Starter',
+    description: 'Dust-sealed ochre chassis engineered for silica sandstorms and heat dispersion.',
   },
   'emerald-recon': {
     id: 'emerald-recon',
@@ -649,6 +695,9 @@ export const OPERATOR_SKINS: Record<
     secondaryHex: '#064e3b',
     visorHex: '#34d399',
     roleTag: 'CBRN Sealed Armor',
+    priceCredits: 0,
+    rarity: 'Starter',
+    description: 'Hermetically sealed CBRN filtration rig for bioluminescent spore zones.',
   },
   'cryo-sentinel': {
     id: 'cryo-sentinel',
@@ -657,6 +706,64 @@ export const OPERATOR_SKINS: Record<
     secondaryHex: '#0284c7',
     visorHex: '#22d3ee',
     roleTag: 'Zero-Kelvin Plating',
+    priceCredits: 0,
+    rarity: 'Starter',
+    description: 'Deep-freeze titanium alloy with superconducting cyan energy conduits.',
+  },
+  'solaris-valkyrie': {
+    id: 'solaris-valkyrie',
+    name: 'Solaris Gold Valkyrie',
+    primaryHex: '#d97706',
+    secondaryHex: '#451a03',
+    visorHex: '#fef08a',
+    roleTag: 'Auric Command Frame',
+    priceCredits: 450,
+    rarity: 'Epic',
+    description: 'Anodized solar-gold flight plating forged for vanguard strike commanders.',
+  },
+  'void-walker': {
+    id: 'void-walker',
+    name: 'Void Walker Stealth',
+    primaryHex: '#312e81',
+    secondaryHex: '#090d16',
+    visorHex: '#a855f7',
+    roleTag: 'Phase-Shift Carapace',
+    priceCredits: 650,
+    rarity: 'Epic',
+    description: 'Radar-absorbent deep indigo composite with ultraviolet optical array.',
+  },
+  'crimson-ronin': {
+    id: 'crimson-ronin',
+    name: 'Crimson Ronin Cyber',
+    primaryHex: '#991b1b',
+    secondaryHex: '#18181b',
+    visorHex: '#fb7185',
+    roleTag: 'High-Velocity Duelist',
+    priceCredits: 800,
+    rarity: 'Legendary',
+    description: 'Articulated crimson alloy plates built for close-quarters 1v1 and 2v2 duels.',
+  },
+  'nebula-titan': {
+    id: 'nebula-titan',
+    name: 'Nebula Titan Exo',
+    primaryHex: '#0d9488',
+    secondaryHex: '#134e4a',
+    visorHex: '#2dd4bf',
+    roleTag: 'Heavy Bastion Rig',
+    priceCredits: 1100,
+    rarity: 'Legendary',
+    description: 'Reinforced orbital-drop armor with reactive teal kinetic dampeners.',
+  },
+  'apex-sovereign': {
+    id: 'apex-sovereign',
+    name: 'Apex Legend Sovereign',
+    primaryHex: '#f8fafc',
+    secondaryHex: '#b45309',
+    visorHex: '#f59e0b',
+    roleTag: 'Mythic Champion Suit',
+    priceCredits: 1500,
+    rarity: 'Mythic',
+    description: 'Prestige platinum-and-gold champion exosuit reserved for Legend-tier victors.',
   },
 };
 
@@ -928,4 +1035,196 @@ export interface MatchReplayRecording {
   frames: ReplayFrameSnapshot[];
   highlights: ReplayHighlightMarker[];
 }
+
+export interface BattleModeDefinition {
+  id: BattleModeId;
+  name: string;
+  shortLabel: string;
+  allyCount: number; // Number of friendly AI/Squad teammates alongside Player 1
+  enemyCount: number; // Number of hostile bots per wave
+  waves: number;
+  xpMultiplier: number;
+  creditWinBonus: number;
+  description: string;
+  isSplitScreen?: boolean;
+  isPractice?: boolean;
+}
+
+export const BATTLE_MODES: Record<BattleModeId, BattleModeDefinition> = {
+  '1v1': {
+    id: '1v1',
+    name: '1v1 Tactical Duel',
+    shortLabel: '1v1 DUEL',
+    allyCount: 0,
+    enemyCount: 1,
+    waves: 3,
+    xpMultiplier: 1.0,
+    creditWinBonus: 140,
+    description: 'Pure head-to-head precision duel across 3 rounds in an expanded arena.',
+  },
+  '2v2': {
+    id: '2v2',
+    name: '2v2 Wingman Strike',
+    shortLabel: '2v2 WINGMAN',
+    allyCount: 1,
+    enemyCount: 2,
+    waves: 2,
+    xpMultiplier: 1.2,
+    creditWinBonus: 180,
+    description: 'Deploy with 1 Allied Operator or Party Friend against a 2-unit hostile duo.',
+  },
+  '3v3': {
+    id: '3v3',
+    name: '3v3 Squad Skirmish',
+    shortLabel: '3v3 SQUAD',
+    allyCount: 2,
+    enemyCount: 3,
+    waves: 2,
+    xpMultiplier: 1.35,
+    creditWinBonus: 220,
+    description: 'Coordinated 3-operator fireteam clashes with fortifications and crossfire.',
+  },
+  '4v4': {
+    id: '4v4',
+    name: '4v4 Maximum Strike Force',
+    shortLabel: '4v4 MAX WARFARE',
+    allyCount: 3,
+    enemyCount: 4,
+    waves: 2,
+    xpMultiplier: 1.55,
+    creditWinBonus: 280,
+    description: 'Full 4v4 squad warfare across the expanded 192m × 192m sector.',
+  },
+  'coop-splitscreen': {
+    id: 'coop-splitscreen',
+    name: 'Offline Co-Op Split-Screen',
+    shortLabel: '2P SPLIT-SCREEN',
+    allyCount: 1,
+    enemyCount: 4,
+    waves: 2,
+    xpMultiplier: 1.45,
+    creditWinBonus: 240,
+    description: 'Dual-viewport local Co-Op: P1 (WASD/Mouse) + P2 (Arrows/Enter or Pad 2).',
+    isSplitScreen: true,
+  },
+  practice: {
+    id: 'practice',
+    name: 'Practice & Target Range',
+    shortLabel: 'PRACTICE RANGE',
+    allyCount: 1,
+    enemyCount: 5,
+    waves: 1,
+    xpMultiplier: 0.85,
+    creditWinBonus: 90,
+    description: 'Free-fire ballistics range with extra salvage (300) and customizable bot hardness.',
+    isPractice: true,
+  },
+};
+
+export interface BotHardnessDefinition {
+  id: BotHardnessId;
+  name: string;
+  rankIndex: number;
+  hpScale: number;
+  speedScale: number;
+  damageScale: number;
+  windupSec: number;
+  xpCreditMultiplier: number;
+  accentColor: string;
+  description: string;
+}
+
+export const BOT_HARDNESS_TIERS: Record<BotHardnessId, BotHardnessDefinition> = {
+  beginner: {
+    id: 'beginner',
+    name: 'Beginner',
+    rankIndex: 1,
+    hpScale: 0.7,
+    speedScale: 0.68,
+    damageScale: 0.55,
+    windupSec: 1.35,
+    xpCreditMultiplier: 0.85,
+    accentColor: '#38bdf8',
+    description: 'Relaxed bot cadence, wide telegraph windows, and reduced incoming damage.',
+  },
+  recruit: {
+    id: 'recruit',
+    name: 'Recruit',
+    rankIndex: 2,
+    hpScale: 0.9,
+    speedScale: 0.85,
+    damageScale: 0.8,
+    windupSec: 1.05,
+    xpCreditMultiplier: 1.0,
+    accentColor: '#10b981',
+    description: 'Standard combat AI with balanced patrol, cover seeking, and burst fire.',
+  },
+  veteran: {
+    id: 'veteran',
+    name: 'Veteran',
+    rankIndex: 3,
+    hpScale: 1.1,
+    speedScale: 1.02,
+    damageScale: 1.0,
+    windupSec: 0.8,
+    xpCreditMultiplier: 1.3,
+    accentColor: '#f59e0b',
+    description: 'Coordinated flanking maneuvers, faster target acquisition, and shield discipline.',
+  },
+  master: {
+    id: 'master',
+    name: 'Master',
+    rankIndex: 4,
+    hpScale: 1.35,
+    speedScale: 1.18,
+    damageScale: 1.25,
+    windupSec: 0.58,
+    xpCreditMultiplier: 1.65,
+    accentColor: '#f97316',
+    description: 'High-velocity spec-ops bots with aggressive strafe-dodging and heavy suppression.',
+  },
+  legend: {
+    id: 'legend',
+    name: 'Legend',
+    rankIndex: 5,
+    hpScale: 1.65,
+    speedScale: 1.35,
+    damageScale: 1.5,
+    windupSec: 0.42,
+    xpCreditMultiplier: 2.25,
+    accentColor: '#ef4444',
+    description: 'Maximum lethality apex AI with relentless multi-angle breaches and +125% XP/Credits.',
+  },
+};
+
+export interface FriendProfile {
+  username: string;
+  level: number;
+  skinId: SkinId;
+  status: 'online' | 'in-match' | 'idle';
+  inParty: boolean;
+}
+
+export interface FriendRequestRecord {
+  id: string;
+  fromUsername: string;
+  toUsername: string;
+  direction: 'incoming' | 'outgoing';
+  status: 'pending' | 'accepted' | 'declined';
+  timestamp: number;
+}
+
+export interface SplitScreenP2Telemetry {
+  active: boolean;
+  callsign: string;
+  hp: number;
+  maxHp: number;
+  shield: number;
+  maxShield: number;
+  ammo: number;
+  magSize: number;
+  eliminations: number;
+  movementMode: PlayerPhysicsState['movementMode'];
+}
+
 
