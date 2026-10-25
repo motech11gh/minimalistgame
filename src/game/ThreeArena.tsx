@@ -30,6 +30,8 @@ import {
   ActiveInputDevice,
   VirtualTouchInputState,
   SmartControlConfig,
+  WeatherAtmosphereMode,
+  ProceduralChunkBlueprint,
   DYNAMIC_ENVIRONMENT_EVENTS,
   DynamicEnvironmentEventDef,
   ReplayCameraMode,
@@ -50,6 +52,10 @@ import {
   evaluateSmartAimAssist,
   stepDynamicEnvironmentEventState,
   interpolateReplayFrames,
+  WORLD_CHUNK_SIZE,
+  getChunkCoordFromWorld,
+  getStreamingChunkCoords,
+  generateProceduralChunkBlueprint,
 } from './rules';
 import { soundEngine } from './sound';
 
@@ -84,6 +90,10 @@ export interface HudTelemetrySnapshot {
   killMarkerActive: boolean;
   damageVignetteIntensity: number;
   smartTargetLocked: boolean;
+  activeChunkKey: string;
+  loadedChunkCount: number;
+  chunksDiscovered: number;
+  weatherMode: WeatherAtmosphereMode;
   activeEnvironmentEvent: {
     id: string;
     name: string;
@@ -129,6 +139,7 @@ interface ThreeArenaProps {
   mapId: MapId;
   battleMode: BattleModeId;
   botHardness: BotHardnessId;
+  weatherMode: WeatherAtmosphereMode;
   partyMembers: FriendProfile[];
   trainingLevel: number;
   callsign: string;
@@ -881,7 +892,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     wallPreviewMesh.visible = false;
     scene.add(wallPreviewMesh);
 
-    // 3D Dynamic Weather Particle InstancedMesh (42 atmospheric particles)
+    // 3D Dynamic Weather Particle InstancedMesh (42 atmospheric event particles)
     const WEATHER_CAP = 42;
     const weatherGeo = new THREE.OctahedronGeometry(0.14, 0);
     const weatherMat = new THREE.MeshBasicMaterial({
@@ -899,6 +910,55 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       offsetY: (i * 7) % 14,
       offsetZ: ((i * 23) % 36) - 18,
       fallSpeed: 3.2 + (i % 4) * 1.1,
+    }));
+
+    // Continuous 3D Light Rain Streaks & Ground Splash Rings (masks infinite chunk horizon)
+    const RAIN_STREAK_CAP = 140;
+    const rainStreakGeo = new THREE.BoxGeometry(0.022, 1.45, 0.022);
+    const rainStreakMat = new THREE.MeshBasicMaterial({
+      color: 0xcbd5e1,
+      transparent: true,
+      opacity: 0.44,
+      depthWrite: false,
+    });
+    const rainStreakInstanced = new THREE.InstancedMesh(
+      rainStreakGeo,
+      rainStreakMat,
+      RAIN_STREAK_CAP
+    );
+    rainStreakInstanced.frustumCulled = false;
+    scene.add(rainStreakInstanced);
+
+    const rainStreakPool = Array.from({ length: RAIN_STREAK_CAP }, (_, i) => ({
+      offsetX: ((i * 31) % 68) - 34,
+      offsetY: (i * 5.3) % 20,
+      offsetZ: ((i * 43) % 68) - 34,
+      fallSpeed: 13.5 + (i % 5) * 2.4,
+      slantX: 0.08 + (i % 3) * 0.02,
+    }));
+
+    const RAIN_SPLASH_CAP = 32;
+    const rainSplashGeo = new THREE.RingGeometry(0.06, 0.24, 12);
+    rainSplashGeo.rotateX(-Math.PI / 2);
+    const rainSplashMat = new THREE.MeshBasicMaterial({
+      color: 0xe2e8f0,
+      transparent: true,
+      opacity: 0.35,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const rainSplashInstanced = new THREE.InstancedMesh(
+      rainSplashGeo,
+      rainSplashMat,
+      RAIN_SPLASH_CAP
+    );
+    rainSplashInstanced.frustumCulled = false;
+    scene.add(rainSplashInstanced);
+
+    const rainSplashPool = Array.from({ length: RAIN_SPLASH_CAP }, (_, i) => ({
+      offsetX: ((i * 17) % 36) - 18,
+      offsetZ: ((i * 29) % 36) - 18,
+      phase: (i * 0.37) % 1.0,
     }));
 
     // 3D Local Player Avatar for Lobby Centerpiece Showcase & 3rd-Person Match Replay
@@ -1267,21 +1327,400 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       });
     }
 
-    // Build / Rebuild Expanded Biome Environment (320m x 320m terrain, 192m x 192m playable arena)
+    // Infinite Procedural Chunk Streaming State (64m x 64m chunks, 5x5 active grid = 25 chunks)
+    interface LoadedChunkEntry {
+      key: string;
+      cx: number;
+      cz: number;
+      group: THREE.Group;
+      terrainGeo: THREE.PlaneGeometry;
+      obstacles: ObstacleBox[];
+      crates: SalvageNode[];
+      spawnAgeSec: number;
+      isInitialChunk: boolean;
+    }
+
+    const loadedChunks = new Map<string, LoadedChunkEntry>();
+    const discoveredChunkKeys = new Set<string>(['0,0']);
+    let currentPlayerChunkKey = '0,0';
+    let sharedTerrainMat: THREE.MeshStandardMaterial | null = null;
+    let sharedStructMat: THREE.MeshStandardMaterial | null = null;
+    let sharedTrimMat: THREE.MeshStandardMaterial | null = null;
+    let sharedBeaconMat: THREE.MeshStandardMaterial | null = null;
+    let sharedTrunkMat: THREE.MeshStandardMaterial | null = null;
+    let sharedCanopyMat: THREE.MeshStandardMaterial | null = null;
+    let sharedCrownMat: THREE.MeshStandardMaterial | null = null;
+    const sharedTrunkGeo = new THREE.CylinderGeometry(0.35, 0.55, 3.2, 8);
+    const sharedCanopyGeo = new THREE.ConeGeometry(2.4, 4.6, 8);
+    const sharedCrownGeo = new THREE.ConeGeometry(1.7, 3.6, 8);
+    const sharedCrateBoxGeo = new THREE.BoxGeometry(1.1, 0.75, 0.85);
+    const sharedCrateLidGeo = new THREE.BoxGeometry(1.16, 0.14, 0.9);
+    const sharedCrateBoxMat = new THREE.MeshStandardMaterial({
+      color: 0x1e293b,
+      roughness: 0.4,
+      metalness: 0.7,
+    });
+    const sharedCrateLidMat = new THREE.MeshStandardMaterial({
+      color: 0xf59e0b,
+      emissive: 0xf59e0b,
+      emissiveIntensity: 0.8,
+      roughness: 0.3,
+    });
+
+    function buildSingleChunkRecord(
+      cx: number,
+      cz: number,
+      mapId: MapId,
+      isInitialChunk: boolean
+    ): LoadedChunkEntry {
+      const biome = BIOMES[mapId] || BIOMES['alpine-outpost'];
+      const bp: ProceduralChunkBlueprint = generateProceduralChunkBlueprint(cx, cz, mapId);
+      const chunkGroup = new THREE.Group();
+
+      // 1. Seamless 64m x 64m Sculpted Terrain Tile with world-space continuous heights
+      const tileGeo = new THREE.PlaneGeometry(WORLD_CHUNK_SIZE, WORLD_CHUNK_SIZE, 16, 16);
+      tileGeo.rotateX(-Math.PI / 2);
+      const posAttr = tileGeo.attributes.position;
+      for (let i = 0; i < posAttr.count; i++) {
+        const localX = posAttr.getX(i);
+        const localZ = posAttr.getZ(i);
+        const worldX = bp.centerX + localX;
+        const worldZ = bp.centerZ + localZ;
+        posAttr.setY(i, getTerrainHeight(worldX, worldZ, mapId));
+      }
+      tileGeo.computeVertexNormals();
+
+      const tileMesh = new THREE.Mesh(
+        tileGeo,
+        sharedTerrainMat || new THREE.MeshStandardMaterial({ color: 0x475569 })
+      );
+      tileMesh.position.set(bp.centerX, 0, bp.centerZ);
+      tileMesh.receiveShadow = true;
+      chunkGroup.add(tileMesh);
+
+      const chunkObstacles: ObstacleBox[] = [];
+
+      // 2. If Origin Chunk (0,0), include Iconic Central Landmark & Lobby Pedestal
+      if (cx === 0 && cz === 0 && sharedStructMat && sharedTrimMat && sharedBeaconMat) {
+        const basePad = new THREE.Mesh(new THREE.BoxGeometry(10, 0.8, 10), sharedTrimMat);
+        basePad.position.set(0, 0.4, -18);
+        basePad.receiveShadow = true;
+        chunkGroup.add(basePad);
+
+        const towerCore = new THREE.Mesh(
+          new THREE.BoxGeometry(4.6, 11.5, 4.6),
+          sharedStructMat
+        );
+        towerCore.position.set(0, 5.9, -18);
+        towerCore.castShadow = true;
+        towerCore.receiveShadow = true;
+        chunkGroup.add(towerCore);
+
+        const upperRing = new THREE.Mesh(
+          new THREE.CylinderGeometry(3.8, 2.9, 1.8, 16),
+          sharedTrimMat
+        );
+        upperRing.position.set(0, 12.2, -18);
+        chunkGroup.add(upperRing);
+
+        const domeCrown = new THREE.Mesh(
+          biome.landmarkType === 'cryo-monolith' || biome.landmarkType === 'obsidian-reactor'
+            ? new THREE.OctahedronGeometry(2.7, 1)
+            : new THREE.SphereGeometry(2.6, 18, 14),
+          sharedBeaconMat
+        );
+        domeCrown.position.set(0, 14.6, -18);
+        chunkGroup.add(domeCrown);
+
+        const pedY = getTerrainHeight(0, 16, mapId);
+        const pedDisc = new THREE.Mesh(
+          new THREE.CylinderGeometry(2.1, 2.4, 0.16, 24),
+          sharedTrimMat
+        );
+        pedDisc.position.set(0, pedY + 0.08, 16);
+        const pedRing = new THREE.Mesh(
+          new THREE.TorusGeometry(2.15, 0.05, 8, 32),
+          sharedBeaconMat
+        );
+        pedRing.rotation.x = Math.PI / 2;
+        pedRing.position.set(0, pedY + 0.16, 16);
+        chunkGroup.add(pedDisc, pedRing);
+
+        chunkObstacles.push({
+          id: 'landmark-core-0-0',
+          x: 0,
+          y: 0,
+          z: -18,
+          width: 5.0,
+          height: 12,
+          depth: 5.0,
+          climbable: true,
+          vaultable: false,
+        });
+      } else if (bp.hasOutpostSpire && sharedStructMat && sharedTrimMat && sharedBeaconMat) {
+        // Distant Sector Relay Spire on procedural outpost chunks
+        const spireY = getTerrainHeight(bp.centerX, bp.centerZ, mapId);
+        const spireGroup = new THREE.Group();
+        spireGroup.position.set(bp.centerX, spireY, bp.centerZ);
+        const pillar = new THREE.Mesh(
+          new THREE.CylinderGeometry(1.1, 1.6, 8.8, 10),
+          sharedStructMat
+        );
+        pillar.position.y = 4.4;
+        const beacon = new THREE.Mesh(new THREE.OctahedronGeometry(1.35, 0), sharedBeaconMat);
+        beacon.position.y = 9.6;
+        spireGroup.add(pillar, beacon);
+        chunkGroup.add(spireGroup);
+      }
+
+      // 3. Procedural Chunk Cover Bunkers & Climbable Sniper Towers
+      if (sharedStructMat && sharedTrimMat && sharedBeaconMat) {
+        for (const obs of bp.obstacles) {
+          const cg = new THREE.Group();
+          cg.position.set(obs.x, obs.y, obs.z);
+
+          const body = new THREE.Mesh(
+            new THREE.BoxGeometry(obs.width, obs.height, obs.depth),
+            obs.climbable ? sharedStructMat : sharedTrimMat
+          );
+          body.position.y = obs.height * 0.5;
+          body.castShadow = true;
+          body.receiveShadow = true;
+          cg.add(body);
+
+          const stripe = new THREE.Mesh(
+            new THREE.BoxGeometry(obs.width + 0.06, 0.1, obs.depth + 0.06),
+            sharedBeaconMat
+          );
+          stripe.position.y = obs.height - 0.12;
+          cg.add(stripe);
+
+          if (obs.climbable) {
+            for (let r = 0; r < 4; r++) {
+              const rung = new THREE.Mesh(
+                new THREE.BoxGeometry(0.75, 0.06, obs.depth + 0.14),
+                sharedBeaconMat
+              );
+              rung.position.y = 0.55 + r * 0.6;
+              cg.add(rung);
+            }
+          }
+
+          chunkGroup.add(cg);
+          chunkObstacles.push(obs);
+        }
+      }
+
+      // 4. Procedural Chunk Composite 3-Part Trees / Monoliths
+      if (bp.trees.length > 0 && sharedTrunkMat && sharedCanopyMat && sharedCrownMat) {
+        const tCount = bp.trees.length;
+        const trunkInst = new THREE.InstancedMesh(sharedTrunkGeo, sharedTrunkMat, tCount);
+        const canopyInst = new THREE.InstancedMesh(sharedCanopyGeo, sharedCanopyMat, tCount);
+        const crownInst = new THREE.InstancedMesh(sharedCrownGeo, sharedCrownMat, tCount);
+
+        bp.trees.forEach((tr, idx) => {
+          _dummyObj.position.set(tr.x, tr.y + 1.5 * tr.scale, tr.z);
+          _dummyObj.rotation.set(0, tr.rotY, 0);
+          _dummyObj.scale.set(tr.scale, tr.scale, tr.scale);
+          _dummyObj.updateMatrix();
+          trunkInst.setMatrixAt(idx, _dummyObj.matrix);
+
+          _dummyObj.position.set(tr.x, tr.y + 4.1 * tr.scale, tr.z);
+          _dummyObj.updateMatrix();
+          canopyInst.setMatrixAt(idx, _dummyObj.matrix);
+
+          _dummyObj.position.set(tr.x, tr.y + 6.1 * tr.scale, tr.z);
+          _dummyObj.updateMatrix();
+          crownInst.setMatrixAt(idx, _dummyObj.matrix);
+
+          _color.set(biome.terrainSecondaryHex).offsetHSL(0, 0, ((idx % 3) - 1) * 0.05);
+          canopyInst.setColorAt(idx, _color);
+          crownInst.setColorAt(idx, _color);
+        });
+
+        trunkInst.instanceMatrix.needsUpdate = true;
+        canopyInst.instanceMatrix.needsUpdate = true;
+        crownInst.instanceMatrix.needsUpdate = true;
+        if (canopyInst.instanceColor) canopyInst.instanceColor.needsUpdate = true;
+        if (crownInst.instanceColor) crownInst.instanceColor.needsUpdate = true;
+        trunkInst.computeBoundingSphere();
+        canopyInst.computeBoundingSphere();
+        crownInst.computeBoundingSphere();
+        chunkGroup.add(trunkInst, canopyInst, crownInst);
+      }
+
+      // 5. Procedural Chunk Salvage Crates
+      const chunkCrates: SalvageNode[] = bp.salvageCrates.map((c) => ({ ...c }));
+      for (const node of chunkCrates) {
+        const crateG = new THREE.Group();
+        crateG.position.set(node.x, node.y, node.z);
+        const box = new THREE.Mesh(sharedCrateBoxGeo, sharedCrateBoxMat);
+        box.position.y = 0.375;
+        const lid = new THREE.Mesh(sharedCrateLidGeo, sharedCrateLidMat);
+        lid.position.y = 0.78;
+        crateG.add(box, lid);
+        cratesGroup.add(crateG);
+        crateMeshMap.set(node.id, crateG);
+      }
+
+      // Newly streamed distant chunks smoothly rise into place inside the horizon rain mist
+      if (!isInitialChunk) {
+        chunkGroup.position.y = -1.6;
+      }
+      environmentGroup.add(chunkGroup);
+
+      return {
+        key: bp.key,
+        cx,
+        cz,
+        group: chunkGroup,
+        terrainGeo: tileGeo,
+        obstacles: chunkObstacles,
+        crates: chunkCrates,
+        spawnAgeSec: isInitialChunk ? 10 : 0,
+        isInitialChunk,
+      };
+    }
+
+    function spawnChunkPatrolNpcs(cx: number, cz: number) {
+      const p = propsRef.current;
+      const roster = computeTeamMatchRoster(p.battleMode, p.botHardness, currentWave);
+      const archetypes: NpcArchetype[] = ['rusher', 'marksman', 'flanker', 'juggernaut'];
+      const patrolCount = 2;
+      const originX = cx * WORLD_CHUNK_SIZE;
+      const originZ = cz * WORLD_CHUNK_SIZE;
+
+      for (let i = 0; i < patrolCount; i++) {
+        const arch = archetypes[Math.abs(cx + cz + i) % archetypes.length];
+        const nx = originX + (i === 0 ? -12 : 12);
+        const nz = originZ + (i === 0 ? -10 : 10);
+        const ny = getTerrainHeight(nx, nz, p.mapId);
+        const baseHp = arch === 'juggernaut' ? 185 : 105;
+        const maxHp = Math.round(baseHp * roster.hpMultiplier);
+        const maxShield = arch === 'juggernaut' ? 80 : 30;
+        const id = `npc-chunk-${cx}-${cz}-${i}-${Date.now()}`;
+        const callsign = `SECTOR-${Math.abs(cx)}${Math.abs(cz)}-${i + 1}`;
+        const npc: NpcEntity = {
+          id,
+          callsign,
+          archetype: arch,
+          x: nx,
+          y: ny,
+          z: nz,
+          vx: 0,
+          vz: 0,
+          rotY: 0,
+          hp: maxHp,
+          maxHp,
+          shield: maxShield,
+          maxShield,
+          state: 'seek',
+          windupTimer: 0.45,
+          attackCooldown: 1.35 * roster.fireCooldownMultiplier,
+          koTimer: 0,
+          hitFlashTimer: 0,
+          strafeSign: i % 2 === 0 ? 1 : -1,
+        };
+        npcs.push(npc);
+        const built = buildOperatorCharacterGroup(arch, contactShadowTex);
+        built.root.position.set(nx, ny, nz);
+        npcsGroup.add(built.root);
+        npcMeshMap.set(id, built);
+      }
+    }
+
+    function syncInfiniteChunks(
+      centerX: number,
+      centerZ: number,
+      mapId: MapId,
+      forceRebuild = false
+    ) {
+      const centerChunk = getChunkCoordFromWorld(centerX, centerZ);
+      const nextKey = `${centerChunk.cx},${centerChunk.cz}`;
+
+      if (!forceRebuild && nextKey === currentPlayerChunkKey && loadedChunks.size > 0) {
+        return;
+      }
+
+      const prevKey = currentPlayerChunkKey;
+      currentPlayerChunkKey = nextKey;
+
+      if (!discoveredChunkKeys.has(nextKey)) {
+        discoveredChunkKeys.add(nextKey);
+        if (propsRef.current.gameState === 'playing' && prevKey !== nextKey) {
+          spawnChunkPatrolNpcs(centerChunk.cx, centerChunk.cz);
+        }
+      }
+
+      const desiredCoords = getStreamingChunkCoords(centerX, centerZ, 2);
+      const desiredKeySet = new Set(desiredCoords.map((c) => c.key));
+
+      // Unload chunks outside the active streaming radius
+      for (const [key, entry] of loadedChunks.entries()) {
+        if (!desiredKeySet.has(key)) {
+          environmentGroup.remove(entry.group);
+          entry.terrainGeo.dispose();
+          for (const c of entry.crates) {
+            const cm = crateMeshMap.get(c.id);
+            if (cm) {
+              cratesGroup.remove(cm);
+              crateMeshMap.delete(c.id);
+            }
+          }
+          loadedChunks.delete(key);
+        }
+      }
+
+      // Stream in any missing chunks in the 5x5 grid around the player
+      for (const coord of desiredCoords) {
+        if (!loadedChunks.has(coord.key)) {
+          const entry = buildSingleChunkRecord(
+            coord.cx,
+            coord.cz,
+            mapId,
+            forceRebuild
+          );
+          loadedChunks.set(coord.key, entry);
+        }
+      }
+
+      // Rebuild active collision obstacles & salvage nodes from currently loaded chunks
+      const nextObstacles: ObstacleBox[] = [];
+      const nextCrates: SalvageNode[] = [];
+      for (const entry of loadedChunks.values()) {
+        nextObstacles.push(...entry.obstacles);
+        nextCrates.push(...entry.crates);
+      }
+      staticObstacles = nextObstacles;
+      salvageNodes = nextCrates;
+    }
+
+    // Build / Rebuild Infinite Chunked Biome Environment
     function buildBiomeScene(mapId: MapId) {
       const biome = BIOMES[mapId] || BIOMES['alpine-outpost'];
       scene.background = new THREE.Color(biome.skyHorizonHex);
-      scene.fog = new THREE.FogExp2(biome.fogHex, biome.fogDensity * 0.82);
+      // Calibrated exponential horizon fog that blends with Light Rain to mask chunk generation at ~128m
+      scene.fog = new THREE.FogExp2(biome.fogHex, Math.max(0.0135, biome.fogDensity * 1.18));
       sunLight.color.setHex(biome.sunHex);
       sunLight.intensity = biome.sunIntensity;
       hemiLight.color.setHex(biome.hemiSkyHex);
       hemiLight.groundColor.setHex(biome.hemiGroundHex);
 
-      // Clear previous biome meshes
+      // Clear previous biome chunks & crates
+      for (const entry of loadedChunks.values()) {
+        environmentGroup.remove(entry.group);
+        entry.terrainGeo.dispose();
+      }
+      loadedChunks.clear();
       while (environmentGroup.children.length > 0) {
         environmentGroup.remove(environmentGroup.children[0]);
       }
+      while (cratesGroup.children.length > 0) {
+        cratesGroup.remove(cratesGroup.children[0]);
+      }
+      crateMeshMap.clear();
       staticObstacles = [];
+      salvageNodes = [];
 
       const { albedoTex, bumpTex } = createProceduralSurfaceTextures(
         renderer,
@@ -1289,18 +1728,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         biome.terrainSecondaryHex
       );
 
-      // 1. Expanded Sculpted Outdoor Terrain Mesh (320m x 320m)
-      const terrainGeo = new THREE.PlaneGeometry(320, 320, 56, 56);
-      terrainGeo.rotateX(-Math.PI / 2);
-      const posAttr = terrainGeo.attributes.position;
-      for (let i = 0; i < posAttr.count; i++) {
-        const vx = posAttr.getX(i);
-        const vz = posAttr.getZ(i);
-        posAttr.setY(i, getTerrainHeight(vx, vz, mapId));
-      }
-      terrainGeo.computeVertexNormals();
-
-      const terrainMat = new THREE.MeshStandardMaterial({
+      sharedTerrainMat = new THREE.MeshStandardMaterial({
         color: 0xffffff,
         map: albedoTex,
         bumpMap: bumpTex,
@@ -1308,260 +1736,40 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         roughness: 0.84,
         metalness: 0.08,
       });
-      const terrainMesh = new THREE.Mesh(terrainGeo, terrainMat);
-      terrainMesh.receiveShadow = true;
-      environmentGroup.add(terrainMesh);
-
-      // 2. Central Landmark Structure (visible in initial spawn vista at z = -18)
-      const landmarkGroup = new THREE.Group();
-      const structMat = new THREE.MeshStandardMaterial({
+      sharedStructMat = new THREE.MeshStandardMaterial({
         color: 0x334155,
         roughness: 0.45,
         metalness: 0.65,
       });
-      const trimMat = new THREE.MeshStandardMaterial({
+      sharedTrimMat = new THREE.MeshStandardMaterial({
         color: 0x0f172a,
         roughness: 0.7,
         metalness: 0.3,
       });
-      const beaconMat = new THREE.MeshStandardMaterial({
+      sharedBeaconMat = new THREE.MeshStandardMaterial({
         color: biome.accentHex,
         emissive: biome.accentHex,
         emissiveIntensity: 1.6,
         roughness: 0.2,
       });
-
-      // Base foundation platform
-      const basePad = new THREE.Mesh(new THREE.BoxGeometry(10, 0.8, 10), trimMat);
-      basePad.position.set(0, 0.4, -18);
-      basePad.receiveShadow = true;
-      landmarkGroup.add(basePad);
-
-      // Central Spire / Tower Core
-      const towerCore = new THREE.Mesh(new THREE.BoxGeometry(4.6, 11.5, 4.6), structMat);
-      towerCore.position.set(0, 5.9, -18);
-      towerCore.castShadow = true;
-      towerCore.receiveShadow = true;
-      landmarkGroup.add(towerCore);
-
-      // Upper Observation Ring & Radome / Reactor Crown
-      const upperRing = new THREE.Mesh(
-        new THREE.CylinderGeometry(3.8, 2.9, 1.8, 16),
-        trimMat
-      );
-      upperRing.position.set(0, 12.2, -18);
-      landmarkGroup.add(upperRing);
-
-      const domeCrown = new THREE.Mesh(
-        biome.landmarkType === 'cryo-monolith' || biome.landmarkType === 'obsidian-reactor'
-          ? new THREE.OctahedronGeometry(2.7, 1)
-          : new THREE.SphereGeometry(2.6, 18, 14),
-        beaconMat
-      );
-      domeCrown.position.set(0, 14.6, -18);
-      landmarkGroup.add(domeCrown);
-
-      // Lobby Tactical Pedestal Disc at (0, groundY, 16)
-      const pedY = getTerrainHeight(0, 16, mapId);
-      const pedDisc = new THREE.Mesh(
-        new THREE.CylinderGeometry(2.1, 2.4, 0.16, 24),
-        trimMat
-      );
-      pedDisc.position.set(0, pedY + 0.08, 16);
-      const pedRing = new THREE.Mesh(
-        new THREE.TorusGeometry(2.15, 0.05, 8, 32),
-        beaconMat
-      );
-      pedRing.rotation.x = Math.PI / 2;
-      pedRing.position.set(0, pedY + 0.16, 16);
-      landmarkGroup.add(pedDisc, pedRing);
-
-      environmentGroup.add(landmarkGroup);
-      staticObstacles.push({
-        id: 'landmark-core',
-        x: 0,
-        y: 0,
-        z: -18,
-        width: 5.0,
-        height: 12,
-        depth: 5.0,
-        climbable: true,
-        vaultable: false,
-      });
-
-      // 3. Expanded Tactical Cover Clusters across 192m x 192m Arena
-      const coverConfigs = [
-        // Front spawn cover (offset left & right so spawn centerline has a clear vista)
-        { x: -6.5, z: 9, w: 3.8, h: 1.35, d: 0.8, climb: false, vault: true },
-        { x: 6.5, z: 9, w: 3.8, h: 1.35, d: 0.8, climb: false, vault: true },
-        // Midfield vaultable bunkers
-        { x: -11, z: -2, w: 4.2, h: 1.4, d: 1.1, climb: false, vault: true },
-        { x: 11, z: -2, w: 4.2, h: 1.4, d: 1.1, climb: false, vault: true },
-        { x: 0, z: 1.5, w: 4.5, h: 1.35, d: 0.9, climb: false, vault: true },
-        // Climbable tactical sniper platforms with ladder rungs
-        { x: -14, z: -12, w: 4.4, h: 2.9, d: 4.4, climb: true, vault: false },
-        { x: 14, z: -12, w: 4.4, h: 2.9, d: 4.4, climb: true, vault: false },
-        { x: -9, z: -26, w: 4.0, h: 2.8, d: 4.0, climb: true, vault: false },
-        { x: 9, z: -26, w: 4.0, h: 2.8, d: 4.0, climb: true, vault: false },
-        // Outer Perimeter Flanking Bunkers & Watchtowers (Expanded 192m x 192m Sector)
-        { x: -28, z: 6, w: 5.2, h: 3.1, d: 5.2, climb: true, vault: false },
-        { x: 28, z: 6, w: 5.2, h: 3.1, d: 5.2, climb: true, vault: false },
-        { x: -32, z: -24, w: 4.8, h: 1.4, d: 1.2, climb: false, vault: true },
-        { x: 32, z: -24, w: 4.8, h: 1.4, d: 1.2, climb: false, vault: true },
-        { x: -22, z: -44, w: 5.0, h: 3.2, d: 5.0, climb: true, vault: false },
-        { x: 22, z: -44, w: 5.0, h: 3.2, d: 5.0, climb: true, vault: false },
-        { x: 0, z: -48, w: 6.2, h: 1.4, d: 1.2, climb: false, vault: true },
-        { x: -18, z: 34, w: 4.6, h: 1.4, d: 1.1, climb: false, vault: true },
-        { x: 18, z: 34, w: 4.6, h: 1.4, d: 1.1, climb: false, vault: true },
-      ];
-
-      coverConfigs.forEach((cfg, idx) => {
-        const cg = new THREE.Group();
-        const groundY = getTerrainHeight(cfg.x, cfg.z, mapId);
-        cg.position.set(cfg.x, groundY, cfg.z);
-
-        const body = new THREE.Mesh(
-          new THREE.BoxGeometry(cfg.w, cfg.h, cfg.d),
-          cfg.climb ? structMat : trimMat
-        );
-        body.position.y = cfg.h * 0.5;
-        body.castShadow = true;
-        body.receiveShadow = true;
-        cg.add(body);
-
-        const stripe = new THREE.Mesh(
-          new THREE.BoxGeometry(cfg.w + 0.06, 0.1, cfg.d + 0.06),
-          beaconMat
-        );
-        stripe.position.y = cfg.h - 0.12;
-        cg.add(stripe);
-
-        if (cfg.climb) {
-          for (let r = 0; r < 4; r++) {
-            const rung = new THREE.Mesh(
-              new THREE.BoxGeometry(0.75, 0.06, cfg.d + 0.14),
-              beaconMat
-            );
-            rung.position.y = 0.55 + r * 0.6;
-            cg.add(rung);
-          }
-        }
-
-        environmentGroup.add(cg);
-        staticObstacles.push({
-          id: `static-cover-${idx}`,
-          x: cfg.x,
-          y: groundY,
-          z: cfg.z,
-          width: cfg.w,
-          height: cfg.h,
-          depth: cfg.d,
-          climbable: cfg.climb,
-          vaultable: cfg.vault,
-        });
-      });
-
-      // 4. Expanded Natural Perimeter Barriers using InstancedMesh (72 composite 3-part trees/monoliths)
-      const instanceCount = 72;
-      const trunkGeo = new THREE.CylinderGeometry(0.35, 0.55, 3.2, 8);
-      const canopyGeo = new THREE.ConeGeometry(2.4, 4.6, 8);
-      const upperCrownGeo = new THREE.ConeGeometry(1.7, 3.6, 8);
-      const trunkMat = new THREE.MeshStandardMaterial({
+      sharedTrunkMat = new THREE.MeshStandardMaterial({
         color: 0x3f2e21,
         roughness: 0.9,
       });
-      const canopyMat = new THREE.MeshStandardMaterial({
+      sharedCanopyMat = new THREE.MeshStandardMaterial({
         color: biome.terrainSecondaryHex,
         roughness: 0.68,
         metalness: 0.12,
       });
-      const crownMat = new THREE.MeshStandardMaterial({
+      sharedCrownMat = new THREE.MeshStandardMaterial({
         color: biome.terrainPrimaryHex,
         roughness: 0.42,
         metalness: 0.22,
       });
 
-      const trunkInstanced = new THREE.InstancedMesh(trunkGeo, trunkMat, instanceCount);
-      const canopyInstanced = new THREE.InstancedMesh(canopyGeo, canopyMat, instanceCount);
-      const crownInstanced = new THREE.InstancedMesh(upperCrownGeo, crownMat, instanceCount);
-
-      for (let i = 0; i < instanceCount; i++) {
-        const angle = (i / instanceCount) * Math.PI * 2;
-        const radius = 62 + (i % 4) * 9.5;
-        const px = Math.cos(angle) * radius;
-        const pz = Math.sin(angle) * radius;
-        const py = getTerrainHeight(px, pz, mapId);
-        const scale = 0.9 + (i % 5) * 0.11;
-
-        _dummyObj.position.set(px, py + 1.5 * scale, pz);
-        _dummyObj.rotation.set(0, angle, 0);
-        _dummyObj.scale.set(scale, scale, scale);
-        _dummyObj.updateMatrix();
-        trunkInstanced.setMatrixAt(i, _dummyObj.matrix);
-
-        _dummyObj.position.set(px, py + 4.1 * scale, pz);
-        _dummyObj.updateMatrix();
-        canopyInstanced.setMatrixAt(i, _dummyObj.matrix);
-
-        _dummyObj.position.set(px, py + 6.1 * scale, pz);
-        _dummyObj.updateMatrix();
-        crownInstanced.setMatrixAt(i, _dummyObj.matrix);
-
-        _color.set(biome.terrainSecondaryHex).offsetHSL(0, 0, ((i % 3) - 1) * 0.05);
-        canopyInstanced.setColorAt(i, _color);
-        crownInstanced.setColorAt(i, _color);
-      }
-      trunkInstanced.instanceMatrix.needsUpdate = true;
-      canopyInstanced.instanceMatrix.needsUpdate = true;
-      crownInstanced.instanceMatrix.needsUpdate = true;
-      if (canopyInstanced.instanceColor) canopyInstanced.instanceColor.needsUpdate = true;
-      if (crownInstanced.instanceColor) crownInstanced.instanceColor.needsUpdate = true;
-      trunkInstanced.computeBoundingSphere();
-      canopyInstanced.computeBoundingSphere();
-      crownInstanced.computeBoundingSphere();
-      environmentGroup.add(trunkInstanced, canopyInstanced, crownInstanced);
-
-      // 5. Salvage Supply Crates for Wall Construction across the Expanded Map
-      while (cratesGroup.children.length > 0) {
-        cratesGroup.remove(cratesGroup.children[0]);
-      }
-      crateMeshMap.clear();
-      salvageNodes = [
-        { id: 'crate-1', label: 'Alloy Salvage Cache', x: -5, y: 0, z: 12, amount: 35, cooldown: 0 },
-        { id: 'crate-2', label: 'Bio-Polymer Crate', x: 5, y: 0, z: 12, amount: 35, cooldown: 0 },
-        { id: 'crate-3', label: 'Heavy Fortification Supply', x: -10, y: 0, z: -6, amount: 45, cooldown: 0 },
-        { id: 'crate-4', label: 'Core Reactor Salvage', x: 10, y: 0, z: -6, amount: 45, cooldown: 0 },
-        { id: 'crate-5', label: 'Forward Outpost Cache', x: 0, y: 0, z: -9, amount: 50, cooldown: 0 },
-        { id: 'crate-6', label: 'West Wing Supply Drop', x: -24, y: 0, z: -12, amount: 55, cooldown: 0 },
-        { id: 'crate-7', label: 'East Wing Supply Drop', x: 24, y: 0, z: -12, amount: 55, cooldown: 0 },
-        { id: 'crate-8', label: 'Deep Sector Cache', x: 0, y: 0, z: -34, amount: 65, cooldown: 0 },
-      ];
-
-      salvageNodes.forEach((node) => {
-        node.y = getTerrainHeight(node.x, node.z, mapId);
-        const crateG = new THREE.Group();
-        crateG.position.set(node.x, node.y, node.z);
-
-        const box = new THREE.Mesh(
-          new THREE.BoxGeometry(1.1, 0.75, 0.85),
-          new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.4, metalness: 0.7 })
-        );
-        box.position.y = 0.375;
-        const lid = new THREE.Mesh(
-          new THREE.BoxGeometry(1.16, 0.14, 0.9),
-          new THREE.MeshStandardMaterial({
-            color: 0xf59e0b,
-            emissive: 0xf59e0b,
-            emissiveIntensity: 0.8,
-            roughness: 0.3,
-          })
-        );
-        lid.position.y = 0.78;
-        crateG.add(box, lid);
-        cratesGroup.add(crateG);
-        crateMeshMap.set(node.id, crateG);
-      });
-
+      discoveredChunkKeys.clear();
+      discoveredChunkKeys.add('0,0');
+      syncInfiniteChunks(playerState.x, playerState.z, mapId, true);
       syncLobbyAvatars();
     }
 
@@ -1597,7 +1805,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       p2WeaponRigGroup.add(vm2);
     }
 
-    // Spawn AI Wave + Friendly Squadmates based on Battle Mode (1v1..4v4, Co-Op, Practice) & Bot Hardness
+    // Spawn AI Wave + Real Party Squadmates based on Battle Mode & Bot Hardness
     function spawnWaveNpcs(waveNum: number) {
       while (npcsGroup.children.length > 0) {
         npcsGroup.remove(npcsGroup.children[0]);
@@ -1624,8 +1832,8 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
 
         const angle = ((i / Math.max(1, roster.enemyCount)) - 0.5) * Math.PI * 0.92;
         const dist = 26 + (i % 3) * 11;
-        const nx = Math.sin(angle) * dist;
-        const nz = -Math.cos(angle) * dist - 8;
+        const nx = playerState.x + Math.sin(angle) * dist;
+        const nz = playerState.z - Math.cos(angle) * dist - 8;
         const ny = getTerrainHeight(nx, nz, p.mapId);
 
         const baseHp = arch === 'juggernaut' ? 190 : arch === 'rusher' ? 95 : 110;
@@ -1663,15 +1871,16 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         npcMeshMap.set(id, built);
       }
 
-      // Spawn Friendly Squad AI / Party Allies for 2v2, 3v3, 4v4
-      const fallbackAllies = ['VANGUARD_A1', 'KESTREL_A2', 'NOVA_A3'];
-      for (let a = 0; a < roster.allyCount; a++) {
-        const partyFriend = p.partyMembers[a];
-        const allyCallsign = partyFriend ? partyFriend.username : fallbackAllies[a % fallbackAllies.length];
-        const allySkinId: SkinId = partyFriend ? partyFriend.skinId : 'alpine-ghost';
+      // Only spawn real party friends added by the player (zero fake bot friends)
+      const realPartyAllies = p.partyMembers.slice(0, Math.max(1, roster.allyCount));
+      for (let a = 0; a < realPartyAllies.length; a++) {
+        const partyFriend = realPartyAllies[a];
+        if (!partyFriend) continue;
+        const allyCallsign = partyFriend.username;
+        const allySkinId: SkinId = partyFriend.skinId || 'alpine-ghost';
         const skinDef = OPERATOR_SKINS[allySkinId] || OPERATOR_SKINS['alpine-ghost'];
-        const ax = (a % 2 === 0 ? -1 : 1) * (4.5 + a * 2.5);
-        const az = 16 - a * 2;
+        const ax = playerState.x + (a % 2 === 0 ? -1 : 1) * (4.5 + a * 2.5);
+        const az = playerState.z - 4 - a * 2;
         const ay = getTerrainHeight(ax, az, p.mapId);
         const allyId = `ally-w${waveNum}-${a}`;
 
@@ -2143,8 +2352,41 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           } else {
             soundEngine.playHitMarker(false);
           }
+        } else {
+          // Also check raycast hit against real remote online players in the shared sector
+          for (const rop of p.remoteOperators) {
+            if (rop.mapId !== p.mapId || rop.hp <= 0) continue;
+            _vec3A.set(rop.x, rop.y + 1.15, rop.z);
+            const rayDistSq = shootRaycaster.ray.distanceSqToPoint(_vec3A);
+            const distToRop = camera.position.distanceTo(_vec3A);
+            if (rayDistSq < 0.62 && distToRop < stats.range) {
+              _vec3B.subVectors(_vec3A, camera.position).normalize();
+              if (_vec3B.dot(shootRaycaster.ray.direction) > 0.7) {
+                const dmg = Math.round(stats.damage * eventDmgMult);
+                hitMarkerTimer = 0.14;
+                soundEngine.playHitMarker(false);
+                spawnParticles(rop.x, rop.y + 1.25, rop.z, 6, 0x38bdf8, 5);
+                p.onSendMultiplayerUpdate({
+                  type: 'player:hit',
+                  targetId: rop.id,
+                  damage: dmg,
+                  attackerCallsign: p.callsign,
+                });
+                break;
+              }
+            }
+          }
         }
       }
+
+      p.onSendMultiplayerUpdate({
+        type: 'player:fire',
+        id: p.callsign,
+        callsign: p.callsign,
+        originX: Number(camera.position.x.toFixed(2)),
+        originY: Number(camera.position.y.toFixed(2)),
+        originZ: Number(camera.position.z.toFixed(2)),
+      });
     }
 
     // Software-WebGL Paced Loop Helper
@@ -2629,11 +2871,18 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
             }
           }
 
-          // Smoothly blend biome fog & sunlight with active Dynamic Environment Event
+          // Smoothly blend biome fog & sunlight with active Weather Mode & Dynamic Environment Event
           if (scene.fog instanceof THREE.FogExp2) {
+            const weatherFogMult =
+              p.weatherMode === 'storm-squall'
+                ? 1.58
+                : p.weatherMode === 'mist-veil'
+                  ? 1.42
+                  : 1.24;
+            const baseFog = Math.max(0.014, biome.fogDensity * weatherFogMult);
             const targetFogDensity = activeEnvEvent
-              ? biome.fogDensity * activeEnvEvent.fogDensityMult
-              : biome.fogDensity * 0.82;
+              ? baseFog * activeEnvEvent.fogDensityMult
+              : baseFog;
             scene.fog.density = THREE.MathUtils.damp(
               scene.fog.density,
               targetFogDensity,
@@ -2645,7 +2894,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           }
           const targetSunInt = activeEnvEvent
             ? biome.sunIntensity * activeEnvEvent.sunIntensityMult
-            : biome.sunIntensity;
+            : biome.sunIntensity * (p.weatherMode === 'storm-squall' ? 0.78 : 0.92);
           sunLight.intensity = THREE.MathUtils.damp(
             sunLight.intensity,
             targetSunInt,
@@ -2783,6 +3032,9 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
             allObstacles,
             p.mapId
           );
+
+          // Dynamically stream infinite 64m x 64m chunks around the player's current world position
+          syncInfiniteChunks(playerState.x, playerState.z, p.mapId, false);
 
           if (playerState.movementMode !== prevMode) {
             if (playerState.movementMode === 'SLIDE') soundEngine.playMovementAction('slide');
@@ -3247,6 +3499,75 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         );
       }
 
+      // Smoothly settle newly streamed distant chunks inside the horizon rain mist
+      for (const entry of loadedChunks.values()) {
+        if (!entry.isInitialChunk && entry.spawnAgeSec < 0.45) {
+          entry.spawnAgeSec += dt;
+          const progress = Math.min(1, entry.spawnAgeSec / 0.45);
+          const easeOut = 1 - Math.pow(1 - progress, 3);
+          entry.group.position.y = -1.6 * (1 - easeOut);
+        } else if (entry.group.position.y !== 0) {
+          entry.group.position.y = 0;
+        }
+      }
+
+      // Step Continuous 3D Light Rain Streaks & Ground Splash Rings around Camera
+      const rainSpeedMult =
+        p.weatherMode === 'storm-squall'
+          ? 1.45
+          : p.weatherMode === 'mist-veil'
+            ? 0.65
+            : 1.0;
+      const rainLengthMult =
+        p.weatherMode === 'storm-squall'
+          ? 1.35
+          : p.weatherMode === 'mist-veil'
+            ? 0.55
+            : 1.0;
+      rainStreakMat.opacity =
+        p.weatherMode === 'storm-squall'
+          ? 0.56
+          : p.weatherMode === 'mist-veil'
+            ? 0.28
+            : 0.44;
+
+      const camX = camera.position.x;
+      const camY = camera.position.y;
+      const camZ = camera.position.z;
+
+      for (let rIdx = 0; rIdx < RAIN_STREAK_CAP; rIdx++) {
+        const rp = rainStreakPool[rIdx];
+        const fallDist = (elapsed * rp.fallSpeed * rainSpeedMult + rp.offsetY) % 20;
+        const ry = camY + 11 - fallDist;
+        const rx =
+          camX +
+          rp.offsetX +
+          Math.sin(elapsed * 0.9 + rIdx * 0.4) * 0.9 -
+          fallDist * rp.slantX;
+        const rz = camZ + rp.offsetZ + Math.cos(elapsed * 0.8 + rIdx * 0.3) * 0.9;
+        _dummyObj.position.set(rx, ry, rz);
+        _dummyObj.rotation.set(0.05, 0, rp.slantX);
+        _dummyObj.scale.set(1, rainLengthMult, 1);
+        _dummyObj.updateMatrix();
+        rainStreakInstanced.setMatrixAt(rIdx, _dummyObj.matrix);
+      }
+      rainStreakInstanced.instanceMatrix.needsUpdate = true;
+
+      for (let sIdx = 0; sIdx < RAIN_SPLASH_CAP; sIdx++) {
+        const sp = rainSplashPool[sIdx];
+        const cycle = (elapsed * 2.2 * rainSpeedMult + sp.phase) % 1.0;
+        const sx = camX + sp.offsetX;
+        const sz = camZ + sp.offsetZ;
+        const sy = getTerrainHeight(sx, sz, p.mapId) + 0.03;
+        const ringScale = 0.25 + cycle * 1.45;
+        _dummyObj.position.set(sx, sy, sz);
+        _dummyObj.rotation.set(0, 0, 0);
+        _dummyObj.scale.set(ringScale, ringScale, ringScale);
+        _dummyObj.updateMatrix();
+        rainSplashInstanced.setMatrixAt(sIdx, _dummyObj.matrix);
+      }
+      rainSplashInstanced.instanceMatrix.needsUpdate = true;
+
       // Update Pooled InstancedMesh Particles
       for (let i = 0; i < PARTICLE_CAP; i++) {
         const pt = particlePool[i];
@@ -3463,6 +3784,10 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           killMarkerActive: killMarkerTimer > 0,
           damageVignetteIntensity: damageVignette,
           smartTargetLocked,
+          activeChunkKey: currentPlayerChunkKey,
+          loadedChunkCount: loadedChunks.size,
+          chunksDiscovered: discoveredChunkKeys.size,
+          weatherMode: p.weatherMode,
           activeEnvironmentEvent: activeEnvEvent
             ? {
                 id: activeEnvEvent.id,

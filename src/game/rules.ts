@@ -27,6 +27,8 @@ import {
   BOT_HARDNESS_TIERS,
   BattleModeId,
   BotHardnessId,
+  ProceduralChunkBlueprint,
+  SalvageNode,
 } from './types';
 
 export function computeWeaponStats(
@@ -97,8 +99,9 @@ export function computeWeaponStats(
 }
 
 /**
- * Deterministic terrain height function keeping the central tactical arena flat enough for crisp cover/wall building
- * while sculpting natural rolling hills and perimeter ridges beyond 26m radius.
+ * Continuous deterministic terrain height function across infinite (x, z) coordinates.
+ * Keeps the central spawn/pedestal area around (0, 0) level while sculpting seamless
+ * rolling hills, valleys, and ridges across all streamed world chunks.
  */
 export function getTerrainHeight(x: number, z: number, mapId: MapId): number {
   const biome = BIOMES[mapId] || BIOMES['alpine-outpost'];
@@ -106,12 +109,12 @@ export function getTerrainHeight(x: number, z: number, mapId: MapId): number {
   if (dist < 22) {
     return 0;
   }
-  const blend = Math.min(1, (dist - 22) / 38);
+  const blend = Math.min(1, (dist - 22) / 34);
   const wave =
-    Math.sin(x * 0.075) * Math.cos(z * 0.075) * 1.4 +
-    Math.sin((x + z) * 0.04) * 0.9;
-  const ridgeBoost = dist > 58 ? Math.min(9, (dist - 58) * 0.38) : 0;
-  return Math.max(0, wave * biome.elevationScale * blend + ridgeBoost);
+    Math.sin(x * 0.055) * Math.cos(z * 0.055) * 1.45 +
+    Math.sin((x + z) * 0.028) * 0.95 +
+    Math.cos(x * 0.018 - z * 0.022) * 0.75;
+  return Math.max(0, (wave + 1.4) * 0.55 * biome.elevationScale * blend);
 }
 
 export interface MovementInput {
@@ -287,18 +290,10 @@ export function evaluateMovementPhysics(
     next.vy -= 21.0 * dt;
   }
 
-  // Candidate position
+  // Candidate position (unbounded for infinite chunked world exploration)
   let candX = next.x + next.vx * dt;
   let candZ = next.z + next.vz * dt;
   let candY = next.y + next.vy * dt;
-
-  // Keep within 68m playable arena radius
-  const radialDist = Math.hypot(candX, candZ);
-  if (radialDist > 66) {
-    const scale = 66 / radialDist;
-    candX *= scale;
-    candZ *= scale;
-  }
 
   // Resolve horizontal & top-surface collisions with obstacles
   let supportY = getTerrainHeight(candX, candZ, mapId);
@@ -978,5 +973,299 @@ export function computeTeamMatchRoster(
   };
 }
 
+const FRIEND_CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
+/**
+ * Generates a unique 6-character Friend Code in the format `VX-XXXXXX`.
+ * Deterministic when a seed string is provided, or random otherwise.
+ */
+export function generatePlayerFriendCode(seed?: string): string {
+  if (seed && seed.trim().length > 0) {
+    let h = 2166136261 >>> 0;
+    const str = seed.trim();
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+    let code = '';
+    for (let i = 0; i < 6; i++) {
+      h ^= (i + 1) * 0x9e3779b9;
+      h = Math.imul(h, 2246822519) >>> 0;
+      code += FRIEND_CODE_ALPHABET[h % FRIEND_CODE_ALPHABET.length];
+    }
+    return `VX-${code}`;
+  }
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    const idx = Math.floor(Math.random() * FRIEND_CODE_ALPHABET.length);
+    code += FRIEND_CODE_ALPHABET[idx];
+  }
+  return `VX-${code}`;
+}
 
+/**
+ * Normalizes user-entered friend code input (e.g., "vx-7k9m2p" or "7k9m2p" -> "VX-7K9M2P").
+ */
+export function normalizeFriendCode(raw: string): string {
+  const cleaned = String(raw || '')
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, '');
+  if (!cleaned) return '';
+  if (cleaned.startsWith('VX-')) {
+    return cleaned.slice(0, 12);
+  }
+  if (/^[A-Z0-9]{4,8}$/.test(cleaned)) {
+    return `VX-${cleaned}`;
+  }
+  return cleaned.slice(0, 16);
+}
+
+export function isValidFriendCodeFormat(code: string): boolean {
+  const norm = normalizeFriendCode(code);
+  return /^VX-[A-Z0-9]{4,8}$/.test(norm);
+}
+
+/**
+ * Infinite World Chunk Size in meters (64m × 64m per chunk).
+ */
+export const WORLD_CHUNK_SIZE = 64;
+
+export function getChunkCoordFromWorld(
+  x: number,
+  z: number,
+  chunkSize = WORLD_CHUNK_SIZE
+): { cx: number; cz: number; key: string } {
+  const cx = Math.floor((x + chunkSize * 0.5) / chunkSize);
+  const cz = Math.floor((z + chunkSize * 0.5) / chunkSize);
+  return { cx, cz, key: `${cx},${cz}` };
+}
+
+export function getStreamingChunkCoords(
+  playerX: number,
+  playerZ: number,
+  radiusChunks = 2
+): Array<{ cx: number; cz: number; key: string; distChunks: number }> {
+  const center = getChunkCoordFromWorld(playerX, playerZ);
+  const list: Array<{ cx: number; cz: number; key: string; distChunks: number }> = [];
+  for (let dx = -radiusChunks; dx <= radiusChunks; dx++) {
+    for (let dz = -radiusChunks; dz <= radiusChunks; dz++) {
+      const cx = center.cx + dx;
+      const cz = center.cz + dz;
+      const distChunks = Math.hypot(dx, dz);
+      list.push({ cx, cz, key: `${cx},${cz}`, distChunks });
+    }
+  }
+  list.sort((a, b) => a.distChunks - b.distChunks);
+  return list;
+}
+
+/**
+ * Deterministic PRNG helper for chunk generation
+ */
+function createChunkRng(cx: number, cz: number, mapId: MapId) {
+  let state = ((cx * 73856093) ^ (cz * 19349663) ^ mapId.charCodeAt(0) * 83492791) >>> 0;
+  if (state === 0) state = 0x6d2b79f5;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Deterministically generates terrain props, tactical cover obstacles, foliage trees,
+ * salvage crates, and outpost spires for any chunk (cx, cz) in the infinite world.
+ */
+export function generateProceduralChunkBlueprint(
+  cx: number,
+  cz: number,
+  mapId: MapId
+): ProceduralChunkBlueprint {
+  const key = `${cx},${cz}`;
+  const centerX = cx * WORLD_CHUNK_SIZE;
+  const centerZ = cz * WORLD_CHUNK_SIZE;
+  const rng = createChunkRng(cx, cz, mapId);
+
+  const obstacles: ObstacleBox[] = [];
+  const trees: ProceduralChunkBlueprint['trees'] = [];
+  const salvageCrates: SalvageNode[] = [];
+
+  if (cx === 0 && cz === 0) {
+    // Origin Chunk (0, 0): Central Spawn Vista, Landmark Spire at (0, -18), and balanced tactical cover
+    obstacles.push({
+      id: 'chunk-0,0-landmark-core',
+      x: 0,
+      y: 0,
+      z: -18,
+      width: 5.0,
+      height: 12,
+      depth: 5.0,
+      climbable: true,
+      vaultable: false,
+    });
+
+    const originCover = [
+      { x: -6.5, z: 9, w: 3.8, h: 1.35, d: 0.8, climb: false, vault: true },
+      { x: 6.5, z: 9, w: 3.8, h: 1.35, d: 0.8, climb: false, vault: true },
+      { x: -11, z: -2, w: 4.2, h: 1.4, d: 1.1, climb: false, vault: true },
+      { x: 11, z: -2, w: 4.2, h: 1.4, d: 1.1, climb: false, vault: true },
+      { x: 0, z: 1.5, w: 4.5, h: 1.35, d: 0.9, climb: false, vault: true },
+      { x: -14, z: -12, w: 4.4, h: 2.9, d: 4.4, climb: true, vault: false },
+      { x: 14, z: -12, w: 4.4, h: 2.9, d: 4.4, climb: true, vault: false },
+      { x: -9, z: -26, w: 4.0, h: 2.8, d: 4.0, climb: true, vault: false },
+      { x: 9, z: -26, w: 4.0, h: 2.8, d: 4.0, climb: true, vault: false },
+    ];
+    originCover.forEach((cfg, idx) => {
+      const gy = getTerrainHeight(cfg.x, cfg.z, mapId);
+      obstacles.push({
+        id: `chunk-0,0-cover-${idx}`,
+        x: cfg.x,
+        y: gy,
+        z: cfg.z,
+        width: cfg.w,
+        height: cfg.h,
+        depth: cfg.d,
+        climbable: cfg.climb,
+        vaultable: cfg.vault,
+      });
+    });
+
+    const originCrates = [
+      { id: 'crate-0,0-1', label: 'Alloy Salvage Cache', x: -5, z: 12, amount: 35 },
+      { id: 'crate-0,0-2', label: 'Bio-Polymer Crate', x: 5, z: 12, amount: 35 },
+      { id: 'crate-0,0-3', label: 'Heavy Fortification Supply', x: -10, z: -6, amount: 45 },
+      { id: 'crate-0,0-4', label: 'Core Reactor Salvage', x: 10, z: -6, amount: 45 },
+    ];
+    originCrates.forEach((c) => {
+      salvageCrates.push({
+        id: c.id,
+        label: c.label,
+        x: c.x,
+        y: getTerrainHeight(c.x, c.z, mapId),
+        z: c.z,
+        amount: c.amount,
+        cooldown: 0,
+      });
+    });
+
+    // Perimeter trees in origin chunk (outside central 22m radius)
+    for (let i = 0; i < 8; i++) {
+      const angle = (i / 8) * Math.PI * 2 + 0.35;
+      const r = 25 + (i % 3) * 2.2;
+      const tx = Math.cos(angle) * r;
+      const tz = Math.sin(angle) * r;
+      if (Math.hypot(tx, tz - 18) < 7) continue;
+      trees.push({
+        x: tx,
+        y: getTerrainHeight(tx, tz, mapId),
+        z: tz,
+        scale: 0.92 + (i % 4) * 0.1,
+        rotY: angle,
+        tintOffset: ((i % 3) - 1) * 0.05,
+      });
+    }
+
+    return {
+      cx,
+      cz,
+      key,
+      centerX,
+      centerZ,
+      obstacles,
+      trees,
+      salvageCrates,
+      hasOutpostSpire: true,
+      spirePos: { x: 0, y: getTerrainHeight(0, -18, mapId), z: -18 },
+    };
+  }
+
+  // Non-origin procedural chunks: generate tactical structures, trees, crates, and periodic outpost spires
+  const hasOutpostSpire = Math.abs(cx * 3 + cz * 5) % 3 === 0;
+  let spirePos: { x: number; y: number; z: number } | null = null;
+  if (hasOutpostSpire) {
+    const sx = centerX + (rng() - 0.5) * 14;
+    const sz = centerZ + (rng() - 0.5) * 14;
+    const sy = getTerrainHeight(sx, sz, mapId);
+    spirePos = { x: Number(sx.toFixed(2)), y: Number(sy.toFixed(2)), z: Number(sz.toFixed(2)) };
+    obstacles.push({
+      id: `chunk-${key}-spire`,
+      x: spirePos.x,
+      y: spirePos.y,
+      z: spirePos.z,
+      width: 4.6,
+      height: 10.5,
+      depth: 4.6,
+      climbable: true,
+      vaultable: false,
+    });
+  }
+
+  const coverCount = 4;
+  for (let i = 0; i < coverCount; i++) {
+    const qx = (i % 2 === 0 ? -1 : 1) * (12 + rng() * 11);
+    const qz = (i < 2 ? -1 : 1) * (12 + rng() * 11);
+    const ox = Number((centerX + qx).toFixed(2));
+    const oz = Number((centerZ + qz).toFixed(2));
+    const oy = getTerrainHeight(ox, oz, mapId);
+    const isClimbTower = i % 2 === 0;
+    obstacles.push({
+      id: `chunk-${key}-obs-${i}`,
+      x: ox,
+      y: oy,
+      z: oz,
+      width: isClimbTower ? 4.4 : 4.2,
+      height: isClimbTower ? 2.9 : 1.4,
+      depth: isClimbTower ? 4.4 : 1.1,
+      climbable: isClimbTower,
+      vaultable: !isClimbTower,
+    });
+  }
+
+  // 2 Salvage Crates per chunk
+  for (let c = 0; c < 2; c++) {
+    const cxPos = Number((centerX + (c === 0 ? -7 : 7) + (rng() - 0.5) * 6).toFixed(2));
+    const czPos = Number((centerZ + (rng() - 0.5) * 14).toFixed(2));
+    salvageCrates.push({
+      id: `crate-${key}-${c}`,
+      label: c === 0 ? 'Sector Salvage Drop' : 'Outpost Alloy Cache',
+      x: cxPos,
+      y: getTerrainHeight(cxPos, czPos, mapId),
+      z: czPos,
+      amount: 45,
+      cooldown: 0,
+    });
+  }
+
+  // 10 Composite Trees / Monoliths per chunk
+  for (let t = 0; t < 10; t++) {
+    const tx = Number((centerX + (rng() - 0.5) * (WORLD_CHUNK_SIZE - 8)).toFixed(2));
+    const tz = Number((centerZ + (rng() - 0.5) * (WORLD_CHUNK_SIZE - 8)).toFixed(2));
+    const tooClose = obstacles.some(
+      (o) => Math.hypot(o.x - tx, o.z - tz) < Math.max(o.width, o.depth) + 2.5
+    );
+    if (tooClose) continue;
+    trees.push({
+      x: tx,
+      y: getTerrainHeight(tx, tz, mapId),
+      z: tz,
+      scale: Number((0.85 + rng() * 0.45).toFixed(2)),
+      rotY: Number((rng() * Math.PI * 2).toFixed(2)),
+      tintOffset: ((t % 3) - 1) * 0.05,
+    });
+  }
+
+  return {
+    cx,
+    cz,
+    key,
+    centerX,
+    centerZ,
+    obstacles,
+    trees,
+    salvageCrates,
+    hasOutpostSpire,
+    spirePos,
+  };
+}

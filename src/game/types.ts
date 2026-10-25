@@ -1198,6 +1198,7 @@ export const BOT_HARDNESS_TIERS: Record<BotHardnessId, BotHardnessDefinition> = 
 };
 
 export interface FriendProfile {
+  friendCode: string;
   username: string;
   level: number;
   skinId: SkinId;
@@ -1207,11 +1208,38 @@ export interface FriendProfile {
 
 export interface FriendRequestRecord {
   id: string;
+  fromCode: string;
   fromUsername: string;
+  toCode: string;
   toUsername: string;
   direction: 'incoming' | 'outgoing';
   status: 'pending' | 'accepted' | 'declined';
   timestamp: number;
+}
+
+export type WeatherAtmosphereMode =
+  | 'light-rain-blur'
+  | 'storm-squall'
+  | 'mist-veil';
+
+export interface ProceduralChunkBlueprint {
+  cx: number;
+  cz: number;
+  key: string;
+  centerX: number;
+  centerZ: number;
+  obstacles: ObstacleBox[];
+  trees: Array<{
+    x: number;
+    y: number;
+    z: number;
+    scale: number;
+    rotY: number;
+    tintOffset: number;
+  }>;
+  salvageCrates: SalvageNode[];
+  hasOutpostSpire: boolean;
+  spirePos: { x: number; y: number; z: number } | null;
 }
 
 export interface SplitScreenP2Telemetry {
@@ -1226,5 +1254,3 @@ export interface SplitScreenP2Telemetry {
   eliminations: number;
   movementMode: PlayerPhysicsState['movementMode'];
 }
-
-

@@ -302,8 +302,9 @@ async function startServer() {
     });
   });
 
-  // Online Account Directory & Friend Request System
+  // Real Online Account Directory & Friend Code Request System (No Bot Accounts)
   interface OnlineAccountEntry {
+    friendCode: string;
     username: string;
     level: number;
     skinId: string;
@@ -313,81 +314,42 @@ async function startServer() {
 
   interface ServerFriendRequest {
     id: string;
+    fromCode: string;
+    toCode: string;
     fromUsername: string;
     toUsername: string;
     status: 'pending' | 'accepted' | 'declined';
     timestamp: number;
   }
 
-  const onlineAccounts = new Map<string, OnlineAccountEntry>([
-    [
-      'KESTREL_99',
-      {
-        username: 'KESTREL_99',
-        level: 14,
-        skinId: 'solaris-valkyrie',
-        status: 'online',
-        updatedAt: Date.now(),
-      },
-    ],
-    [
-      'NOVA_PRIME',
-      {
-        username: 'NOVA_PRIME',
-        level: 22,
-        skinId: 'apex-sovereign',
-        status: 'online',
-        updatedAt: Date.now(),
-      },
-    ],
-    [
-      'VORTEX_7',
-      {
-        username: 'VORTEX_7',
-        level: 9,
-        skinId: 'crimson-ronin',
-        status: 'online',
-        updatedAt: Date.now(),
-      },
-    ],
-    [
-      'SHADOW_LYNX',
-      {
-        username: 'SHADOW_LYNX',
-        level: 18,
-        skinId: 'void-walker',
-        status: 'in-match',
-        updatedAt: Date.now(),
-      },
-    ],
-    [
-      'APEX_ZERO',
-      {
-        username: 'APEX_ZERO',
-        level: 31,
-        skinId: 'nebula-titan',
-        status: 'online',
-        updatedAt: Date.now(),
-      },
-    ],
-  ]);
+  function normalizeCodeServer(raw: string): string {
+    const cleaned = String(raw || '')
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, '');
+    if (!cleaned) return '';
+    const body = cleaned.startsWith('VX') ? cleaned.slice(2) : cleaned;
+    if (!body) return '';
+    return `VX-${body.slice(0, 6)}`;
+  }
 
-  const serverFriendRequests: ServerFriendRequest[] = [
-    {
-      id: 'freq_seed_1',
-      fromUsername: 'KESTREL_99',
-      toUsername: 'VANGUARD-01',
-      status: 'pending',
-      timestamp: Date.now() - 45000,
-    },
-    {
-      id: 'freq_seed_2',
-      fromUsername: 'NOVA_PRIME',
-      toUsername: 'VANGUARD-01',
-      status: 'accepted',
-      timestamp: Date.now() - 180000,
-    },
-  ];
+  function generateCodeFromUsername(username: string): string {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let hash = 2166136261;
+    for (let i = 0; i < username.length; i++) {
+      hash ^= username.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    let code = 'VX-';
+    for (let i = 0; i < 6; i++) {
+      const idx = Math.abs((hash >>> (i * 4)) ^ (hash >>> (i + 3))) % alphabet.length;
+      code += alphabet[idx];
+    }
+    return code;
+  }
+
+  // Strictly real registered accounts only — zero bot friends
+  const onlineAccounts = new Map<string, OnlineAccountEntry>();
+  const serverFriendRequests: ServerFriendRequest[] = [];
 
   app.post('/api/accounts/register', (req, res) => {
     const rawUsername = String(req.body?.username || '').trim().slice(0, 28);
@@ -395,15 +357,29 @@ async function startServer() {
       res.status(400).json({ error: 'Username must be at least 2 characters.' });
       return;
     }
-    const key = rawUsername.toUpperCase();
+    const rawCode = normalizeCodeServer(String(req.body?.friendCode || ''));
+    const friendCode =
+      /^VX-[A-Z0-9]{6}$/.test(rawCode) ? rawCode : generateCodeFromUsername(rawUsername);
+
     const entry: OnlineAccountEntry = {
+      friendCode,
       username: rawUsername,
       level: Math.max(1, Number(req.body?.level || 1)),
       skinId: String(req.body?.skinId || 'vanguard-obsidian'),
-      status: 'online',
+      status:
+        req.body?.status === 'in-match' || req.body?.status === 'idle'
+          ? req.body.status
+          : 'online',
       updatedAt: Date.now(),
     };
-    onlineAccounts.set(key, entry);
+    onlineAccounts.set(friendCode, entry);
+
+    // Update any existing friend requests with latest username for this code
+    for (const r of serverFriendRequests) {
+      if (r.fromCode === friendCode) r.fromUsername = rawUsername;
+      if (r.toCode === friendCode) r.toUsername = rawUsername;
+    }
+
     broadcast({ type: 'account:registered', account: entry });
     res.json({
       ok: true,
@@ -412,45 +388,43 @@ async function startServer() {
     });
   });
 
-  function buildFriendsStateForUser(rawUsername: string) {
-    const myUsername = (rawUsername || 'VANGUARD_01').trim();
-    const myUpper = myUsername.toUpperCase();
+  function buildFriendsStateForCode(rawCode: string, rawUsername: string) {
+    const myCode = normalizeCodeServer(rawCode);
+    const myUpper = String(rawUsername || '').trim().toUpperCase();
 
     const requests = serverFriendRequests
       .filter(
         (r) =>
-          r.fromUsername.toUpperCase() === myUpper ||
-          r.toUsername.toUpperCase() === myUpper ||
-          r.toUsername.toUpperCase() === 'VANGUARD-01' ||
-          r.toUsername.toUpperCase() === 'VANGUARD_01'
+          (myCode && (r.fromCode === myCode || r.toCode === myCode)) ||
+          (myUpper &&
+            (r.fromUsername.toUpperCase() === myUpper ||
+              r.toUsername.toUpperCase() === myUpper))
       )
-      .map((r) => ({
-        ...r,
-        direction:
-          r.fromUsername.toUpperCase() === myUpper ? 'outgoing' : 'incoming',
-      }));
+      .map((r) => {
+        const isOutgoing =
+          (myCode && r.fromCode === myCode) ||
+          (!myCode && myUpper && r.fromUsername.toUpperCase() === myUpper);
+        return {
+          ...r,
+          direction: (isOutgoing ? 'outgoing' : 'incoming') as 'outgoing' | 'incoming',
+        };
+      });
 
-    const acceptedFriendNames = new Set<string>(['NOVA_PRIME', 'VORTEX_7']);
+    const acceptedFriendCodes = new Set<string>();
     for (const r of requests) {
       if (r.status === 'accepted') {
-        const other =
-          r.fromUsername.toUpperCase() === myUpper
-            ? r.toUsername
-            : r.fromUsername;
-        if (
-          other.toUpperCase() !== myUpper &&
-          other.toUpperCase() !== 'VANGUARD-01' &&
-          other.toUpperCase() !== 'VANGUARD_01'
-        ) {
-          acceptedFriendNames.add(other.toUpperCase());
+        const otherCode = r.direction === 'outgoing' ? r.toCode : r.fromCode;
+        if (otherCode && otherCode !== myCode) {
+          acceptedFriendCodes.add(otherCode);
         }
       }
     }
 
-    const friends = Array.from(acceptedFriendNames)
-      .map((upperName) => onlineAccounts.get(upperName))
+    const friends = Array.from(acceptedFriendCodes)
+      .map((code) => onlineAccounts.get(code))
       .filter((entry): entry is OnlineAccountEntry => Boolean(entry))
       .map((entry) => ({
+        friendCode: entry.friendCode,
         username: entry.username,
         level: entry.level,
         skinId: entry.skinId,
@@ -466,67 +440,126 @@ async function startServer() {
   }
 
   app.get('/api/friends/state', (req, res) => {
-    const myUsername = String(req.query.username || 'VANGUARD_01').trim();
-    res.json(buildFriendsStateForUser(myUsername));
+    const myCode = String(req.query.friendCode || '').trim();
+    const myUsername = String(req.query.username || '').trim();
+    res.json(buildFriendsStateForCode(myCode, myUsername));
   });
 
   app.post('/api/friends/request', (req, res) => {
     const fromUsername = String(req.body?.fromUsername || 'VANGUARD_01')
       .trim()
       .slice(0, 28);
-    const toUsername = String(req.body?.toUsername || '')
-      .trim()
-      .slice(0, 28);
+    const rawFromCode = normalizeCodeServer(String(req.body?.fromCode || ''));
+    const fromCode =
+      /^VX-[A-Z0-9]{6}$/.test(rawFromCode)
+        ? rawFromCode
+        : generateCodeFromUsername(fromUsername);
 
-    if (toUsername.length < 2) {
-      res.status(400).json({ error: 'Please enter a valid username (2+ chars).' });
-      return;
-    }
-    if (fromUsername.toUpperCase() === toUsername.toUpperCase()) {
-      res.status(400).json({ error: 'You cannot send a friend request to yourself.' });
-      return;
-    }
-
-    // Ensure target exists in online directory so any username can be added and tested
-    const targetUpper = toUsername.toUpperCase();
-    if (!onlineAccounts.has(targetUpper)) {
-      onlineAccounts.set(targetUpper, {
-        username: toUsername,
-        level: 7,
-        skinId: 'alpine-ghost',
+    // Ensure sender is registered in the directory
+    if (!onlineAccounts.has(fromCode)) {
+      onlineAccounts.set(fromCode, {
+        friendCode: fromCode,
+        username: fromUsername,
+        level: Math.max(1, Number(req.body?.fromLevel || 1)),
+        skinId: String(req.body?.fromSkinId || 'vanguard-obsidian'),
         status: 'online',
         updatedAt: Date.now(),
       });
     }
 
+    const rawTargetInput = String(req.body?.toCode || req.body?.toUsername || '').trim();
+    const toCode = normalizeCodeServer(rawTargetInput);
+
+    if (!/^VX-[A-Z0-9]{6}$/.test(toCode)) {
+      res.status(400).json({
+        error: `No player found with friend code "${rawTargetInput || 'EMPTY'}". Friend codes use format VX-XXXXXX.`,
+      });
+      return;
+    }
+
+    if (fromCode === toCode) {
+      res.status(400).json({
+        error: 'You cannot send a friend request to your own friend code.',
+      });
+      return;
+    }
+
+    const targetAccount = onlineAccounts.get(toCode);
+    if (!targetAccount) {
+      res.status(404).json({
+        error: `No player found with friend code "${toCode}". Check the code in their Account tab and try again.`,
+      });
+      return;
+    }
+
+    // Check if an active or accepted request already exists between these two codes
+    const existingReq = serverFriendRequests.find(
+      (r) =>
+        r.status !== 'declined' &&
+        ((r.fromCode === fromCode && r.toCode === toCode) ||
+          (r.fromCode === toCode && r.toCode === fromCode))
+    );
+
+    if (existingReq) {
+      if (existingReq.status === 'accepted') {
+        res.status(400).json({
+          error: `Player ${targetAccount.username} (${toCode}) is already in your Friends list.`,
+        });
+        return;
+      }
+      // If the other player had already sent us a pending request, auto-accept both!
+      if (existingReq.fromCode === toCode && existingReq.status === 'pending') {
+        existingReq.status = 'accepted';
+        broadcast({ type: 'friend:responded', request: existingReq });
+        const state = buildFriendsStateForCode(fromCode, fromUsername);
+        res.json({
+          ok: true,
+          request: { ...existingReq, direction: 'incoming' },
+          targetProfile: targetAccount,
+          ...state,
+        });
+        return;
+      }
+      res.status(400).json({
+        error: `Friend request to ${targetAccount.username} (${toCode}) is already pending.`,
+      });
+      return;
+    }
+
     const newReq: ServerFriendRequest = {
       id: `freq_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      fromCode,
+      toCode,
       fromUsername,
-      toUsername: onlineAccounts.get(targetUpper)?.username || toUsername,
-      status: 'accepted',
+      toUsername: targetAccount.username,
+      status: 'pending',
       timestamp: Date.now(),
     };
     serverFriendRequests.unshift(newReq);
     broadcast({ type: 'friend:request', request: newReq });
 
-    const state = buildFriendsStateForUser(fromUsername);
+    const state = buildFriendsStateForCode(fromCode, fromUsername);
     res.json({
       ok: true,
       request: { ...newReq, direction: 'outgoing' },
-      targetProfile: onlineAccounts.get(targetUpper),
+      targetProfile: targetAccount,
       ...state,
     });
   });
 
   app.post('/api/friends/respond', (req, res) => {
+    const friendCode = normalizeCodeServer(String(req.body?.friendCode || ''));
     const username = String(req.body?.username || 'VANGUARD_01').trim();
     const requestId = String(req.body?.requestId || '');
     const action = req.body?.action === 'decline' ? 'declined' : 'accepted';
     const found = serverFriendRequests.find((r) => r.id === requestId);
-    if (found) {
-      found.status = action;
+    if (!found) {
+      res.status(404).json({ error: 'Friend request not found.' });
+      return;
     }
-    const state = buildFriendsStateForUser(username);
+    found.status = action;
+    broadcast({ type: 'friend:responded', request: found });
+    const state = buildFriendsStateForCode(friendCode, username);
     res.json({ ok: true, request: found, ...state });
   });
 
@@ -600,6 +633,38 @@ async function startServer() {
               callsign: op.callsign,
               emoteId: op.activeEmote,
               emoteExpiresAt: op.emoteExpiresAt,
+            });
+          }
+        } else if (eventType === 'player:fire') {
+          broadcast(
+            {
+              type: 'player:fired',
+              id: String(msg.id || ''),
+              callsign: String(msg.callsign || 'OPERATOR'),
+              originX: Number(msg.originX || 0),
+              originY: Number(msg.originY || 1.5),
+              originZ: Number(msg.originZ || 0),
+              targetX: Number(msg.targetX || 0),
+              targetY: Number(msg.targetY || 1.5),
+              targetZ: Number(msg.targetZ || 0),
+              colorHex: String(msg.colorHex || '#38bdf8'),
+            },
+            ws
+          );
+        } else if (eventType === 'player:hit') {
+          const targetId = String(msg.targetId || '');
+          const damage = Math.max(1, Math.min(120, Number(msg.damage || 20)));
+          const attackerCallsign = String(msg.attackerCallsign || 'OPERATOR');
+          const targetOp = roomOperators.get(targetId);
+          if (targetOp) {
+            targetOp.hp = Math.max(0, targetOp.hp - damage);
+            roomOperators.set(targetId, targetOp);
+            broadcast({
+              type: 'player:damaged',
+              targetId,
+              damage,
+              hp: targetOp.hp,
+              attackerCallsign,
             });
           }
         } else if (eventType === 'wall:build') {

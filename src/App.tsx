@@ -19,6 +19,7 @@ import {
   LobbyPageId,
   FriendProfile,
   FriendRequestRecord,
+  WeatherAtmosphereMode,
   WeaponId,
   OpticId,
   BarrelId,
@@ -39,6 +40,8 @@ import {
   computeWeaponStats,
   calculateMatchXpAndCredits,
   computeOperatorLevelFromXp,
+  generatePlayerFriendCode,
+  normalizeFriendCode,
 } from './game/rules';
 import { soundEngine } from './game/sound';
 import {
@@ -84,20 +87,43 @@ export default function App() {
   const [lobbyPage, setLobbyPage] = useState<LobbyPageId>('play');
   const [accountMinimized, setAccountMinimized] = useState<boolean>(true);
 
-  // Match Mode, Bot Hardness & Map State
+  // Match Mode, Bot Hardness, Weather Atmosphere & Map State
   const [mapId, setMapId] = useState<MapId>('alpine-outpost');
   const [battleMode, setBattleMode] = useState<BattleModeId>('2v2');
   const [botHardness, setBotHardness] = useState<BotHardnessId>('veteran');
+  const [weatherMode, setWeatherMode] =
+    useState<WeatherAtmosphereMode>('light-rain-blur');
   const [trainingLevel, setTrainingLevel] = useState<number>(1);
   const [highestReachedLevel, setHighestReachedLevel] = useState<number>(4);
 
-  // Operator Account, XP, Credits & Customization State
+  // Operator Account, Friend Code, XP, Credits & Customization State
   const [callsign, setCallsign] = useState<string>(() => {
     if (typeof window !== 'undefined') {
       return localStorage.getItem('apex_username') || 'VANGUARD_01';
     }
     return 'VANGUARD_01';
   });
+  const [friendCode, setFriendCode] = useState<string>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('apex_friend_code');
+      if (saved && /^VX-[A-Z0-9]{6}$/.test(saved)) {
+        return saved;
+      }
+      const generated = generatePlayerFriendCode(
+        `${localStorage.getItem('apex_username') || 'VANGUARD_01'}_${Math.random()
+          .toString(36)
+          .slice(2, 8)}`
+      );
+      try {
+        localStorage.setItem('apex_friend_code', generated);
+      } catch {
+        // Ignore storage error
+      }
+      return generated;
+    }
+    return 'VX-7A9K2M';
+  });
+  const [codeCopiedToast, setCodeCopiedToast] = useState<boolean>(false);
   const [accountRegistered, setAccountRegistered] = useState<boolean>(true);
   const [usernameDraft, setUsernameDraft] = useState<string>(callsign);
   const [accountToast, setAccountToast] = useState<string | null>(null);
@@ -157,14 +183,24 @@ export default function App() {
     damageBonus: 0.05,
   });
 
-  // Friends & Party State
+  // Real Online Friends & Friend Code Request State (Zero Bot Friends)
   const [friendsList, setFriendsList] = useState<FriendProfile[]>([]);
   const [friendRequests, setFriendRequests] = useState<FriendRequestRecord[]>(
     []
   );
+  const [onlineDirectory, setOnlineDirectory] = useState<
+    Array<{
+      friendCode: string;
+      username: string;
+      level: number;
+      skinId: SkinId;
+      status: string;
+    }>
+  >([]);
   const [partyMembers, setPartyMembers] = useState<FriendProfile[]>([]);
-  const [friendSearchUsername, setFriendSearchUsername] = useState<string>('');
+  const [friendCodeInput, setFriendCodeInput] = useState<string>('');
   const [friendStatusMsg, setFriendStatusMsg] = useState<string | null>(null);
+  const [friendErrorMsg, setFriendErrorMsg] = useState<string | null>(null);
 
   const [muted, setMuted] = useState<boolean>(false);
   const [restartNonce, setRestartNonce] = useState<number>(0);
@@ -279,6 +315,10 @@ export default function App() {
     killMarkerActive: false,
     damageVignetteIntensity: 0,
     smartTargetLocked: false,
+    activeChunkKey: '0,0',
+    loadedChunkCount: 25,
+    chunksDiscovered: 1,
+    weatherMode: 'light-rain-blur',
     activeEnvironmentEvent: null,
     nextEventCooldownSec: 6.5,
     splitScreenP2: null,
@@ -294,12 +334,13 @@ export default function App() {
     },
   });
 
-  // Persist local XP, Credits, Username, and Unlocked Skins
+  // Persist local XP, Credits, Username, Friend Code, and Unlocked Skins
   useEffect(() => {
     try {
       localStorage.setItem('apex_xp', String(localXp));
       localStorage.setItem('apex_credits', String(localCredits));
       localStorage.setItem('apex_username', callsign);
+      localStorage.setItem('apex_friend_code', friendCode);
       localStorage.setItem(
         'apex_unlocked_skins',
         JSON.stringify(unlockedSkins)
@@ -307,30 +348,43 @@ export default function App() {
     } catch {
       // Ignore storage quota issues
     }
-  }, [localXp, localCredits, callsign, unlockedSkins]);
+  }, [localXp, localCredits, callsign, friendCode, unlockedSkins]);
 
   // Mirror game state to document.body.dataset.state
   useEffect(() => {
     document.body.dataset.state = gameState;
   }, [gameState]);
 
-  // Sync Online Account & Friends State with Backend API
-  const syncFriendsAndAccount = async (usernameToSync: string) => {
+  // Sync Online Account, Personal Friend Code & Friends State with Backend API
+  const syncFriendsAndAccount = async (
+    usernameToSync = callsign,
+    codeToSync = friendCode
+  ) => {
     const levelInfo = computeOperatorLevelFromXp(localXp);
     try {
-      await fetch('/api/accounts/register', {
+      const regRes = await fetch('/api/accounts/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          friendCode: codeToSync,
           username: usernameToSync,
           skinId,
           level: levelInfo.level,
           xp: localXp,
           credits: localCredits,
+          status: gameState === 'playing' ? 'in-match' : 'online',
         }),
       });
+      if (regRes.ok) {
+        const regData = await regRes.json();
+        if (regData?.account?.friendCode) {
+          setFriendCode(regData.account.friendCode);
+        }
+      }
       const res = await fetch(
-        `/api/friends/state?username=${encodeURIComponent(usernameToSync)}`
+        `/api/friends/state?friendCode=${encodeURIComponent(
+          codeToSync
+        )}&username=${encodeURIComponent(usernameToSync)}`
       );
       if (res.ok) {
         const data = await res.json();
@@ -340,6 +394,9 @@ export default function App() {
         if (Array.isArray(data.requests)) {
           setFriendRequests(data.requests);
         }
+        if (Array.isArray(data.directory)) {
+          setOnlineDirectory(data.directory);
+        }
       }
     } catch {
       // Offline fallback if needed
@@ -347,8 +404,8 @@ export default function App() {
   };
 
   useEffect(() => {
-    syncFriendsAndAccount(callsign);
-  }, [callsign]);
+    syncFriendsAndAccount(callsign, friendCode);
+  }, [callsign, friendCode, skinId, gameState]);
 
   // Automatic Hardware Input Mutual-Exclusion Listener
   useEffect(() => {
@@ -495,6 +552,31 @@ export default function App() {
             });
           } else if (msg.type === 'wall:destroyed' && msg.id) {
             setSharedWalls((prev) => prev.filter((w) => w.id !== msg.id));
+          } else if (
+            msg.type === 'friend:request' ||
+            msg.type === 'friend:responded' ||
+            msg.type === 'account:registered'
+          ) {
+            // Real-time refresh of friend requests & accepted friends when another player interacts via code
+            const savedCode =
+              localStorage.getItem('apex_friend_code') || friendCode;
+            const savedName =
+              localStorage.getItem('apex_username') || callsign;
+            fetch(
+              `/api/friends/state?friendCode=${encodeURIComponent(
+                savedCode
+              )}&username=${encodeURIComponent(savedName)}`
+            )
+              .then((r) => (r.ok ? r.json() : null))
+              .then((data) => {
+                if (!data) return;
+                if (Array.isArray(data.friends)) setFriendsList(data.friends);
+                if (Array.isArray(data.requests))
+                  setFriendRequests(data.requests);
+                if (Array.isArray(data.directory))
+                  setOnlineDirectory(data.directory);
+              })
+              .catch(() => {});
           }
         } catch {
           // Ignore malformed WS packets
@@ -544,6 +626,16 @@ export default function App() {
     }).catch(() => {});
   };
 
+  const handleCopyFriendCode = () => {
+    try {
+      navigator.clipboard?.writeText(friendCode);
+    } catch {
+      // Ignore clipboard permission in headless preview
+    }
+    setCodeCopiedToast(true);
+    setTimeout(() => setCodeCopiedToast(false), 2200);
+  };
+
   const handleSaveUsernameAccount = async (e: React.FormEvent) => {
     e.preventDefault();
     const cleaned = usernameDraft
@@ -558,46 +650,66 @@ export default function App() {
     setUsernameDraft(cleaned);
     setAccountRegistered(true);
     persistLoadoutIfSignedIn({ callsign: cleaned });
-    await syncFriendsAndAccount(cleaned);
-    setAccountToast(`Online Account [${cleaned}] synced!`);
+    await syncFriendsAndAccount(cleaned, friendCode);
+    setAccountToast(`Online Account [${cleaned}] (${friendCode}) synced!`);
     setTimeout(() => setAccountToast(null), 3200);
   };
 
   const handleSendFriendRequest = async (e: React.FormEvent) => {
     e.preventDefault();
-    const target = friendSearchUsername.trim();
-    if (target.length < 2) {
-      setFriendStatusMsg('Enter a valid username (2+ characters).');
+    const rawTarget = friendCodeInput.trim();
+    const normalizedTarget = normalizeFriendCode(rawTarget);
+    setFriendStatusMsg(null);
+    setFriendErrorMsg(null);
+
+    if (!rawTarget) {
+      setFriendErrorMsg(
+        'Please enter a player Friend Code (format VX-XXXXXX).'
+      );
       return;
     }
-    setFriendStatusMsg(null);
+
     try {
+      const levelInfo = computeOperatorLevelFromXp(localXp);
       const res = await fetch('/api/friends/request', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          fromCode: friendCode,
           fromUsername: callsign,
-          toUsername: target,
+          fromLevel: levelInfo.level,
+          fromSkinId: skinId,
+          toCode: normalizedTarget || rawTarget,
         }),
       });
       const data = await res.json();
       if (!res.ok) {
-        setFriendStatusMsg(data.error || 'Could not send friend request.');
+        setFriendErrorMsg(
+          data.error ||
+            `No player found with friend code "${
+              normalizedTarget || rawTarget
+            }".`
+        );
         return;
       }
       if (Array.isArray(data.friends)) setFriendsList(data.friends);
       if (Array.isArray(data.requests)) setFriendRequests(data.requests);
-      setFriendSearchUsername('');
+      if (Array.isArray(data.directory)) setOnlineDirectory(data.directory);
+      setFriendCodeInput('');
+      const targetName = data.targetProfile?.username || normalizedTarget;
+      const targetCode = data.targetProfile?.friendCode || normalizedTarget;
       setFriendStatusMsg(
-        `Friend request sent to ${target.toUpperCase()} — accepted and added to Friends!`
+        data.request?.status === 'accepted'
+          ? `Connected with ${targetName} (${targetCode}) — added to your Friends list!`
+          : `Friend request sent to ${targetName} (${targetCode})! Waiting for them to accept.`
       );
       if (currentUser) {
-        sendFirestoreFriendRequest(currentUser, callsign, target).catch(
+        sendFirestoreFriendRequest(currentUser, callsign, targetName).catch(
           () => {}
         );
       }
     } catch {
-      setFriendStatusMsg('Network error sending friend request.');
+      setFriendErrorMsg('Network error while looking up Friend Code.');
     }
   };
 
@@ -610,6 +722,7 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          friendCode,
           username: callsign,
           requestId,
           action,
@@ -619,6 +732,13 @@ export default function App() {
         const data = await res.json();
         if (Array.isArray(data.friends)) setFriendsList(data.friends);
         if (Array.isArray(data.requests)) setFriendRequests(data.requests);
+        if (Array.isArray(data.directory)) setOnlineDirectory(data.directory);
+        setFriendErrorMsg(null);
+        setFriendStatusMsg(
+          action === 'accept'
+            ? 'Friend request accepted! Player added to your Friends list.'
+            : 'Friend request declined.'
+        );
       }
     } catch {
       // Ignore network error
@@ -628,11 +748,15 @@ export default function App() {
   const handleTogglePartyMember = (friend: FriendProfile) => {
     setPartyMembers((prev) => {
       const exists = prev.some(
-        (p) => p.username.toUpperCase() === friend.username.toUpperCase()
+        (p) =>
+          p.friendCode === friend.friendCode ||
+          p.username.toUpperCase() === friend.username.toUpperCase()
       );
       if (exists) {
         return prev.filter(
-          (p) => p.username.toUpperCase() !== friend.username.toUpperCase()
+          (p) =>
+            p.friendCode !== friend.friendCode &&
+            p.username.toUpperCase() !== friend.username.toUpperCase()
         );
       }
       if (prev.length >= 3) {
@@ -694,7 +818,7 @@ export default function App() {
     nextState: GameState,
     outcome?: {
       victory: boolean;
-      score: number;
+      score: boolean extends never ? number : number;
       eliminations: number;
       wallsConstructed: number;
       waveReached: number;
@@ -776,6 +900,7 @@ export default function App() {
         mapId={mapId}
         battleMode={battleMode}
         botHardness={botHardness}
+        weatherMode={weatherMode}
         partyMembers={partyMembers}
         trainingLevel={trainingLevel}
         callsign={callsign}
@@ -807,6 +932,21 @@ export default function App() {
         onStateChange={handleStateChange}
         onSendMultiplayerUpdate={sendMultiplayerUpdate}
         onReplayUpdated={setReplayRecording}
+      />
+
+      {/* Atmospheric Horizon Blur & Light Rain Veil (masks distant chunk streaming without WebGL backdrop-filter stall) */}
+      <div
+        data-testid="weather-horizon-veil"
+        data-weather={weatherMode}
+        className="fixed inset-0 z-10 pointer-events-none overflow-hidden"
+        style={{
+          background:
+            weatherMode === 'storm-squall'
+              ? 'radial-gradient(circle at 50% 48%, rgba(15,23,42,0) 42%, rgba(15,23,42,0.52) 100%), linear-gradient(180deg, rgba(148,163,184,0.18) 0%, rgba(100,116,139,0.22) 38%, rgba(15,23,42,0.04) 68%, rgba(15,23,42,0.34) 100%)'
+              : weatherMode === 'mist-veil'
+                ? 'radial-gradient(circle at 50% 48%, rgba(15,23,42,0) 38%, rgba(30,41,59,0.48) 100%), linear-gradient(180deg, rgba(203,213,225,0.16) 0%, rgba(148,163,184,0.24) 44%, rgba(15,23,42,0.03) 72%, rgba(15,23,42,0.28) 100%)'
+                : 'radial-gradient(circle at 50% 48%, rgba(15,23,42,0) 46%, rgba(15,23,42,0.38) 100%), linear-gradient(180deg, rgba(186,230,253,0.12) 0%, rgba(148,163,184,0.18) 40%, rgba(15,23,42,0.02) 70%, rgba(15,23,42,0.26) 100%)',
+        }}
       />
 
       {/* ===================================================================== */}
@@ -888,7 +1028,7 @@ export default function App() {
               </nav>
             </div>
 
-            {/* Right: Level Badge + Credits + Collapsible Account Icon Button */}
+            {/* Right: Level Badge + Credits + Friend Code + Collapsible Account Icon Button */}
             <div className="relative flex items-center gap-2">
               <div
                 className="hidden sm:flex items-center gap-3 px-3.5 py-2 rounded-xl border border-white/15 font-mono text-xs"
@@ -903,6 +1043,13 @@ export default function App() {
                 </span>
                 <span className="text-slate-600">·</span>
                 <span className="text-emerald-400">{callsign}</span>
+                <span className="text-slate-600">·</span>
+                <span
+                  data-testid="header-friend-code"
+                  className="text-amber-300 font-bold"
+                >
+                  {friendCode}
+                </span>
               </div>
 
               {/* Account Icon Button to Show or Minimize Account Drawer */}
@@ -934,7 +1081,7 @@ export default function App() {
                 </span>
               </button>
 
-              {/* Collapsible Account Creation, Level, Credits & Controls Popover */}
+              {/* Collapsible Account Creation, Friend Code, Level, Credits & Controls Popover */}
               {!accountMinimized && (
                 <div
                   data-testid="lobby-account-drawer"
@@ -959,6 +1106,32 @@ export default function App() {
                       className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-mono text-slate-300 cursor-pointer"
                     >
                       Minimize [–]
+                    </button>
+                  </div>
+
+                  {/* Unique Player Friend Code Card inside Account Tab */}
+                  <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-400/40 flex items-center justify-between gap-2">
+                    <div>
+                      <div className="text-[10px] font-mono text-amber-300 uppercase">
+                        YOUR PERSONAL FRIEND CODE (SHARE TO ADD FRIENDS)
+                      </div>
+                      <div
+                        data-testid="account-friend-code"
+                        className="text-base font-mono font-bold tracking-wider text-white"
+                      >
+                        {friendCode}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      data-testid="copy-friend-code-btn"
+                      onClick={() => {
+                        navigator.clipboard?.writeText(friendCode).catch(() => {});
+                        setAccountToast(`Copied Friend Code ${friendCode}!`);
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-mono font-bold text-xs cursor-pointer shrink-0"
+                    >
+                      Copy Code
                     </button>
                   </div>
 
@@ -999,7 +1172,7 @@ export default function App() {
                       htmlFor="account-username-input"
                       className="block text-[11px] font-mono text-slate-300"
                     >
-                      Online Account Username (Used for Friend Requests)
+                      Online Account Callsign (Linked to {friendCode})
                     </label>
                     <div className="flex items-center gap-2">
                       <input
@@ -1021,7 +1194,10 @@ export default function App() {
                       </button>
                     </div>
                     {accountToast && (
-                      <div className="text-[11px] font-mono text-emerald-400">
+                      <div
+                        data-testid="account-toast-msg"
+                        className="text-[11px] font-mono text-emerald-400"
+                      >
                         {accountToast}
                       </div>
                     )}
@@ -1130,7 +1306,11 @@ export default function App() {
           {lobbyPage === 'play' && (
             <div className="flex-1 flex flex-col justify-between pointer-events-none py-2">
               {/* Center-Top Floating Operator Level & Skin Tag + `+` Party Slots */}
-              <div className="flex flex-col items-center mt-1 gap-3">
+              <div
+                className={`flex flex-col items-center mt-1 gap-3 transition-opacity ${
+                  !accountMinimized ? 'opacity-0 pointer-events-none' : 'opacity-100'
+                }`}
+              >
                 {/* Operator Level + Skin Badge over 3D Character */}
                 <div
                   className="pointer-events-auto flex items-center gap-3 px-4 py-2 rounded-full border border-white/20 shadow-xl"
@@ -1715,18 +1895,23 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 5 Expanded 192m x 192m Maps / Biomes */}
-              <div className="pt-2 border-t border-white/10">
-                <div className="flex items-center justify-between mb-1.5">
-                  <span className="text-xs font-mono text-emerald-400 uppercase">
-                    3. CHOOSE EXPANDED DEPLOYMENT MAP (192M × 192M LARGE SECTORS)
-                  </span>
+              {/* 5 Infinite Procedural Chunk Biomes + Weather Atmosphere Masking */}
+              <div className="pt-2 border-t border-white/10 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <span className="text-xs font-mono text-emerald-400 uppercase block">
+                      3. INFINITE PROCEDURAL CHUNK BIOME (UNBOUNDED 64M × 64M STREAMING CHUNKS)
+                    </span>
+                    <span className="text-[11px] text-slate-400">
+                      Terrain, cover, foliage, and salvage stream seamlessly in every direction as you move.
+                    </span>
+                  </div>
                   <button
                     type="button"
                     onClick={() => handleStartDeployment()}
                     className="px-4 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-xs cursor-pointer"
                   >
-                    Deploy Now →
+                    Deploy Into Infinite World →
                   </button>
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-5 gap-2.5">
@@ -1752,7 +1937,7 @@ export default function App() {
                               style={{ backgroundColor: b.accentHex }}
                             />
                             <span className="text-[10px] font-mono text-amber-300">
-                              192m × 192m
+                              ∞ CHUNKS
                             </span>
                           </div>
                           <div className="text-xs font-bold leading-snug">
@@ -1766,12 +1951,68 @@ export default function App() {
                     );
                   })}
                 </div>
+
+                {/* Weather Atmosphere & Horizon Blur Selector (Masks Chunk Generation) */}
+                <div className="pt-2 border-t border-white/10">
+                  <div className="text-xs font-mono text-sky-300 uppercase mb-1.5">
+                    4. WEATHER ATMOSPHERE &amp; HORIZON BLUR (MASKS CHUNK STREAMING)
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                    {(
+                      [
+                        {
+                          id: 'light-rain-blur',
+                          name: 'Light Rain + Horizon Blur',
+                          tag: 'RECOMMENDED',
+                          desc: 'Gentle 3D rain streaks, ground ripples, and atmospheric horizon mist veil make new chunk generation unnoticeable.',
+                        },
+                        {
+                          id: 'storm-squall',
+                          name: 'Heavy Storm Squall',
+                          tag: 'DENSE RAIN',
+                          desc: 'High-velocity rain curtains and deeper horizon fog for close-quarters tactical ambushes.',
+                        },
+                        {
+                          id: 'mist-veil',
+                          name: 'Soft Horizon Mist Veil',
+                          tag: 'LOW PARTICLES',
+                          desc: 'Subtle peripheral atmospheric blur and exponential distance haze with minimal precipitation.',
+                        },
+                      ] as const
+                    ).map((wm) => {
+                      const active = weatherMode === wm.id;
+                      return (
+                        <button
+                          key={wm.id}
+                          type="button"
+                          data-testid={`weather-mode-${wm.id}`}
+                          onClick={() => setWeatherMode(wm.id)}
+                          className={`p-3 rounded-xl border text-left cursor-pointer transition-colors ${
+                            active
+                              ? 'bg-sky-500/20 border-sky-400 text-white'
+                              : 'bg-slate-900 border-white/10 text-slate-300 hover:border-white/25'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-1 mb-1">
+                            <span className="text-xs font-bold">{wm.name}</span>
+                            <span className="text-[10px] font-mono text-sky-300">
+                              {wm.tag}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-400">
+                            {wm.desc}
+                          </p>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
               </div>
             </div>
           )}
 
           {/* =============================================================== */}
-          {/* PAGE 5: FRIENDS & PARTY PAGE (`friends`) — Add by Username      */}
+          {/* PAGE 5: REAL FRIENDS & PARTY PAGE (`friends`) — Friend Codes    */}
           {/* =============================================================== */}
           {lobbyPage === 'friends' && (
             <div
@@ -1779,42 +2020,84 @@ export default function App() {
               className="pointer-events-auto w-full max-w-4xl mx-auto my-auto rounded-2xl border border-white/15 p-5 shadow-2xl space-y-4 max-h-[80vh] overflow-y-auto"
               style={{ backgroundColor: 'rgba(9,13,22,0.94)' }}
             >
-              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 pb-3">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-3">
                 <div>
                   <div className="text-xs font-mono text-amber-400 uppercase">
-                    ONLINE SOCIAL &amp; SQUAD PARTY NETWORK
+                    REAL ONLINE SOCIAL NETWORK · ZERO BOT FRIENDS
                   </div>
                   <h2 className="text-xl font-display font-bold text-white">
-                    Add Friends by Username &amp; Build Your 4v4 Party
+                    Add Real Friends via Personal Friend Code &amp; Build Squad
                   </h2>
                 </div>
-                <div className="text-xs font-mono text-slate-300">
-                  Your Username:{' '}
-                  <span className="text-amber-400 font-bold">{callsign}</span>
+                <div className="flex items-center gap-2.5 bg-slate-950 border border-amber-400/40 px-3.5 py-2 rounded-xl">
+                  <div>
+                    <div className="text-[10px] font-mono text-slate-400 uppercase">
+                      YOUR ACCOUNT CODE ({callsign})
+                    </div>
+                    <div
+                      data-testid="friends-page-own-code"
+                      className="text-sm font-mono font-bold text-amber-300"
+                    >
+                      {friendCode}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard?.writeText(friendCode).catch(() => {});
+                      setFriendStatusMsg(`Copied your Friend Code (${friendCode})!`);
+                    }}
+                    className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-mono font-bold text-xs cursor-pointer"
+                  >
+                    Copy
+                  </button>
                 </div>
               </div>
 
-              {/* Send Friend Request by Username */}
+              {/* Send Real Friend Request by Friend Code */}
               <form
                 onSubmit={handleSendFriendRequest}
                 className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5 bg-slate-950 p-3.5 rounded-xl border border-white/10"
               >
-                <input
-                  type="text"
-                  data-testid="friend-username-input"
-                  value={friendSearchUsername}
-                  onChange={(e) => setFriendSearchUsername(e.target.value)}
-                  placeholder="Enter operator username (e.g. APEX_ZERO, SHADOW_LYNX)..."
-                  className="flex-1 bg-slate-900 border border-white/15 rounded-lg px-3.5 py-2 text-xs font-mono text-white"
-                />
+                <div className="flex-1">
+                  <label
+                    htmlFor="friend-code-input"
+                    className="block text-[10px] font-mono text-slate-400 uppercase mb-1"
+                  >
+                    ENTER PLAYER FRIEND CODE (FROM THEIR ACCOUNT TAB, E.G. VX-849204)
+                  </label>
+                  <input
+                    id="friend-code-input"
+                    type="text"
+                    data-testid="friend-code-input"
+                    value={friendCodeInput}
+                    onChange={(e) => {
+                      setFriendCodeInput(e.target.value.toUpperCase());
+                      if (friendErrorMsg) setFriendErrorMsg(null);
+                    }}
+                    placeholder="Enter Friend Code (e.g. VX-739201)..."
+                    className="w-full bg-slate-900 border border-white/15 rounded-lg px-3.5 py-2 text-xs font-mono text-white tracking-wider uppercase"
+                  />
+                </div>
                 <button
                   type="submit"
                   data-testid="send-friend-request-btn"
-                  className="px-5 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-xs cursor-pointer shrink-0"
+                  className="px-5 py-2.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-xs cursor-pointer shrink-0 self-end sm:self-center"
                 >
                   Send Friend Request
                 </button>
               </form>
+
+              {/* Explicit Error Banner when no player exists with that Friend Code */}
+              {friendErrorMsg && (
+                <div
+                  data-testid="friend-request-error"
+                  role="alert"
+                  className="px-4 py-2.5 rounded-xl bg-rose-500/20 border border-rose-400 text-rose-200 text-xs font-mono font-bold"
+                >
+                  ⚠ {friendErrorMsg}
+                </div>
+              )}
 
               {friendStatusMsg && (
                 <div
@@ -1826,92 +2109,162 @@ export default function App() {
               )}
 
               <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
-                {/* Friends Roster + Add to Party */}
+                {/* Real Friends Roster + Add to Party (Zero Bot Friends) */}
                 <div className="md:col-span-7 space-y-2">
                   <div className="text-xs font-semibold text-slate-300">
-                    Friends List ({friendsList.length}) · Click [+] to Add to
+                    Real Friends List ({friendsList.length}) · Click [+] to Add to
                     Party ({partyMembers.length}/3)
                   </div>
                   <div className="space-y-2">
-                    {friendsList.map((f) => {
-                      const inParty = partyMembers.some(
-                        (pm) => pm.username === f.username
-                      );
-                      return (
-                        <div
-                          key={f.username}
-                          className="flex items-center justify-between p-2.5 rounded-xl bg-slate-900 border border-white/10"
-                        >
-                          <div className="flex items-center gap-2.5">
-                            <span
-                              className={`w-2.5 h-2.5 rounded-full ${
-                                f.status === 'online'
-                                  ? 'bg-emerald-400'
-                                  : 'bg-amber-400'
-                              }`}
-                            />
-                            <div>
-                              <div className="text-xs font-mono font-bold text-white">
-                                {f.username}{' '}
-                                <span className="text-sky-400">
-                                  LVL {f.level}
-                                </span>
-                              </div>
-                              <div className="text-[10px] font-mono text-slate-400">
-                                Skin:{' '}
-                                {OPERATOR_SKINS[f.skinId]?.name ||
-                                  'Vanguard Obsidian'}
+                    {friendsList.length === 0 ? (
+                      <div
+                        data-testid="empty-friends-banner"
+                        className="p-4 rounded-xl bg-slate-950 border border-white/10 text-xs text-slate-400 font-mono space-y-1"
+                      >
+                        <div className="text-slate-200 font-bold">
+                          No friends added yet (0 Bot Friends).
+                        </div>
+                        <div>
+                          Share your personal code{' '}
+                          <span className="text-amber-300 font-bold">
+                            {friendCode}
+                          </span>{' '}
+                          or enter another real player&apos;s Friend Code above to
+                          connect!
+                        </div>
+                      </div>
+                    ) : (
+                      friendsList.map((f) => {
+                        const inParty = partyMembers.some(
+                          (pm) => pm.friendCode === f.friendCode
+                        );
+                        return (
+                          <div
+                            key={f.friendCode}
+                            data-testid={`friend-row-${f.friendCode}`}
+                            className="flex items-center justify-between p-2.5 rounded-xl bg-slate-900 border border-white/10"
+                          >
+                            <div className="flex items-center gap-2.5">
+                              <span
+                                className={`w-2.5 h-2.5 rounded-full ${
+                                  f.status === 'online'
+                                    ? 'bg-emerald-400'
+                                    : 'bg-amber-400'
+                                }`}
+                              />
+                              <div>
+                                <div className="text-xs font-mono font-bold text-white">
+                                  {f.username}{' '}
+                                  <span className="text-amber-300">
+                                    [{f.friendCode}]
+                                  </span>{' '}
+                                  <span className="text-sky-400">
+                                    LVL {f.level}
+                                  </span>
+                                </div>
+                                <div className="text-[10px] font-mono text-slate-400">
+                                  Skin:{' '}
+                                  {OPERATOR_SKINS[f.skinId]?.name ||
+                                    'Vanguard Obsidian'}
+                                </div>
                               </div>
                             </div>
-                          </div>
 
-                          <button
-                            type="button"
-                            data-testid={`friend-party-toggle-${f.username}`}
-                            onClick={() => handleTogglePartyMember(f)}
-                            className={`px-3 py-1.5 rounded-lg font-mono text-xs font-bold cursor-pointer ${
-                              inParty
-                                ? 'bg-emerald-500 text-slate-950'
-                                : 'bg-slate-800 hover:bg-amber-500 hover:text-slate-950 text-slate-200'
-                            }`}
-                          >
-                            {inParty ? '✓ IN PARTY' : '+ ADD TO PARTY'}
-                          </button>
-                        </div>
-                      );
-                    })}
+                            <button
+                              type="button"
+                              data-testid={`friend-party-toggle-${f.friendCode}`}
+                              onClick={() => handleTogglePartyMember(f)}
+                              className={`px-3 py-1.5 rounded-lg font-mono text-xs font-bold cursor-pointer ${
+                                inParty
+                                  ? 'bg-emerald-500 text-slate-950'
+                                  : 'bg-slate-800 hover:bg-amber-500 hover:text-slate-950 text-slate-200'
+                              }`}
+                            >
+                              {inParty ? 'IN PARTY [ACTIVE]' : '+ ADD TO PARTY'}
+                            </button>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+
+                  {/* Active Real Online Players Directory (Quick Click Code) */}
+                  <div className="pt-2">
+                    <div className="text-[11px] font-mono text-sky-300 uppercase mb-1.5">
+                      Real Players Currently Registered Online (
+                      {
+                        onlineDirectory.filter((p) => p.friendCode !== friendCode)
+                          .length
+                      }
+                      )
+                    </div>
+                    {onlineDirectory.filter((p) => p.friendCode !== friendCode)
+                      .length === 0 ? (
+                      <div className="p-2.5 rounded-xl bg-slate-950/80 border border-white/5 text-[11px] font-mono text-slate-400">
+                        Waiting for other real players to connect online. Open a
+                        second tab or invite a friend to see them live!
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        {onlineDirectory
+                          .filter((p) => p.friendCode !== friendCode)
+                          .map((p) => (
+                            <div
+                              key={p.friendCode}
+                              className="p-2 rounded-lg bg-slate-950 border border-white/10 flex items-center justify-between text-xs font-mono"
+                            >
+                              <div>
+                                <div className="font-bold text-white">
+                                  {p.username}
+                                </div>
+                                <div className="text-[10px] text-amber-300">
+                                  {p.friendCode} · LVL {p.level}
+                                </div>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => setFriendCodeInput(p.friendCode)}
+                                className="px-2 py-1 rounded bg-slate-800 hover:bg-amber-500 hover:text-slate-950 text-[10px] text-amber-300 font-bold cursor-pointer"
+                              >
+                                Use Code
+                              </button>
+                            </div>
+                          ))}
+                      </div>
+                    )}
                   </div>
                 </div>
 
-                {/* Incoming & Outgoing Friend Requests */}
+                {/* Incoming & Outgoing Real Friend Requests via Code */}
                 <div className="md:col-span-5 space-y-2">
                   <div className="text-xs font-semibold text-slate-300">
-                    Friend Requests ({friendRequests.length})
+                    Real Friend Requests ({friendRequests.length})
                   </div>
                   <div className="space-y-2">
                     {friendRequests.length === 0 ? (
                       <div className="p-3 rounded-xl bg-slate-950 border border-white/5 text-xs text-slate-400 font-mono">
-                        No pending requests. Enter any username above to send a
-                        friend request!
+                        No pending friend requests. Enter a registered player&apos;s
+                        Friend Code above to send a real-time request!
                       </div>
                     ) : (
                       friendRequests.map((req) => (
                         <div
                           key={req.id}
+                          data-testid={`friend-request-card-${req.id}`}
                           className="p-2.5 rounded-xl bg-slate-900 border border-white/10 flex items-center justify-between gap-2"
                         >
                           <div>
                             <div className="text-xs font-mono font-bold text-white">
-                              {req.fromUsername === callsign
-                                ? `To: ${req.toUsername}`
-                                : `From: ${req.fromUsername}`}
+                              {req.fromCode === friendCode
+                                ? `To: ${req.toUsername} (${req.toCode})`
+                                : `From: ${req.fromUsername} (${req.fromCode})`}
                             </div>
                             <div className="text-[10px] font-mono text-amber-400 uppercase">
                               {req.status}
                             </div>
                           </div>
                           {req.status === 'pending' &&
-                            req.fromUsername !== callsign && (
+                            req.fromCode !== friendCode && (
                               <div className="flex items-center gap-1.5">
                                 <button
                                   type="button"
@@ -1928,6 +2281,7 @@ export default function App() {
                                 </button>
                                 <button
                                   type="button"
+                                  data-testid={`decline-request-${req.id}`}
                                   onClick={() =>
                                     handleRespondToFriendRequest(
                                       req.id,
@@ -2040,6 +2394,18 @@ export default function App() {
               </div>
             </div>
           )}
+
+          {/* Bottom-Right Corner Attribution Credits */}
+          <div
+            data-testid="app-credits-badge"
+            className="pointer-events-none self-end mt-2 px-3 py-1 rounded-lg border border-white/15 text-[11px] font-mono tracking-wide text-slate-300 shadow-lg"
+            style={{ backgroundColor: 'rgba(9,13,22,0.88)' }}
+          >
+            Credits:{' '}
+            <span className="font-bold text-amber-400">
+              motech11, Google LLC.
+            </span>
+          </div>
         </div>
       )}
 
@@ -2223,7 +2589,7 @@ export default function App() {
             </div>
           )}
 
-          {/* CORNER CLUSTER 1 (TOP-LEFT): Tactical Radar + Mode/Hardness/Time/Kills */}
+          {/* CORNER CLUSTER 1 (TOP-LEFT): Tactical Radar + Infinite Chunk Telemetry */}
           <div
             className="fixed top-4 left-4 rounded-xl border border-white/15 p-3 flex items-center gap-3.5"
             style={{ backgroundColor: 'rgba(9,13,22,0.86)' }}
@@ -2265,36 +2631,73 @@ export default function App() {
               })}
             </div>
 
-            <div className="flex items-center gap-4 pr-1">
-              <div>
-                <div className="text-[10px] font-mono uppercase text-sky-400">
-                  {currentModeDef.shortLabel} · {currentHardnessDef.name}
+            <div className="space-y-1 pr-1">
+              <div className="flex items-center gap-4">
+                <div>
+                  <div className="text-[10px] font-mono uppercase text-sky-400">
+                    {currentModeDef.shortLabel} · {currentHardnessDef.name}
+                  </div>
+                  <div className="text-lg font-display font-bold tabular-nums text-white">
+                    WAVE {hud.wave}/{hud.totalWaves}
+                  </div>
                 </div>
-                <div className="text-lg font-display font-bold tabular-nums text-white">
-                  WAVE {hud.wave}/{hud.totalWaves}
+                <div>
+                  <div className="text-[10px] font-mono uppercase text-slate-400">
+                    HOSTILES
+                  </div>
+                  <div className="text-lg font-display font-bold tabular-nums text-rose-400">
+                    {hud.enemiesRemaining}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[10px] font-mono uppercase text-slate-400">
+                    TIME · KILLS
+                  </div>
+                  <div className="text-lg font-display font-bold tabular-nums text-amber-400">
+                    {hud.matchElapsedSec}s · {hud.eliminations}K
+                  </div>
                 </div>
               </div>
-              <div>
-                <div className="text-[10px] font-mono uppercase text-slate-400">
-                  HOSTILES
-                </div>
-                <div className="text-lg font-display font-bold tabular-nums text-rose-400">
-                  {hud.enemiesRemaining}
-                </div>
-              </div>
-              <div>
-                <div className="text-[10px] font-mono uppercase text-slate-400">
-                  TIME · KILLS
-                </div>
-                <div className="text-lg font-display font-bold tabular-nums text-amber-400">
-                  {hud.matchElapsedSec}s · {hud.eliminations}K
-                </div>
+              <div
+                data-testid="hud-chunk-weather-badge"
+                className="text-[10px] font-mono text-emerald-300 flex items-center gap-2 border-t border-white/10 pt-1"
+              >
+                <span>CHUNK [{hud.activeChunkKey}]</span>
+                <span className="text-slate-500">·</span>
+                <span>{hud.loadedChunkCount} STREAMING</span>
+                <span className="text-slate-500">·</span>
+                <span className="text-sky-300">
+                  {weatherMode === 'light-rain-blur'
+                    ? 'LIGHT RAIN + BLUR'
+                    : weatherMode === 'storm-squall'
+                      ? 'STORM SQUALL'
+                      : 'HORIZON MIST'}
+                </span>
               </div>
             </div>
           </div>
 
           {/* CORNER CLUSTER 2 (TOP-RIGHT): Compact Utility Buttons */}
           <div className="fixed top-4 right-4 pointer-events-auto flex items-center gap-1.5">
+            <button
+              type="button"
+              tabIndex={-1}
+              data-testid="hud-weather-toggle-btn"
+              onClick={(e) => {
+                e.currentTarget.blur();
+                setWeatherMode((prev) =>
+                  prev === 'light-rain-blur'
+                    ? 'storm-squall'
+                    : prev === 'storm-squall'
+                      ? 'mist-veil'
+                      : 'light-rain-blur'
+                );
+              }}
+              className="px-2.5 h-9 rounded-lg border border-sky-400/35 flex items-center justify-center text-[10px] font-mono font-bold text-sky-300 hover:bg-slate-800 cursor-pointer"
+              style={{ backgroundColor: 'rgba(9,13,22,0.85)' }}
+            >
+              RAIN/BLUR
+            </button>
             <button
               type="button"
               tabIndex={-1}
@@ -2812,6 +3215,18 @@ export default function App() {
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {gameState !== 'title' && (
+        <div
+          data-testid="app-credits-hud-badge"
+          className="fixed bottom-0.5 right-4 z-30 pointer-events-none text-[10px] leading-none font-mono tracking-wide text-slate-400/90"
+        >
+          Credits:{' '}
+          <span className="font-semibold text-amber-400/90">
+            motech11, Google LLC.
+          </span>
         </div>
       )}
     </main>

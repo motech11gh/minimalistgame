@@ -408,5 +408,84 @@ test('calculateMatchXpAndCredits rewards faster kills-per-minute and victory cre
   assert.ok(r4v4.hpMultiplier > r1v1.hpMultiplier);
 });
 
+test('friend code generation, normalization, and infinite procedural chunk streaming work deterministically', async () => {
+  const {
+    generatePlayerFriendCode,
+    normalizeFriendCode,
+    isValidFriendCodeFormat,
+    getChunkCoordFromWorld,
+    getStreamingChunkCoords,
+    generateProceduralChunkBlueprint,
+    evaluateMovementPhysics,
+    getTerrainHeight,
+  } = await import('./rules');
 
+  // 1. Deterministic friend code from seed
+  const code1 = generatePlayerFriendCode('user-seed-alpha');
+  const code2 = generatePlayerFriendCode('user-seed-alpha');
+  const code3 = generatePlayerFriendCode('user-seed-beta');
+  assert.equal(code1, code2);
+  assert.notEqual(code1, code3);
+  assert.equal(isValidFriendCodeFormat(code1), true);
 
+  // 2. Normalization of bare code or lowercase
+  assert.equal(normalizeFriendCode('  7k9m2p '), 'VX-7K9M2P');
+  assert.equal(normalizeFriendCode('vx-ab34cd'), 'VX-AB34CD');
+  assert.equal(isValidFriendCodeFormat('7k9m2p'), true);
+  assert.equal(isValidFriendCodeFormat('!bad!'), false);
+
+  // 3. Infinite chunk coordinate mapping & streaming grid
+  assert.deepEqual(getChunkCoordFromWorld(0, 0), { cx: 0, cz: 0, key: '0,0' });
+  assert.deepEqual(getChunkCoordFromWorld(64, -128), { cx: 1, cz: -2, key: '1,-2' });
+
+  const streamGrid = getStreamingChunkCoords(64, -128, 2);
+  assert.equal(streamGrid.length, 25); // 5x5 grid around active chunk
+  assert.equal(streamGrid[0].key, '1,-2'); // Closest chunk is first
+
+  // 4. Deterministic chunk blueprint generation
+  const chunkA = generateProceduralChunkBlueprint(3, -4, 'alpine-outpost');
+  const chunkB = generateProceduralChunkBlueprint(3, -4, 'alpine-outpost');
+  assert.deepEqual(chunkA, chunkB);
+  assert.ok(chunkA.obstacles.length >= 4);
+  assert.equal(chunkA.salvageCrates.length, 2);
+  assert.ok(chunkA.trees.length > 0);
+
+  // 5. Unbounded movement far beyond the old 66m radius
+  const farState: PlayerPhysicsState = {
+    x: 240,
+    y: getTerrainHeight(240, -320, 'alpine-outpost'),
+    z: -320,
+    vx: 0,
+    vy: 0,
+    vz: -10,
+    yaw: 0,
+    pitch: 0,
+    grounded: true,
+    coyoteTimer: 0.1,
+    jumpBufferTimer: 0,
+    isSliding: false,
+    slideTimer: 0,
+    slideCooldown: 0,
+    isVaulting: false,
+    vaultTimer: 0,
+    isClimbing: false,
+    eyeHeight: 1.72,
+    stamina: 100,
+    movementMode: 'SPRINT',
+  };
+  const steppedFar = evaluateMovementPhysics(
+    farState,
+    {
+      forward: 1,
+      right: 0,
+      sprintHeld: true,
+      slideJustPressed: false,
+      jumpJustPressed: false,
+      jumpHeld: false,
+    },
+    0.05,
+    [],
+    'alpine-outpost'
+  );
+  assert.ok(Math.hypot(steppedFar.x, steppedFar.z) > 390, 'Player can travel infinitely across chunks');
+});
