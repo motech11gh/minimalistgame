@@ -53,6 +53,7 @@ import {
   stepDynamicEnvironmentEventState,
   interpolateReplayFrames,
   WORLD_CHUNK_SIZE,
+  BOT_DISCOVERY_RADIUS,
   getChunkCoordFromWorld,
   getStreamingChunkCoords,
   generateProceduralChunkBlueprint,
@@ -93,6 +94,10 @@ export interface HudTelemetrySnapshot {
   activeChunkKey: string;
   loadedChunkCount: number;
   chunksDiscovered: number;
+  discoveredByCount: number;
+  arenaSizeLabel: string;
+  useChunkStreaming: boolean;
+  brPlayersAlive: number | null;
   weatherMode: WeatherAtmosphereMode;
   activeEnvironmentEvent: {
     id: string;
@@ -694,12 +699,18 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     resetSession?: () => void;
     forceTriggerEnvironmentEvent?: () => void;
     syncLobbyAvatars?: () => void;
+    onGameStateTransition?: (nextState: GameState) => void;
   }>({});
 
   // Trigger biome rebuild when mapId changes
   useEffect(() => {
     internalRef.current.rebuildBiome?.(props.mapId);
   }, [props.mapId]);
+
+  // Immediately sync scene visibility & camera when gameState transitions
+  useEffect(() => {
+    internalRef.current.onGameStateTransition?.(props.gameState);
+  }, [props.gameState]);
 
   // Trigger weapon viewmodel & lobby avatar rebuild when weapon, attachments, skin, or party changes
   useEffect(() => {
@@ -818,6 +829,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     const cratesGroup = new THREE.Group();
     const remotePlayersGroup = new THREE.Group();
     const lobbyPartyGroup = new THREE.Group();
+    const arenaBoundaryGroup = new THREE.Group();
     const weaponRigGroup = new THREE.Group();
     const p2WeaponRigGroup = new THREE.Group();
     camera.add(weaponRigGroup);
@@ -830,7 +842,8 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       alliesGroup,
       cratesGroup,
       remotePlayersGroup,
-      lobbyPartyGroup
+      lobbyPartyGroup,
+      arenaBoundaryGroup
     );
 
     // Pooled InstancedMesh Particle Ring Buffer (36 particles)
@@ -1020,6 +1033,15 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         const gy = getTerrainHeight(slot.x, slot.z, p.mapId);
         fBuilt.root.position.set(slot.x, gy, slot.z);
         fBuilt.root.rotation.y = slot.rotY;
+
+        // Add glowing party pedestal ring under each accepted party friend's 3D avatar
+        const friendPedRing = new THREE.Mesh(
+          new THREE.TorusGeometry(1.05, 0.04, 8, 24),
+          new THREE.MeshBasicMaterial({ color: 0x10b981 })
+        );
+        friendPedRing.rotation.x = Math.PI / 2;
+        friendPedRing.position.set(slot.x, gy + 0.08, slot.z);
+        lobbyPartyGroup.add(friendPedRing);
         lobbyPartyGroup.add(fBuilt.root);
       });
     }
@@ -1136,6 +1158,9 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     let sessionEnded = false;
     let smartTargetLocked = false;
     let firedThisStep = false;
+    let brPlayersAlive = 100;
+    let brReserveBots = 0;
+    let brSimElimTimer = 0;
 
     // Dynamic Environment Event State
     let activeEnvEvent: DynamicEnvironmentEventDef | null = null;
@@ -1407,30 +1432,113 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         basePad.receiveShadow = true;
         chunkGroup.add(basePad);
 
-        const towerCore = new THREE.Mesh(
-          new THREE.BoxGeometry(4.6, 11.5, 4.6),
-          sharedStructMat
-        );
-        towerCore.position.set(0, 5.9, -18);
-        towerCore.castShadow = true;
-        towerCore.receiveShadow = true;
-        chunkGroup.add(towerCore);
+        if (biome.landmarkType === 'playground-fort') {
+          // Tactical Playground Park: Multi-deck climbing castle + spiral tube slide
+          const fortPostMat = new THREE.MeshStandardMaterial({ color: 0xd97706, roughness: 0.5 });
+          const slideMat = new THREE.MeshStandardMaterial({
+            color: 0xf43f5e,
+            roughness: 0.3,
+            metalness: 0.2,
+          });
+          const roofMat = new THREE.MeshStandardMaterial({ color: 0x2563eb, roughness: 0.4 });
+          for (const px of [-2.4, 2.4]) {
+            for (const pz of [-20.4, -15.6]) {
+              const post = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.28, 8.5, 10), fortPostMat);
+              post.position.set(px, 4.25, pz);
+              chunkGroup.add(post);
+            }
+          }
+          const deck = new THREE.Mesh(new THREE.BoxGeometry(5.6, 0.5, 5.6), sharedStructMat);
+          deck.position.set(0, 5.2, -18);
+          const pyramidRoof = new THREE.Mesh(new THREE.ConeGeometry(4.2, 3.2, 4), roofMat);
+          pyramidRoof.position.set(0, 9.8, -18);
+          pyramidRoof.rotation.y = Math.PI / 4;
+          const tubeSlide = new THREE.Mesh(new THREE.TorusGeometry(2.6, 0.65, 10, 24, Math.PI * 1.35), slideMat);
+          tubeSlide.position.set(2.8, 3.2, -18);
+          tubeSlide.rotation.x = Math.PI / 3;
+          chunkGroup.add(deck, pyramidRoof, tubeSlide);
+        } else if (biome.landmarkType === 'forest-watchtower') {
+          // Redwood Deep Forest: Tall timber fire-lookout watchtower
+          const woodMat = new THREE.MeshStandardMaterial({ color: 0x5c3a21, roughness: 0.85 });
+          for (const px of [-2.1, 2.1]) {
+            for (const pz of [-20.1, -15.9]) {
+              const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.45, 11.0, 8), woodMat);
+              leg.position.set(px, 5.5, pz);
+              chunkGroup.add(leg);
+            }
+          }
+          const cabin = new THREE.Mesh(new THREE.BoxGeometry(5.4, 3.2, 5.4), woodMat);
+          cabin.position.set(0, 11.4, -18);
+          const roof = new THREE.Mesh(new THREE.ConeGeometry(4.5, 2.6, 4), sharedTrimMat);
+          roof.position.set(0, 14.2, -18);
+          roof.rotation.y = Math.PI / 4;
+          const beacon = new THREE.Mesh(new THREE.SphereGeometry(0.9, 12, 12), sharedBeaconMat);
+          beacon.position.set(0, 15.8, -18);
+          chunkGroup.add(cabin, roof, beacon);
+        } else if (biome.landmarkType === 'water-slide-tower') {
+          // Water Splash Aqua Park: Hydro-flume tower + twin aqua slides + splash pool ring
+          const poolBasin = new THREE.Mesh(
+            new THREE.CylinderGeometry(6.8, 7.2, 0.9, 24),
+            new THREE.MeshStandardMaterial({ color: 0x0284c7, roughness: 0.2, metalness: 0.3 })
+          );
+          poolBasin.position.set(0, 0.45, -18);
+          const hydroCore = new THREE.Mesh(new THREE.CylinderGeometry(2.2, 2.6, 12, 16), sharedStructMat);
+          hydroCore.position.set(0, 6.2, -18);
+          const flumeA = new THREE.Mesh(
+            new THREE.TorusGeometry(3.4, 0.62, 10, 24, Math.PI * 1.5),
+            new THREE.MeshStandardMaterial({ color: 0x06b6d4, roughness: 0.2 })
+          );
+          flumeA.position.set(2.2, 4.8, -18);
+          flumeA.rotation.x = Math.PI / 2.6;
+          const bucketTop = new THREE.Mesh(new THREE.CylinderGeometry(1.8, 1.3, 2.4, 14), sharedBeaconMat);
+          bucketTop.position.set(0, 13.6, -18);
+          chunkGroup.add(poolBasin, hydroCore, flumeA, bucketTop);
+        } else if (biome.landmarkType === 'ferris-wheel') {
+          // Abandoned Theme Park: Giant rusted Ferris Wheel + neon hub
+          const wheelRim = new THREE.Mesh(
+            new THREE.TorusGeometry(6.2, 0.32, 10, 28),
+            sharedBeaconMat
+          );
+          wheelRim.position.set(0, 8.8, -18);
+          const legL = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.4, 10, 8), sharedStructMat);
+          legL.position.set(-2.6, 4.8, -18);
+          legL.rotation.z = -0.24;
+          const legR = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.4, 10, 8), sharedStructMat);
+          legR.position.set(2.6, 4.8, -18);
+          legR.rotation.z = 0.24;
+          chunkGroup.add(wheelRim, legL, legR);
+          for (let g = 0; g < 8; g++) {
+            const ang = (g / 8) * Math.PI * 2;
+            const gondola = new THREE.Mesh(new THREE.BoxGeometry(1.3, 1.1, 1.1), sharedTrimMat);
+            gondola.position.set(Math.cos(ang) * 6.2, 8.8 + Math.sin(ang) * 6.2, -18);
+            chunkGroup.add(gondola);
+          }
+        } else {
+          const towerCore = new THREE.Mesh(
+            new THREE.BoxGeometry(4.6, 11.5, 4.6),
+            sharedStructMat
+          );
+          towerCore.position.set(0, 5.9, -18);
+          towerCore.castShadow = true;
+          towerCore.receiveShadow = true;
+          chunkGroup.add(towerCore);
 
-        const upperRing = new THREE.Mesh(
-          new THREE.CylinderGeometry(3.8, 2.9, 1.8, 16),
-          sharedTrimMat
-        );
-        upperRing.position.set(0, 12.2, -18);
-        chunkGroup.add(upperRing);
+          const upperRing = new THREE.Mesh(
+            new THREE.CylinderGeometry(3.8, 2.9, 1.8, 16),
+            sharedTrimMat
+          );
+          upperRing.position.set(0, 12.2, -18);
+          chunkGroup.add(upperRing);
 
-        const domeCrown = new THREE.Mesh(
-          biome.landmarkType === 'cryo-monolith' || biome.landmarkType === 'obsidian-reactor'
-            ? new THREE.OctahedronGeometry(2.7, 1)
-            : new THREE.SphereGeometry(2.6, 18, 14),
-          sharedBeaconMat
-        );
-        domeCrown.position.set(0, 14.6, -18);
-        chunkGroup.add(domeCrown);
+          const domeCrown = new THREE.Mesh(
+            biome.landmarkType === 'cryo-monolith' || biome.landmarkType === 'obsidian-reactor'
+              ? new THREE.OctahedronGeometry(2.7, 1)
+              : new THREE.SphereGeometry(2.6, 18, 14),
+            sharedBeaconMat
+          );
+          domeCrown.position.set(0, 14.6, -18);
+          chunkGroup.add(domeCrown);
+        }
 
         const pedY = getTerrainHeight(0, 16, mapId);
         const pedDisc = new THREE.Mesh(
@@ -1473,7 +1581,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         chunkGroup.add(spireGroup);
       }
 
-      // 3. Procedural Chunk Cover Bunkers & Climbable Sniper Towers
+      // 3. Procedural Chunk Cover Bunkers, Themed Props & Climbable Sniper Towers
       if (sharedStructMat && sharedTrimMat && sharedBeaconMat) {
         for (const obs of bp.obstacles) {
           const cg = new THREE.Group();
@@ -1494,6 +1602,47 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           );
           stripe.position.y = obs.height - 0.12;
           cg.add(stripe);
+
+          // Add distinctive themed silhouettes on top/side of cover obstacles
+          if (obs.themePropType === 'slide') {
+            const ramp = new THREE.Mesh(
+              new THREE.BoxGeometry(1.2, 0.18, obs.height * 1.25),
+              sharedBeaconMat
+            );
+            ramp.position.set(0, obs.height * 0.55, obs.depth * 0.65);
+            ramp.rotation.x = 0.55;
+            cg.add(ramp);
+          } else if (obs.themePropType === 'swing') {
+            const topBar = new THREE.Mesh(
+              new THREE.CylinderGeometry(0.08, 0.08, obs.width + 1.2, 8),
+              sharedBeaconMat
+            );
+            topBar.rotation.z = Math.PI / 2;
+            topBar.position.y = obs.height + 1.1;
+            cg.add(topBar);
+          } else if (obs.themePropType === 'log-bunker') {
+            const logMesh = new THREE.Mesh(
+              new THREE.CylinderGeometry(0.55, 0.55, obs.width + 0.4, 10),
+              sharedTrunkMat || sharedTrimMat
+            );
+            logMesh.rotation.z = Math.PI / 2;
+            logMesh.position.y = obs.height + 0.35;
+            cg.add(logMesh);
+          } else if (obs.themePropType === 'pool-wall') {
+            const fountainJet = new THREE.Mesh(
+              new THREE.CylinderGeometry(0.18, 0.42, 1.4, 10),
+              sharedBeaconMat
+            );
+            fountainJet.position.y = obs.height + 0.7;
+            cg.add(fountainJet);
+          } else if (obs.themePropType === 'coaster-arch') {
+            const archRing = new THREE.Mesh(
+              new THREE.TorusGeometry(obs.width * 0.45, 0.12, 8, 16, Math.PI),
+              sharedBeaconMat
+            );
+            archRing.position.y = obs.height;
+            cg.add(archRing);
+          }
 
           if (obs.climbable) {
             for (let r = 0; r < 4; r++) {
@@ -1584,22 +1733,36 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
 
     function spawnChunkPatrolNpcs(cx: number, cz: number) {
       const p = propsRef.current;
-      const roster = computeTeamMatchRoster(p.battleMode, p.botHardness, currentWave);
+      const roster = computeTeamMatchRoster(
+        p.battleMode,
+        p.botHardness,
+        currentWave,
+        p.partyMembers.length
+      );
+      // Only spawn dynamic chunk patrol bots in open-world chunk-streaming modes (Practice / Battle Royale)
+      if (!roster.useChunkStreaming) return;
+
       const archetypes: NpcArchetype[] = ['rusher', 'marksman', 'flanker', 'juggernaut'];
-      const patrolCount = 2;
+      const patrolCount = p.battleMode === 'battle-royale' ? 3 : 2;
       const originX = cx * WORLD_CHUNK_SIZE;
       const originZ = cz * WORLD_CHUNK_SIZE;
 
       for (let i = 0; i < patrolCount; i++) {
+        if (p.battleMode === 'battle-royale' && brReserveBots <= 0) break;
+        if (p.battleMode === 'battle-royale') brReserveBots = Math.max(0, brReserveBots - 1);
+
         const arch = archetypes[Math.abs(cx + cz + i) % archetypes.length];
-        const nx = originX + (i === 0 ? -12 : 12);
-        const nz = originZ + (i === 0 ? -10 : 10);
+        const nx = originX + (i === 0 ? -14 : i === 1 ? 14 : 0);
+        const nz = originZ + (i === 0 ? -12 : i === 1 ? 12 : -18);
         const ny = getTerrainHeight(nx, nz, p.mapId);
         const baseHp = arch === 'juggernaut' ? 185 : 105;
         const maxHp = Math.round(baseHp * roster.hpMultiplier);
         const maxShield = arch === 'juggernaut' ? 80 : 30;
         const id = `npc-chunk-${cx}-${cz}-${i}-${Date.now()}`;
-        const callsign = `SECTOR-${Math.abs(cx)}${Math.abs(cz)}-${i + 1}`;
+        const callsign =
+          p.battleMode === 'battle-royale'
+            ? `SURVIVOR-${Math.max(2, brPlayersAlive - i)}`
+            : `SECTOR-${Math.abs(cx)}${Math.abs(cz)}-${i + 1}`;
         const npc: NpcEntity = {
           id,
           callsign,
@@ -1614,7 +1777,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           maxHp,
           shield: maxShield,
           maxShield,
-          state: 'seek',
+          state: 'patrol',
           windupTimer: 0.45,
           attackCooldown: 1.35 * roster.fireCooldownMultiplier,
           koTimer: 0,
@@ -1629,13 +1792,75 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       }
     }
 
+    function rebuildArenaBoundaryPerimeter(mapId: MapId) {
+      while (arenaBoundaryGroup.children.length > 0) {
+        arenaBoundaryGroup.remove(arenaBoundaryGroup.children[0]);
+      }
+      const p = propsRef.current;
+      const roster = computeTeamMatchRoster(
+        p.battleMode,
+        p.botHardness,
+        currentWave,
+        p.partyMembers.length
+      );
+      if (roster.useChunkStreaming) return;
+
+      const r = roster.arenaRadius;
+      const biome = BIOMES[mapId] || BIOMES['alpine-outpost'];
+      const railMat = new THREE.MeshBasicMaterial({
+        color: biome.accentHex,
+        transparent: true,
+        opacity: 0.42,
+      });
+      const postMat = new THREE.MeshStandardMaterial({
+        color: 0x0f172a,
+        metalness: 0.7,
+        roughness: 0.3,
+      });
+
+      const corners = [
+        { x: -r, z: -r },
+        { x: r, z: -r },
+        { x: r, z: r },
+        { x: -r, z: r },
+      ];
+      for (const c of corners) {
+        const py = getTerrainHeight(c.x, c.z, mapId);
+        const pylon = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.65, 6.5, 8), postMat);
+        pylon.position.set(c.x, py + 3.25, c.z);
+        const beacon = new THREE.Mesh(new THREE.OctahedronGeometry(0.7, 0), railMat);
+        beacon.position.set(c.x, py + 7.0, c.z);
+        arenaBoundaryGroup.add(pylon, beacon);
+      }
+
+      const span = r * 2;
+      const northRail = new THREE.Mesh(new THREE.BoxGeometry(span, 2.2, 0.18), railMat);
+      northRail.position.set(0, getTerrainHeight(0, -r, mapId) + 1.1, -r);
+      const southRail = new THREE.Mesh(new THREE.BoxGeometry(span, 2.2, 0.18), railMat);
+      southRail.position.set(0, getTerrainHeight(0, r, mapId) + 1.1, r);
+      const eastRail = new THREE.Mesh(new THREE.BoxGeometry(0.18, 2.2, span), railMat);
+      eastRail.position.set(r, getTerrainHeight(r, 0, mapId) + 1.1, 0);
+      const westRail = new THREE.Mesh(new THREE.BoxGeometry(0.18, 2.2, span), railMat);
+      westRail.position.set(-r, getTerrainHeight(-r, 0, mapId) + 1.1, 0);
+      arenaBoundaryGroup.add(northRail, southRail, eastRail, westRail);
+    }
+
     function syncInfiniteChunks(
       centerX: number,
       centerZ: number,
       mapId: MapId,
       forceRebuild = false
     ) {
-      const centerChunk = getChunkCoordFromWorld(centerX, centerZ);
+      const p = propsRef.current;
+      const roster = computeTeamMatchRoster(
+        p.battleMode,
+        p.botHardness,
+        currentWave,
+        p.partyMembers.length
+      );
+      const centerChunk = roster.useChunkStreaming
+        ? getChunkCoordFromWorld(centerX, centerZ)
+        : { cx: 0, cz: 0 };
       const nextKey = `${centerChunk.cx},${centerChunk.cz}`;
 
       if (!forceRebuild && nextKey === currentPlayerChunkKey && loadedChunks.size > 0) {
@@ -1647,12 +1872,19 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
 
       if (!discoveredChunkKeys.has(nextKey)) {
         discoveredChunkKeys.add(nextKey);
-        if (propsRef.current.gameState === 'playing' && prevKey !== nextKey) {
+        if (
+          p.gameState === 'playing' &&
+          prevKey !== nextKey &&
+          roster.useChunkStreaming
+        ) {
           spawnChunkPatrolNpcs(centerChunk.cx, centerChunk.cz);
         }
       }
 
-      const desiredCoords = getStreamingChunkCoords(centerX, centerZ, 2);
+      // Fixed-player modes (1v1, 2v2, 3v3, 4v4, party-vs) use a bounded tailored map without chunk streaming
+      const desiredCoords = roster.useChunkStreaming
+        ? getStreamingChunkCoords(centerX, centerZ, 2)
+        : getStreamingChunkCoords(0, 0, roster.arenaRadius > 32 ? 1 : 0);
       const desiredKeySet = new Set(desiredCoords.map((c) => c.key));
 
       // Unload chunks outside the active streaming radius
@@ -1671,14 +1903,14 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         }
       }
 
-      // Stream in any missing chunks in the 5x5 grid around the player
+      // Stream in any missing chunks
       for (const coord of desiredCoords) {
         if (!loadedChunks.has(coord.key)) {
           const entry = buildSingleChunkRecord(
             coord.cx,
             coord.cz,
             mapId,
-            forceRebuild
+            forceRebuild || !roster.useChunkStreaming
           );
           loadedChunks.set(coord.key, entry);
         }
@@ -1688,8 +1920,24 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       const nextObstacles: ObstacleBox[] = [];
       const nextCrates: SalvageNode[] = [];
       for (const entry of loadedChunks.values()) {
-        nextObstacles.push(...entry.obstacles);
-        nextCrates.push(...entry.crates);
+        for (const obs of entry.obstacles) {
+          if (
+            roster.useChunkStreaming ||
+            (Math.abs(obs.x) <= roster.arenaRadius - 1.5 &&
+              Math.abs(obs.z) <= roster.arenaRadius - 1.5)
+          ) {
+            nextObstacles.push(obs);
+          }
+        }
+        for (const crate of entry.crates) {
+          if (
+            roster.useChunkStreaming ||
+            (Math.abs(crate.x) <= roster.arenaRadius - 1.5 &&
+              Math.abs(crate.z) <= roster.arenaRadius - 1.5)
+          ) {
+            nextCrates.push(crate);
+          }
+        }
       }
       staticObstacles = nextObstacles;
       salvageNodes = nextCrates;
@@ -1770,6 +2018,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       discoveredChunkKeys.clear();
       discoveredChunkKeys.add('0,0');
       syncInfiniteChunks(playerState.x, playerState.z, mapId, true);
+      rebuildArenaBoundaryPerimeter(mapId);
       syncLobbyAvatars();
     }
 
@@ -1820,20 +2069,113 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       allyNpcs = [];
 
       const p = propsRef.current;
-      const roster = computeTeamMatchRoster(p.battleMode, p.botHardness, waveNum);
+      const roster = computeTeamMatchRoster(
+        p.battleMode,
+        p.botHardness,
+        waveNum,
+        p.partyMembers.length
+      );
       totalWavesInMatch = roster.totalWaves;
       const archetypes: NpcArchetype[] = ['rusher', 'marksman', 'flanker', 'juggernaut'];
 
-      for (let i = 0; i < roster.enemyCount; i++) {
+      // Special Case 1: Party Mode (Play vs the friend(s) in your party!)
+      if (p.battleMode === 'party-vs') {
+        const partyRivals =
+          p.partyMembers.length > 0
+            ? p.partyMembers
+            : [
+                {
+                  friendCode: 'PRTY-01',
+                  username: 'PARTY-RIVAL-01',
+                  level: 5,
+                  skinId: 'vanguard-obsidian' as SkinId,
+                  status: 'in-match' as const,
+                  online: true,
+                },
+              ];
+
+        for (let i = 0; i < partyRivals.length; i++) {
+          const rival = partyRivals[i];
+          const rSkin = OPERATOR_SKINS[rival.skinId] || OPERATOR_SKINS['vanguard-obsidian'];
+          const angle = ((i / Math.max(1, partyRivals.length)) - 0.5) * Math.PI * 0.55;
+          const dist = 21; // Within 25-block discovery zone for immediate Party Duel
+          const nx = playerState.x + Math.sin(angle) * dist;
+          const nz = playerState.z - Math.cos(angle) * dist;
+          const ny = getTerrainHeight(nx, nz, p.mapId);
+          const id = `npc-party-rival-${i}`;
+          const npc: NpcEntity = {
+            id,
+            callsign: `${rival.username} [PARTY RIVAL]`,
+            archetype: 'marksman',
+            x: nx,
+            y: ny,
+            z: nz,
+            vx: 0,
+            vz: 0,
+            rotY: 0,
+            hp: Math.round(125 * roster.hpMultiplier),
+            maxHp: Math.round(125 * roster.hpMultiplier),
+            shield: 65,
+            maxShield: 65,
+            state: 'seek',
+            windupTimer: 0.45,
+            attackCooldown: 1.15 * roster.fireCooldownMultiplier,
+            koTimer: 0,
+            hitFlashTimer: 0,
+            strafeSign: i % 2 === 0 ? 1 : -1,
+          };
+          npcs.push(npc);
+          const built = buildOperatorCharacterGroup('marksman', contactShadowTex, {
+            primary: rSkin.primaryHex,
+            secondary: rSkin.secondaryHex,
+            visor: rSkin.visorHex,
+          });
+          built.root.position.set(nx, ny, nz);
+          npcsGroup.add(built.root);
+          npcMeshMap.set(id, built);
+        }
+        return;
+      }
+
+      // Special Case 2: 100-Player Battle Royale (100 total combatants across huge chunk map)
+      const activeSpawnCount =
+        p.battleMode === 'battle-royale' ? 18 : roster.enemyCount;
+
+      if (p.battleMode === 'battle-royale' && waveNum === 1) {
+        brPlayersAlive = 100;
+        brReserveBots = Math.max(0, 99 - activeSpawnCount);
+        brSimElimTimer = 4.5;
+      }
+
+      for (let i = 0; i < activeSpawnCount; i++) {
         let arch: NpcArchetype = archetypes[i % 3];
-        if ((p.botHardness === 'master' || p.botHardness === 'legend' || p.trainingLevel >= 2) && i % 4 === 3) {
+        if (
+          (p.botHardness === 'master' || p.botHardness === 'legend' || p.trainingLevel >= 2) &&
+          i % 4 === 3
+        ) {
           arch = 'juggernaut';
         }
 
-        const angle = ((i / Math.max(1, roster.enemyCount)) - 0.5) * Math.PI * 0.92;
-        const dist = 26 + (i % 3) * 11;
-        const nx = playerState.x + Math.sin(angle) * dist;
-        const nz = playerState.z - Math.cos(angle) * dist - 8;
+        // In 1v1 / 2v2 / 3v3 / 4v4, place initial bots near the 25-block discovery boundary
+        // In Battle Royale, spread bots from 22m out to 110m so distant bots patrol peacefully (>25 blocks)
+        const angle =
+          p.battleMode === 'battle-royale'
+            ? (i / activeSpawnCount) * Math.PI * 2
+            : ((i / Math.max(1, activeSpawnCount)) - 0.5) * Math.PI * 0.85;
+        const dist =
+          p.battleMode === 'battle-royale'
+            ? 21 + (i % 6) * 15
+            : Math.min(roster.arenaRadius - 4, 21 + (i % 3) * 6);
+        const nx = THREE.MathUtils.clamp(
+          playerState.x + Math.sin(angle) * dist,
+          -roster.arenaRadius + 3,
+          roster.arenaRadius - 3
+        );
+        const nz = THREE.MathUtils.clamp(
+          playerState.z - Math.cos(angle) * dist - 4,
+          -roster.arenaRadius + 3,
+          roster.arenaRadius - 3
+        );
         const ny = getTerrainHeight(nx, nz, p.mapId);
 
         const baseHp = arch === 'juggernaut' ? 190 : arch === 'rusher' ? 95 : 110;
@@ -1841,7 +2183,12 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         const maxShield = arch === 'juggernaut' ? 90 : arch === 'flanker' ? 35 : 0;
 
         const id = `npc-w${waveNum}-${i}`;
-        const callsign = `${arch.toUpperCase()}-${String(i + 1).padStart(2, '0')}`;
+        const callsign =
+          p.battleMode === 'battle-royale'
+            ? `BR-OP-${String(i + 2).padStart(3, '0')}`
+            : activeSpawnCount === 1
+              ? `DUELIST-01`
+              : `${arch.toUpperCase()}-${String(i + 1).padStart(2, '0')}`;
         const npc: NpcEntity = {
           id,
           callsign,
@@ -1856,7 +2203,7 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           maxHp,
           shield: maxShield,
           maxShield,
-          state: 'seek',
+          state: 'patrol',
           windupTimer: 0.45,
           attackCooldown: (1.2 + (i % 4) * 0.45) * roster.fireCooldownMultiplier,
           koTimer: 0,
@@ -1871,16 +2218,17 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
         npcMeshMap.set(id, built);
       }
 
-      // Only spawn real party friends added by the player (zero fake bot friends)
-      const realPartyAllies = p.partyMembers.slice(0, Math.max(1, roster.allyCount));
-      for (let a = 0; a < realPartyAllies.length; a++) {
-        const partyFriend = realPartyAllies[a];
-        if (!partyFriend) continue;
-        const allyCallsign = partyFriend.username;
-        const allySkinId: SkinId = partyFriend.skinId || 'alpine-ghost';
+      // Spawn exact ally count for 2v2 (1 ally), 3v3 (2 allies), 4v4 (3 allies), 1v1 (0 allies)
+      const desiredAllies = roster.allyCount;
+      for (let a = 0; a < desiredAllies; a++) {
+        const partyFriend = p.partyMembers[a];
+        const allyCallsign = partyFriend
+          ? partyFriend.username
+          : `WINGMAN-0${a + 1}`;
+        const allySkinId: SkinId = partyFriend?.skinId || 'alpine-ghost';
         const skinDef = OPERATOR_SKINS[allySkinId] || OPERATOR_SKINS['alpine-ghost'];
-        const ax = playerState.x + (a % 2 === 0 ? -1 : 1) * (4.5 + a * 2.5);
-        const az = playerState.z - 4 - a * 2;
+        const ax = playerState.x + (a % 2 === 0 ? -1 : 1) * (4.2 + a * 2.2);
+        const az = playerState.z - 3.5 - a * 1.8;
         const ay = getTerrainHeight(ax, az, p.mapId);
         const allyId = `ally-w${waveNum}-${a}`;
 
@@ -1920,7 +2268,12 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
 
     function resetSession() {
       const p = propsRef.current;
-      const roster = computeTeamMatchRoster(p.battleMode, p.botHardness, 1);
+      const roster = computeTeamMatchRoster(
+        p.battleMode,
+        p.botHardness,
+        1,
+        p.partyMembers.length
+      );
       const stats = computeWeaponStats(
         p.weaponId,
         {
@@ -1934,8 +2287,8 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
 
       playerState = {
         x: 0,
-        y: getTerrainHeight(0, 20, p.mapId),
-        z: 20,
+        y: getTerrainHeight(0, 10, p.mapId),
+        z: 10,
         vx: 0,
         vy: 0,
         vz: 0,
@@ -1956,8 +2309,8 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       };
       p2State = {
         x: 3.6,
-        y: getTerrainHeight(3.6, 20, p.mapId),
-        z: 20,
+        y: getTerrainHeight(3.6, 10, p.mapId),
+        z: 10,
         vx: 0,
         vy: 0,
         vz: 0,
@@ -2014,6 +2367,8 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
       wallMeshMap.clear();
       localBuiltWalls = [];
 
+      syncInfiniteChunks(playerState.x, playerState.z, p.mapId, true);
+      rebuildArenaBoundaryPerimeter(p.mapId);
       spawnWaveNpcs(1);
       captureReplayFrame(true);
       publishReplayRecording();
@@ -2025,6 +2380,50 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
     internalRef.current.syncLobbyAvatars = syncLobbyAvatars;
     internalRef.current.forceTriggerEnvironmentEvent = () => {
       pendingForceEnvEvent = true;
+    };
+    internalRef.current.onGameStateTransition = (nextState: GameState) => {
+      const p = propsRef.current;
+      if (nextState === 'playing') {
+        resetSession();
+        const isSplit = p.battleMode === 'coop-splitscreen';
+        replayOperatorAvatar.root.visible = isSplit;
+        lobbyPartyGroup.visible = false;
+        npcsGroup.visible = true;
+        alliesGroup.visible = true;
+        remotePlayersGroup.visible = true;
+        weaponRigGroup.visible = true;
+        p2WeaponRigGroup.visible = isSplit;
+        p2OperatorAvatar.root.visible = isSplit;
+        camera.fov = 70;
+        camera.updateProjectionMatrix();
+        camera.position.set(
+          playerState.x,
+          playerState.y + playerState.eyeHeight,
+          playerState.z
+        );
+        camera.rotation.order = 'YXZ';
+        camera.rotation.set(playerState.pitch, playerState.yaw, 0);
+        renderer.render(scene, camera);
+      } else if (nextState === 'title') {
+        weaponRigGroup.visible = false;
+        p2WeaponRigGroup.visible = false;
+        wallPreviewMesh.visible = false;
+        p2OperatorAvatar.root.visible = false;
+        weatherInstanced.visible = false;
+        npcsGroup.visible = false;
+        alliesGroup.visible = false;
+        remotePlayersGroup.visible = false;
+        lobbyPartyGroup.visible = true;
+        const pedY = getTerrainHeight(0, 16, p.mapId);
+        replayOperatorAvatar.root.visible = true;
+        replayOperatorAvatar.root.position.set(0, pedY + 0.16, 16);
+        replayOperatorAvatar.root.rotation.y = 0;
+        camera.fov = 56;
+        camera.updateProjectionMatrix();
+        camera.position.set(0, pedY + 1.55, 20.65);
+        camera.lookAt(0, pedY + 1.24, 15.8);
+        renderer.render(scene, camera);
+      }
     };
 
     buildBiomeScene(propsRef.current.mapId);
@@ -2341,6 +2740,9 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
             playerEliminations += 1;
             playerScore += hitHead ? 150 : 100;
             playerSalvage += 18;
+            if (p.battleMode === 'battle-royale') {
+              brPlayersAlive = Math.max(1, brPlayersAlive - 1);
+            }
             soundEngine.playHitMarker(true);
             spawnParticles(closestNpc.x, closestNpc.y + 1.2, closestNpc.z, 18, 0xf97316, 8);
             recordReplayHighlight(
@@ -2997,6 +3399,12 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           const eventSpeedMult = activeEnvEvent ? activeEnvEvent.speedMultiplier : 1.0;
           const eventJumpMult = activeEnvEvent ? activeEnvEvent.jumpMultiplier : 1.0;
 
+          const activeRoster = computeTeamMatchRoster(
+            p.battleMode,
+            p.botHardness,
+            currentWave,
+            p.partyMembers.length
+          );
           const prevMode = playerState.movementMode;
           playerState = evaluateMovementPhysics(
             playerState,
@@ -3027,13 +3435,16 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
               jumpMultiplier: eventJumpMult,
               smartParkour:
                 p.smartControl.enabled && p.smartControl.autoSprintAndParkour,
+              arenaRadius: activeRoster.useChunkStreaming
+                ? undefined
+                : activeRoster.arenaRadius,
             },
             simDt,
             allObstacles,
             p.mapId
           );
 
-          // Dynamically stream infinite 64m x 64m chunks around the player's current world position
+          // Dynamically stream infinite 64m x 64m chunks when in open-world modes
           syncInfiniteChunks(playerState.x, playerState.z, p.mapId, false);
 
           if (playerState.movementMode !== prevMode) {
@@ -3250,9 +3661,24 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
             }
           }
 
-          // Step Enemy AI NPCs with Bot Hardness Scaling & Crowd Attack Token Pool
-          const roster = computeTeamMatchRoster(p.battleMode, p.botHardness, currentWave);
+          // Step Enemy AI NPCs with 25-Block Discovery Zone, Bot Hardness Scaling & Crowd Attack Token Pool
+          const roster = computeTeamMatchRoster(
+            p.battleMode,
+            p.botHardness,
+            currentWave,
+            p.partyMembers.length
+          );
           let activeWindups = npcs.filter((n) => n.state === 'windup' && n.hp > 0).length;
+
+          // In 100-Player Battle Royale, simulate distant sector skirmishes & replenish active bots from reserve pool
+          if (p.battleMode === 'battle-royale' && brPlayersAlive > 1) {
+            brSimElimTimer -= simDt;
+            if (brSimElimTimer <= 0 && brReserveBots > 0) {
+              brSimElimTimer = 3.2 + Math.random() * 2.4;
+              brReserveBots = Math.max(0, brReserveBots - 1);
+              brPlayersAlive = Math.max(2, brPlayersAlive - 1);
+            }
+          }
 
           for (const npc of npcs) {
             const meshEntry = npcMeshMap.get(npc.id);
@@ -3281,7 +3707,8 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
               playerState,
               simDt,
               roster.speedMultiplier,
-              activeWindups < roster.maxConcurrentWindups
+              activeWindups < roster.maxConcurrentWindups,
+              BOT_DISCOVERY_RADIUS
             );
 
             npc.vx = decision.nextVx;
@@ -3402,7 +3829,28 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
 
           // Check Wave Completion / Victory
           const aliveCount = npcs.filter((n) => n.hp > 0).length;
-          if (aliveCount === 0 && !sessionEnded) {
+          if (p.battleMode === 'battle-royale') {
+            if (aliveCount === 0 && brReserveBots > 0) {
+              spawnChunkPatrolNpcs(0, 0);
+            }
+            if ((brPlayersAlive <= 1 || (aliveCount === 0 && brReserveBots <= 0)) && !sessionEnded) {
+              brPlayersAlive = 1;
+              sessionEnded = true;
+              recordReplayHighlight('WAVE_CLEAR', `Battle Royale #1 Victory`, '#10b981');
+              captureReplayFrame(true);
+              publishReplayRecording();
+              document.exitPointerLock?.();
+              soundEngine.playOutcomeSting(true);
+              p.onStateChange('gameover', {
+                victory: true,
+                score: playerScore + 650,
+                eliminations: playerEliminations,
+                wallsConstructed: wallsConstructedCount,
+                waveReached: 1,
+                durationSec: Math.max(1, Math.round(matchElapsedSec)),
+              });
+            }
+          } else if (aliveCount === 0 && !sessionEnded) {
             if (currentWave < totalWavesInMatch) {
               currentWave += 1;
               playerSalvage += 45;
@@ -3753,6 +4201,18 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           p.stimBuff
         );
 
+        const hudRoster = computeTeamMatchRoster(
+          p.battleMode,
+          p.botHardness,
+          currentWave,
+          p.partyMembers.length
+        );
+        const discoveredByCount = npcs.filter(
+          (n) =>
+            n.hp > 0 &&
+            Math.hypot(n.x - playerState.x, n.z - playerState.z) <= BOT_DISCOVERY_RADIUS
+        ).length;
+
         p.onHudUpdate({
           hp: Math.round(playerHp),
           maxHp: playerMaxHp,
@@ -3773,8 +4233,12 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           wave: currentWave,
           totalWaves: totalWavesInMatch,
           matchElapsedSec: Math.round(matchElapsedSec),
-          enemiesRemaining: npcs.filter((n) => n.hp > 0).length,
-          totalEnemiesInWave: npcs.length,
+          enemiesRemaining:
+            p.battleMode === 'battle-royale'
+              ? Math.max(0, brPlayersAlive - 1)
+              : npcs.filter((n) => n.hp > 0).length,
+          totalEnemiesInWave:
+            p.battleMode === 'battle-royale' ? 100 : npcs.length,
           score: Math.round(playerScore),
           eliminations: playerEliminations,
           wallsConstructed: wallsConstructedCount,
@@ -3787,6 +4251,10 @@ export const ThreeArena: React.FC<ThreeArenaProps> = (props) => {
           activeChunkKey: currentPlayerChunkKey,
           loadedChunkCount: loadedChunks.size,
           chunksDiscovered: discoveredChunkKeys.size,
+          discoveredByCount,
+          arenaSizeLabel: hudRoster.arenaSizeLabel,
+          useChunkStreaming: hudRoster.useChunkStreaming,
+          brPlayersAlive: p.battleMode === 'battle-royale' ? brPlayersAlive : null,
           weatherMode: p.weatherMode,
           activeEnvironmentEvent: activeEnvEvent
             ? {

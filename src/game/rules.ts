@@ -99,9 +99,9 @@ export function computeWeaponStats(
 }
 
 /**
- * Continuous deterministic terrain height function across infinite (x, z) coordinates.
+ * Continuous deterministic terrain height function across (x, z) coordinates.
  * Keeps the central spawn/pedestal area around (0, 0) level while sculpting seamless
- * rolling hills, valleys, and ridges across all streamed world chunks.
+ * rolling hills, valleys, and ridges across all world chunks.
  */
 export function getTerrainHeight(x: number, z: number, mapId: MapId): number {
   const biome = BIOMES[mapId] || BIOMES['alpine-outpost'];
@@ -127,11 +127,12 @@ export interface MovementInput {
   speedMultiplier?: number;
   jumpMultiplier?: number;
   smartParkour?: boolean;
+  arenaRadius?: number;
 }
 
 /**
  * Steps player movement including Walking, Sprinting, Sliding, Vaulting over waist-high cover,
- * and Climbing tall walls/ramparts.
+ * Climbing tall walls/ramparts, and optional mode-scaled arena boundary clamping.
  */
 export function evaluateMovementPhysics(
   state: PlayerPhysicsState,
@@ -155,7 +156,6 @@ export function evaluateMovementPhysics(
   // Forward and right unit vectors in XZ plane
   const sinYaw = Math.sin(next.yaw);
   const cosYaw = Math.cos(next.yaw);
-  // In Three.js right-handed camera: -Z is forward when yaw=0
   const forwardX = -sinYaw;
   const forwardZ = -cosYaw;
   const rightX = cosYaw;
@@ -238,7 +238,6 @@ export function evaluateMovementPhysics(
   const autoVault = Boolean(input.smartParkour && input.forward > 0.65 && next.grounded);
 
   if ((input.jumpHeld || autoClimb) && frontClimbable && input.forward > 0.1) {
-    // Climbing tall obstacle/rampart
     next.isClimbing = true;
     next.isVaulting = false;
     next.isSliding = false;
@@ -251,7 +250,6 @@ export function evaluateMovementPhysics(
     frontVaultable &&
     next.y < frontVaultable.y + frontVaultable.height - 0.1
   ) {
-    // Vaulting waist-high cover or barricade
     next.isVaulting = true;
     next.isClimbing = false;
     next.isSliding = false;
@@ -262,7 +260,6 @@ export function evaluateMovementPhysics(
     next.vx = forwardX * 8.5;
     next.vz = forwardZ * 8.5;
   } else if (next.jumpBufferTimer > 0 && next.coyoteTimer > 0) {
-    // Standard Jump
     next.vy = 8.4 * jumpMult;
     next.grounded = false;
     next.coyoteTimer = 0;
@@ -290,10 +287,17 @@ export function evaluateMovementPhysics(
     next.vy -= 21.0 * dt;
   }
 
-  // Candidate position (unbounded for infinite chunked world exploration)
+  // Candidate position
   let candX = next.x + next.vx * dt;
   let candZ = next.z + next.vz * dt;
   let candY = next.y + next.vy * dt;
+
+  // Enforce mode-specific arena boundary if a finite arenaRadius (< 1000m) is active
+  if (input.arenaRadius && input.arenaRadius < 1000) {
+    const bound = Math.max(18, input.arenaRadius);
+    candX = Math.max(-bound, Math.min(bound, candX));
+    candZ = Math.max(-bound, Math.min(bound, candZ));
+  }
 
   // Resolve horizontal & top-surface collisions with obstacles
   let supportY = getTerrainHeight(candX, candZ, mapId);
@@ -307,13 +311,11 @@ export function evaluateMovementPhysics(
 
     if (Math.abs(dx) < halfW && Math.abs(dz) < halfD) {
       const obsTop = obs.y + obs.height;
-      // If player feet are near or above the top of the obstacle, stand on top of it
       if (next.y >= obsTop - 0.55 || next.isVaulting || next.isClimbing) {
         if (candY <= obsTop + 0.05 && next.vy <= 0) {
           supportY = Math.max(supportY, obsTop);
         }
       } else if (candY < obsTop - 0.1) {
-        // Push out along shallowest axis
         const overlapX = halfW - Math.abs(dx);
         const overlapZ = halfD - Math.abs(dz);
         if (overlapX < overlapZ) {
@@ -432,24 +434,46 @@ export function evaluateLipinskiRuleOfFive(compound: {
 }
 
 /**
+ * Anti-Chaos Bot Discovery Radius: 25 blocks (25 meters).
+ * Bots ONLY discover, aggro, chase, and fire at the player when within 25 blocks.
+ * Outside 25 blocks, bots patrol their local sector calmly so there is zero cross-map chaos.
+ */
+export const BOT_DISCOVERY_RADIUS = 25;
+
+export function isWithinBotDiscoveryZone(
+  botX: number,
+  botZ: number,
+  targetX: number,
+  targetZ: number,
+  discoveryRadius = BOT_DISCOVERY_RADIUS
+): boolean {
+  return Math.hypot(targetX - botX, targetZ - botZ) <= discoveryRadius;
+}
+
+/**
  * Distinct AI NPC movement & attack decision policies across 4 archetypes:
  * - rusher: aggressive close-quarters advance
- * - marksman: maintains 22-34m standoff range and kites back if player closes in
+ * - marksman: maintains 16-24m standoff range and kites back if player closes in
  * - flanker: orbits laterally around the player to bypass frontal walls
  * - juggernaut: steady shielded march with high-damage suppression
+ *
+ * Enforces the 25-block (25m) discovery zone (`BOT_DISCOVERY_RADIUS`):
+ * If `dist > discoveryRadius`, the bot does NOT discover or fire at the player (`state: 'patrol'`).
  */
 export function stepAiDecisionPolicy(
   npc: NpcEntity,
   playerPos: { x: number; y: number; z: number },
   dt: number,
   speedMult: number,
-  canAcquireAttackToken: boolean
+  canAcquireAttackToken: boolean,
+  discoveryRadius = BOT_DISCOVERY_RADIUS
 ): {
   nextVx: number;
   nextVz: number;
   nextRotY: number;
   nextState: NpcEntity['state'];
   triggerFire: boolean;
+  discoveredPlayer: boolean;
 } {
   const dx = playerPos.x - npc.x;
   const dz = playerPos.z - npc.z;
@@ -459,8 +483,6 @@ export function stepAiDecisionPolicy(
   const perpX = -dirZ * npc.strafeSign;
   const perpZ = dirX * npc.strafeSign;
 
-  const targetRotY = Math.atan2(dx, dz);
-
   if (npc.hp <= 0 || npc.state === 'ko') {
     return {
       nextVx: 0,
@@ -468,9 +490,25 @@ export function stepAiDecisionPolicy(
       nextRotY: npc.rotY,
       nextState: 'ko',
       triggerFire: false,
+      discoveredPlayer: false,
     };
   }
 
+  // 25-Block Discovery Zone Check: Outside 25 blocks, bots patrol locally without aggro or chaos
+  if (dist > discoveryRadius) {
+    const patrolAngle = npc.rotY + npc.strafeSign * 0.45 * dt;
+    const patrolSpeed = 1.65 * speedMult;
+    return {
+      nextVx: Math.sin(patrolAngle) * patrolSpeed,
+      nextVz: Math.cos(patrolAngle) * patrolSpeed,
+      nextRotY: patrolAngle,
+      nextState: 'patrol',
+      triggerFire: false,
+      discoveredPlayer: false,
+    };
+  }
+
+  const targetRotY = Math.atan2(dx, dz);
   let baseSpeed = 4.2 * speedMult;
   let moveX = 0;
   let moveZ = 0;
@@ -483,12 +521,12 @@ export function stepAiDecisionPolicy(
     moveZ = dirZ * baseSpeed + perpZ * 1.4;
   } else if (npc.archetype === 'marksman') {
     baseSpeed = 3.9 * speedMult;
-    preferredRange = 32;
-    if (dist < 16) {
+    preferredRange = 22;
+    if (dist < 14) {
       // Kite backward away from player
       moveX = -dirX * baseSpeed + perpX * 1.8;
       moveZ = -dirZ * baseSpeed + perpZ * 1.8;
-    } else if (dist > 34) {
+    } else if (dist > 23) {
       moveX = dirX * baseSpeed;
       moveZ = dirZ * baseSpeed;
     } else {
@@ -498,7 +536,6 @@ export function stepAiDecisionPolicy(
   } else if (npc.archetype === 'flanker') {
     baseSpeed = 5.4 * speedMult;
     preferredRange = 16;
-    // Strong lateral orbit vector to flank around player's built walls
     const approachWeight = dist > 16 ? 0.55 : 0.15;
     moveX = (dirX * approachWeight + perpX * 0.95) * baseSpeed;
     moveZ = (dirZ * approachWeight + perpZ * 0.95) * baseSpeed;
@@ -521,7 +558,7 @@ export function stepAiDecisionPolicy(
       nextState = 'recover';
     }
   } else if (
-    dist <= preferredRange + 10 &&
+    dist <= Math.min(discoveryRadius, preferredRange + 8) &&
     npc.attackCooldown <= 0 &&
     canAcquireAttackToken
   ) {
@@ -535,7 +572,8 @@ export function stepAiDecisionPolicy(
     nextVz: moveZ,
     nextRotY: targetRotY,
     nextState,
-    triggerFire: triggerFire,
+    triggerFire,
+    discoveredPlayer: true,
   };
 }
 
@@ -584,7 +622,6 @@ export function parseStandardGamepadState(
   deadzone = 0.16
 ): ParsedGamepadFrame {
   const lx = applyThumbstickDeadzone(axes[0] ?? 0, deadzone);
-  // Standard gamepad axis[1] is -1 up (forward), +1 down (backward)
   const ly = applyThumbstickDeadzone(-(axes[1] ?? 0), deadzone);
   const rx = applyThumbstickDeadzone(axes[2] ?? 0, deadzone);
   const ry = applyThumbstickDeadzone(-(axes[3] ?? 0), deadzone);
@@ -641,8 +678,6 @@ export function parseStandardGamepadState(
 
 /**
  * Evaluates Smart Target Magnetism & Aim Assist for smooth cross-platform play.
- * Gently pulls yaw/pitch toward the closest hostile within the acquisition cone
- * and signals whether the reticle is tightly locked for Smart Auto-Fire.
  */
 export function evaluateSmartAimAssist(
   player: { x: number; y: number; z: number; eyeHeight: number; yaw: number; pitch: number },
@@ -660,7 +695,6 @@ export function evaluateSmartAimAssist(
   const eyeY = player.y + player.eyeHeight;
   const eyeZ = player.z;
 
-  // Player look unit vector from yaw & pitch (Three.js YXZ convention: -Z is forward at yaw=0)
   const cosPitch = Math.cos(player.pitch);
   const lookX = -Math.sin(player.yaw) * cosPitch;
   const lookY = Math.sin(player.pitch);
@@ -675,7 +709,7 @@ export function evaluateSmartAimAssist(
   for (const npc of npcs) {
     if (npc.hp <= 0 || npc.state === 'ko') continue;
     const tx = npc.x - eyeX;
-    const ty = npc.y + 1.38 - eyeY; // Aim at upper torso / neck
+    const ty = npc.y + 1.38 - eyeY;
     const tz = npc.z - eyeZ;
     const dist = Math.hypot(tx, ty, tz);
     if (dist < 0.5 || dist > maxRange) continue;
@@ -687,7 +721,6 @@ export function evaluateSmartAimAssist(
     const dot = Math.max(-1, Math.min(1, lookX * dirX + lookY * dirY + lookZ * dirZ));
     const angle = Math.acos(dot);
 
-    // Acquisition cone of ~13.5 degrees (0.235 rad)
     if (angle <= 0.235) {
       const score = (0.24 - angle) * 100 - dist * 0.15;
       if (score > bestScore) {
@@ -786,8 +819,7 @@ export function stepDynamicEnvironmentEventState(
 }
 
 /**
- * Smoothly interpolates between recorded Match Replay keyframes for 60fps playback
- * at any playback speed (0.5x, 1x, 2x) or timeline scrub position.
+ * Smoothly interpolates between recorded Match Replay keyframes for 60fps playback.
  */
 export function interpolateReplayFrames(
   recording: MatchReplayRecording,
@@ -803,7 +835,6 @@ export function interpolateReplayFrames(
     return last;
   }
 
-  // Binary search or linear scan for bounding frames
   let idx = 0;
   for (let i = 0; i < frames.length - 1; i++) {
     if (frames[i + 1].timestamp >= targetTimeSec) {
@@ -817,7 +848,6 @@ export function interpolateReplayFrames(
   const span = Math.max(0.0001, f1.timestamp - f0.timestamp);
   const alpha = Math.max(0, Math.min(1, (targetTimeSec - f0.timestamp) / span));
 
-  // Shortest-angle yaw interpolation
   let dyaw = f1.playerYaw - f0.playerYaw;
   while (dyaw > Math.PI) dyaw -= Math.PI * 2;
   while (dyaw < -Math.PI) dyaw += Math.PI * 2;
@@ -850,9 +880,6 @@ export function interpolateReplayFrames(
 
 /**
  * Computes custom XP and Credits for a completed match.
- * XP scales with time played + total eliminations + kills-per-minute (KPM) velocity bonus
- * so achieving the most kills in less time yields significantly higher XP.
- * Winning a match awards a large Victory Credit bonus scaled by Bot Hardness and Team Mode.
  */
 export function calculateMatchXpAndCredits(params: {
   durationSec: number;
@@ -878,7 +905,6 @@ export function calculateMatchXpAndCredits(params: {
   const safeElims = Math.max(0, Math.round(params.eliminations));
   const safeWalls = Math.max(0, Math.round(params.wallsConstructed));
 
-  // Kills-per-minute efficiency rate (higher kills in shorter time -> higher KPM bonus)
   const killsPerMinute = Number((safeElims / durationMinutes).toFixed(2));
 
   const timeXp = Math.round(Math.min(550, safeDurationSec * 4.2));
@@ -892,7 +918,6 @@ export function calculateMatchXpAndCredits(params: {
     Math.round((timeXp + eliminationXp + kpmVelocityBonusXp + victoryBonusXp) * combinedMult)
   );
 
-  // Credits earned: base match completion + Win Bonus + eliminations + KPM efficiency
   const baseCredits = 45;
   const winCredits = params.victory ? modeDef.creditWinBonus : 0;
   const elimCredits = safeElims * 24;
@@ -937,16 +962,22 @@ export function computeOperatorLevelFromXp(xp: number): {
 }
 
 /**
- * Computes the team match roster and bot scaling for 1v1, 2v2, 3v3, 4v4, Co-Op Split-Screen, and Practice.
+ * Computes the team match roster, mode-specific map size, chunk-streaming flag, and bot scaling
+ * for 1v1, 2v2, 3v3, 4v4, Party vs Party, 100-Player Battle Royale, Co-Op Split-Screen, and Practice.
  */
 export function computeTeamMatchRoster(
   battleMode: BattleModeId,
   botHardness: BotHardnessId,
-  waveNumber: number
+  waveNumber: number,
+  partyMemberCount = 0
 ): {
   allyCount: number;
   enemyCount: number;
+  totalCombatants: number;
   totalWaves: number;
+  arenaRadius: number;
+  arenaSizeLabel: string;
+  useChunkStreaming: boolean;
   hpMultiplier: number;
   speedMultiplier: number;
   damageMultiplier: number;
@@ -954,22 +985,48 @@ export function computeTeamMatchRoster(
   fireCooldownMultiplier: number;
   maxConcurrentWindups: number;
   startingSalvage: number;
+  discoveryRadius: number;
 } {
   const modeDef = BATTLE_MODES[battleMode] || BATTLE_MODES['2v2'];
   const hardnessDef = BOT_HARDNESS_TIERS[botHardness] || BOT_HARDNESS_TIERS.recruit;
   const waveScale = 1 + Math.max(0, waveNumber - 1) * 0.14;
 
+  // In Party Mode ('party-vs'), you play directly against the friend(s) in your party!
+  const enemyCount =
+    battleMode === 'party-vs'
+      ? Math.max(1, partyMemberCount)
+      : modeDef.enemyCount;
+
+  const allyCount =
+    battleMode === 'party-vs'
+      ? 0
+      : battleMode === 'battle-royale'
+        ? Math.min(3, partyMemberCount)
+        : modeDef.allyCount;
+
+  const totalCombatants =
+    battleMode === 'battle-royale'
+      ? 100
+      : battleMode === 'party-vs'
+        ? 1 + enemyCount
+        : 1 + allyCount + enemyCount;
+
   return {
-    allyCount: modeDef.allyCount,
-    enemyCount: modeDef.enemyCount,
+    allyCount,
+    enemyCount,
+    totalCombatants,
     totalWaves: modeDef.waves,
+    arenaRadius: modeDef.arenaRadius,
+    arenaSizeLabel: modeDef.arenaSizeLabel,
+    useChunkStreaming: modeDef.useChunkStreaming,
     hpMultiplier: Number((hardnessDef.hpScale * waveScale).toFixed(2)),
     speedMultiplier: Number((hardnessDef.speedScale * (1 + Math.max(0, waveNumber - 1) * 0.06)).toFixed(2)),
     damageMultiplier: Number((hardnessDef.damageScale * waveScale).toFixed(2)),
     windupSec: hardnessDef.windupSec,
     fireCooldownMultiplier: Number(Math.max(0.45, hardnessDef.windupSec).toFixed(2)),
     maxConcurrentWindups: hardnessDef.rankIndex >= 4 ? 3 : 2,
-    startingSalvage: modeDef.isPractice ? 300 : 140,
+    startingSalvage: modeDef.isPractice ? 300 : battleMode === 'battle-royale' ? 180 : 140,
+    discoveryRadius: BOT_DISCOVERY_RADIUS,
   };
 }
 
@@ -977,7 +1034,6 @@ const FRIEND_CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
 /**
  * Generates a unique 6-character Friend Code in the format `VX-XXXXXX`.
- * Deterministic when a seed string is provided, or random otherwise.
  */
 export function generatePlayerFriendCode(seed?: string): string {
   if (seed && seed.trim().length > 0) {
@@ -1074,9 +1130,25 @@ function createChunkRng(cx: number, cz: number, mapId: MapId) {
   };
 }
 
+function getThemePropTypeForMap(mapId: MapId, index: number): ObstacleBox['themePropType'] {
+  if (mapId === 'playground') {
+    return index % 2 === 0 ? 'slide' : 'swing';
+  }
+  if (mapId === 'forest') {
+    return 'log-bunker';
+  }
+  if (mapId === 'water-splash') {
+    return index % 2 === 0 ? 'slide' : 'pool-wall';
+  }
+  if (mapId === 'theme-park') {
+    return 'coaster-arch';
+  }
+  return 'standard';
+}
+
 /**
  * Deterministically generates terrain props, tactical cover obstacles, foliage trees,
- * salvage crates, and outpost spires for any chunk (cx, cz) in the infinite world.
+ * salvage crates, and outpost spires for any chunk (cx, cz).
  */
 export function generateProceduralChunkBlueprint(
   cx: number,
@@ -1104,6 +1176,7 @@ export function generateProceduralChunkBlueprint(
       depth: 5.0,
       climbable: true,
       vaultable: false,
+      themePropType: getThemePropTypeForMap(mapId, 0),
     });
 
     const originCover = [
@@ -1114,8 +1187,8 @@ export function generateProceduralChunkBlueprint(
       { x: 0, z: 1.5, w: 4.5, h: 1.35, d: 0.9, climb: false, vault: true },
       { x: -14, z: -12, w: 4.4, h: 2.9, d: 4.4, climb: true, vault: false },
       { x: 14, z: -12, w: 4.4, h: 2.9, d: 4.4, climb: true, vault: false },
-      { x: -9, z: -26, w: 4.0, h: 2.8, d: 4.0, climb: true, vault: false },
-      { x: 9, z: -26, w: 4.0, h: 2.8, d: 4.0, climb: true, vault: false },
+      { x: -9, z: -20, w: 4.0, h: 2.8, d: 4.0, climb: true, vault: false },
+      { x: 9, z: -20, w: 4.0, h: 2.8, d: 4.0, climb: true, vault: false },
     ];
     originCover.forEach((cfg, idx) => {
       const gy = getTerrainHeight(cfg.x, cfg.z, mapId);
@@ -1129,6 +1202,7 @@ export function generateProceduralChunkBlueprint(
         depth: cfg.d,
         climbable: cfg.climb,
         vaultable: cfg.vault,
+        themePropType: getThemePropTypeForMap(mapId, idx + 1),
       });
     });
 
@@ -1150,10 +1224,10 @@ export function generateProceduralChunkBlueprint(
       });
     });
 
-    // Perimeter trees in origin chunk (outside central 22m radius)
-    for (let i = 0; i < 8; i++) {
-      const angle = (i / 8) * Math.PI * 2 + 0.35;
-      const r = 25 + (i % 3) * 2.2;
+    const treeCount = mapId === 'forest' ? 16 : 8;
+    for (let i = 0; i < treeCount; i++) {
+      const angle = (i / treeCount) * Math.PI * 2 + 0.35;
+      const r = (mapId === 'forest' ? 19 : 25) + (i % 3) * 2.4;
       const tx = Math.cos(angle) * r;
       const tz = Math.sin(angle) * r;
       if (Math.hypot(tx, tz - 18) < 7) continue;
@@ -1161,7 +1235,7 @@ export function generateProceduralChunkBlueprint(
         x: tx,
         y: getTerrainHeight(tx, tz, mapId),
         z: tz,
-        scale: 0.92 + (i % 4) * 0.1,
+        scale: (mapId === 'forest' ? 1.35 : 0.92) + (i % 4) * 0.12,
         rotY: angle,
         tintOffset: ((i % 3) - 1) * 0.05,
       });
@@ -1199,6 +1273,7 @@ export function generateProceduralChunkBlueprint(
       depth: 4.6,
       climbable: true,
       vaultable: false,
+      themePropType: getThemePropTypeForMap(mapId, 0),
     });
   }
 
@@ -1220,6 +1295,7 @@ export function generateProceduralChunkBlueprint(
       depth: isClimbTower ? 4.4 : 1.1,
       climbable: isClimbTower,
       vaultable: !isClimbTower,
+      themePropType: getThemePropTypeForMap(mapId, i),
     });
   }
 
@@ -1238,8 +1314,9 @@ export function generateProceduralChunkBlueprint(
     });
   }
 
-  // 10 Composite Trees / Monoliths per chunk
-  for (let t = 0; t < 10; t++) {
+  // Trees / Monoliths per chunk (more dense in Forest)
+  const chunkTreeCount = mapId === 'forest' ? 16 : 10;
+  for (let t = 0; t < chunkTreeCount; t++) {
     const tx = Number((centerX + (rng() - 0.5) * (WORLD_CHUNK_SIZE - 8)).toFixed(2));
     const tz = Number((centerZ + (rng() - 0.5) * (WORLD_CHUNK_SIZE - 8)).toFixed(2));
     const tooClose = obstacles.some(
@@ -1250,7 +1327,7 @@ export function generateProceduralChunkBlueprint(
       x: tx,
       y: getTerrainHeight(tx, tz, mapId),
       z: tz,
-      scale: Number((0.85 + rng() * 0.45).toFixed(2)),
+      scale: Number(((mapId === 'forest' ? 1.25 : 0.85) + rng() * 0.45).toFixed(2)),
       rotY: Number((rng() * Math.PI * 2).toFixed(2)),
       tintOffset: ((t % 3) - 1) * 0.05,
     });

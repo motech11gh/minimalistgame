@@ -489,3 +489,127 @@ test('friend code generation, normalization, and infinite procedural chunk strea
   );
   assert.ok(Math.hypot(steppedFar.x, steppedFar.z) > 390, 'Player can travel infinitely across chunks');
 });
+
+test('25-block bot discovery zone prevents cross-map aggro and mode-specific map sizes & bot counts work', async () => {
+  const {
+    BOT_DISCOVERY_RADIUS,
+    isWithinBotDiscoveryZone,
+    stepAiDecisionPolicy,
+    computeTeamMatchRoster,
+    generateProceduralChunkBlueprint,
+    evaluateMovementPhysics,
+  } = await import('./rules');
+
+  assert.equal(BOT_DISCOVERY_RADIUS, 25);
+  assert.equal(isWithinBotDiscoveryZone(0, 0, 15, 15), true); // ~21.2m <= 25
+  assert.equal(isWithinBotDiscoveryZone(0, 0, 20, 20), false); // ~28.3m > 25
+
+  const testBot: NpcEntity = {
+    id: 'bot-25',
+    callsign: 'RECON-01',
+    archetype: 'rusher',
+    x: 0,
+    y: 0,
+    z: -32, // 32 blocks away (> 25 blocks)
+    vx: 0,
+    vz: 0,
+    rotY: 0,
+    hp: 100,
+    maxHp: 100,
+    shield: 0,
+    maxShield: 0,
+    state: 'patrol',
+    windupTimer: 0.4,
+    attackCooldown: 0,
+    koTimer: 0,
+    hitFlashTimer: 0,
+    strafeSign: 1,
+  };
+
+  // At 32m (> 25 blocks), bot must NOT discover or fire at player
+  const farDecision = stepAiDecisionPolicy(testBot, { x: 0, y: 0, z: 0 }, 0.016, 1.0, true);
+  assert.equal(farDecision.discoveredPlayer, false);
+  assert.equal(farDecision.nextState, 'patrol');
+  assert.equal(farDecision.triggerFire, false);
+
+  // At 18m (<= 25 blocks), bot discovers player and engages
+  const nearDecision = stepAiDecisionPolicy(
+    { ...testBot, z: -18 },
+    { x: 0, y: 0, z: 0 },
+    0.016,
+    1.0,
+    true
+  );
+  assert.equal(nearDecision.discoveredPlayer, true);
+  assert.notEqual(nearDecision.nextState, 'patrol');
+
+  // Mode-specific bot counts, map sizes, and chunk streaming flags
+  const m1v1 = computeTeamMatchRoster('1v1', 'veteran', 1, 0);
+  assert.equal(m1v1.enemyCount, 1);
+  assert.equal(m1v1.allyCount, 0);
+  assert.equal(m1v1.useChunkStreaming, false);
+  assert.equal(m1v1.arenaRadius, 24);
+
+  const m2v2 = computeTeamMatchRoster('2v2', 'veteran', 1, 1);
+  assert.equal(m2v2.enemyCount, 2);
+  assert.equal(m2v2.allyCount, 1);
+  assert.equal(m2v2.useChunkStreaming, false);
+  assert.ok(m2v2.arenaRadius > m1v1.arenaRadius);
+
+  const mParty = computeTeamMatchRoster('party-vs', 'veteran', 1, 2);
+  assert.equal(mParty.allyCount, 0);
+  assert.equal(mParty.enemyCount, 2);
+  assert.equal(mParty.useChunkStreaming, false);
+
+  const mBR = computeTeamMatchRoster('battle-royale', 'veteran', 1, 0);
+  assert.equal(mBR.totalCombatants, 100);
+  assert.equal(mBR.useChunkStreaming, true);
+  assert.ok(mBR.arenaRadius >= 250);
+
+  // Bounded 1v1 arena clamps player position within 24m
+  const clamped = evaluateMovementPhysics(
+    {
+      x: 23.8,
+      y: 0,
+      z: 0,
+      vx: 10,
+      vy: 0,
+      vz: 0,
+      yaw: -Math.PI / 2,
+      pitch: 0,
+      grounded: true,
+      coyoteTimer: 0.1,
+      jumpBufferTimer: 0,
+      isSliding: false,
+      slideTimer: 0,
+      slideCooldown: 0,
+      isVaulting: false,
+      vaultTimer: 0,
+      isClimbing: false,
+      eyeHeight: 1.72,
+      stamina: 100,
+      movementMode: 'SPRINT',
+    },
+    {
+      forward: 1,
+      right: 0,
+      sprintHeld: true,
+      slideJustPressed: false,
+      jumpJustPressed: false,
+      jumpHeld: false,
+      arenaRadius: 24,
+    },
+    0.05,
+    [],
+    'playground'
+  );
+  assert.ok(clamped.x <= 24, '1v1 arena boundary clamps player within 24m');
+
+  // Verify new themed maps generate valid chunk blueprints
+  for (const mapId of ['playground', 'forest', 'water-splash', 'theme-park'] as const) {
+    const bp = generateProceduralChunkBlueprint(0, 0, mapId);
+    assert.ok(bp.obstacles.length >= 6);
+    assert.ok(bp.trees.length > 0);
+  }
+});
+

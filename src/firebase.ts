@@ -9,6 +9,7 @@ import {
 } from 'firebase/auth';
 import {
   getFirestore,
+  setLogLevel,
   doc,
   getDoc,
   getDocFromServer,
@@ -23,9 +24,18 @@ import {
 import firebaseConfig from '../firebase-applet-config.json';
 
 const app = initializeApp(firebaseConfig);
+// Suppress internal @firebase/firestore error logs when offline or when a cached Auth token fails refresh
+try {
+  setLogLevel('silent');
+} catch {
+  // Ignore if unsupported in environment
+}
+
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 const googleProvider = new GoogleAuthProvider();
+
+const LOCAL_PROFILE_STORAGE_KEY = 'apex_vanguard_operator_profile_v1';
 
 export enum OperationType {
   CREATE = 'create',
@@ -51,6 +61,52 @@ export interface FirestoreErrorInfo {
       email?: string | null;
     }[];
   };
+}
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error ?? '');
+}
+
+export function isTokenServiceError(error: unknown): boolean {
+  const msg = getErrorMessage(error);
+  return (
+    msg.includes('token-service-api-has-not-been-used') ||
+    msg.includes('securetoken.googleapis.com') ||
+    msg.includes('Fetching auth token failed') ||
+    msg.includes('auth/network-request-failed') ||
+    msg.includes('auth/internal-error')
+  );
+}
+
+export function isTransientOrOfflineError(error: unknown): boolean {
+  const msg = getErrorMessage(error);
+  return (
+    isTokenServiceError(error) ||
+    msg.includes('the client is offline') ||
+    msg.includes('Failed to get document because the client is offline') ||
+    msg.includes('Could not reach Cloud Firestore backend') ||
+    msg.includes('unavailable') ||
+    msg.includes('offline')
+  );
+}
+
+export async function ensureValidAuthUser(user: User | null): Promise<User | null> {
+  if (!user) return null;
+  try {
+    await user.getIdToken();
+    return user;
+  } catch (error) {
+    if (isTokenServiceError(error) || getErrorMessage(error).includes('auth/')) {
+      try {
+        await signOut(auth);
+      } catch {
+        // Ignore signOut failure
+      }
+      return null;
+    }
+    return user;
+  }
 }
 
 export function handleFirestoreError(
@@ -79,17 +135,25 @@ export function handleFirestoreError(
   throw new Error(JSON.stringify(errInfo));
 }
 
-// Validate connection to Firestore on boot
+// Validate connection to Firestore on boot after verifying any cached Auth session
 async function testConnection() {
   try {
+    if (typeof auth.authStateReady === 'function') {
+      await auth.authStateReady();
+    }
+    if (auth.currentUser) {
+      const validUser = await ensureValidAuthUser(auth.currentUser);
+      if (!validUser) return;
+    }
     await getDocFromServer(doc(db, 'test', 'connection'));
   } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Please check your Firebase configuration.');
+    if (isTokenServiceError(error)) {
+      await signOut(auth).catch(() => {});
     }
+    // Operate seamlessly in local/Express mode when Firestore is offline
   }
 }
-testConnection();
+void testConnection();
 
 export interface OperatorProfileData {
   uid: string;
@@ -117,9 +181,76 @@ function sanitizeCallsign(raw: string): string {
   return cleaned.length >= CALLSIGN_MIN ? cleaned : 'VANGUARD-OP';
 }
 
+function readLocalFallbackProfile(
+  uid: string,
+  displayName: string | null | undefined,
+  defaults: Omit<OperatorProfileData, 'uid'>
+): OperatorProfileData {
+  let saved: Partial<OperatorProfileData> = {};
+  if (typeof window !== 'undefined') {
+    try {
+      const raw = localStorage.getItem(LOCAL_PROFILE_STORAGE_KEY);
+      if (raw) {
+        saved = JSON.parse(raw) as Partial<OperatorProfileData>;
+      }
+    } catch {
+      // Ignore storage parse error
+    }
+  }
+  const profile: OperatorProfileData = {
+    uid,
+    callsign: sanitizeCallsign(
+      String(saved.callsign || displayName || defaults.callsign)
+    ),
+    skinId: String(saved.skinId || defaults.skinId),
+    emoteId: String(saved.emoteId || defaults.emoteId),
+    primaryWeaponId: String(saved.primaryWeaponId || defaults.primaryWeaponId),
+    opticId: String(saved.opticId || defaults.opticId),
+    barrelId: String(saved.barrelId || defaults.barrelId),
+    underbarrelId: String(saved.underbarrelId || defaults.underbarrelId),
+    magId: String(saved.magId || defaults.magId),
+    stimCompoundCid: Number(saved.stimCompoundCid || defaults.stimCompoundCid),
+    xp: Math.max(defaults.xp, Number(saved.xp || 0)),
+    credits: Math.max(defaults.credits, Number(saved.credits ?? 600)),
+    highestTrainingLevel: Math.max(
+      1,
+      Math.min(
+        4,
+        Number(saved.highestTrainingLevel || defaults.highestTrainingLevel || 1)
+      )
+    ),
+    totalEliminations: Number(
+      saved.totalEliminations || defaults.totalEliminations || 0
+    ),
+    wallsBuilt: Number(saved.wallsBuilt || defaults.wallsBuilt || 0),
+  };
+  writeLocalFallbackProfile(profile);
+  return profile;
+}
+
+function writeLocalFallbackProfile(profile: Partial<OperatorProfileData>): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const existingRaw = localStorage.getItem(LOCAL_PROFILE_STORAGE_KEY);
+    const existing = existingRaw ? JSON.parse(existingRaw) : {};
+    localStorage.setItem(
+      LOCAL_PROFILE_STORAGE_KEY,
+      JSON.stringify({ ...existing, ...profile })
+    );
+  } catch {
+    // Ignore storage quota error
+  }
+}
+
 export async function signInOperator(): Promise<User | null> {
   const cred = await signInWithPopup(auth, googleProvider);
-  return cred.user;
+  const validUser = await ensureValidAuthUser(cred.user);
+  if (!validUser) {
+    throw new Error(
+      'Cloud Token Service API is currently offline for this project; using Local Online Account.'
+    );
+  }
+  return validUser;
 }
 
 export async function signOutOperator(): Promise<void> {
@@ -133,15 +264,23 @@ export async function loadOrCreateOperatorProfile(
   user: User,
   defaults: Omit<OperatorProfileData, 'uid'>
 ): Promise<OperatorProfileData> {
-  const path = `operators/${user.uid}`;
+  const fallback = readLocalFallbackProfile(user.uid, user.displayName, defaults);
+  const validUser = await ensureValidAuthUser(user);
+  if (!validUser) {
+    return fallback;
+  }
+
+  const path = `operators/${validUser.uid}`;
   try {
-    const ref = doc(db, 'operators', user.uid);
+    const ref = doc(db, 'operators', validUser.uid);
     const snap = await getDoc(ref);
     if (snap.exists()) {
       const data = snap.data();
-      return {
-        uid: user.uid,
-        callsign: sanitizeCallsign(String(data.callsign || user.displayName || defaults.callsign)),
+      const loaded: OperatorProfileData = {
+        uid: validUser.uid,
+        callsign: sanitizeCallsign(
+          String(data.callsign || validUser.displayName || defaults.callsign)
+        ),
         skinId: String(data.skinId || defaults.skinId),
         emoteId: String(data.emoteId || defaults.emoteId),
         primaryWeaponId: String(data.primaryWeaponId || defaults.primaryWeaponId),
@@ -152,15 +291,20 @@ export async function loadOrCreateOperatorProfile(
         stimCompoundCid: Number(data.stimCompoundCid || defaults.stimCompoundCid),
         xp: Number(data.xp || 0),
         credits: Number(data.credits ?? defaults.credits ?? 600),
-        highestTrainingLevel: Math.max(1, Math.min(4, Number(data.highestTrainingLevel || 1))),
+        highestTrainingLevel: Math.max(
+          1,
+          Math.min(4, Number(data.highestTrainingLevel || 1))
+        ),
         totalEliminations: Number(data.totalEliminations || 0),
         wallsBuilt: Number(data.wallsBuilt || 0),
       };
+      writeLocalFallbackProfile(loaded);
+      return loaded;
     }
 
     const initialProfile: OperatorProfileData = {
-      uid: user.uid,
-      callsign: sanitizeCallsign(user.displayName || defaults.callsign),
+      uid: validUser.uid,
+      callsign: sanitizeCallsign(validUser.displayName || defaults.callsign),
       skinId: defaults.skinId,
       emoteId: defaults.emoteId,
       primaryWeaponId: defaults.primaryWeaponId,
@@ -176,7 +320,9 @@ export async function loadOrCreateOperatorProfile(
       wallsBuilt: defaults.wallsBuilt,
     };
 
-    if (user.emailVerified) {
+    writeLocalFallbackProfile(initialProfile);
+
+    if (validUser.emailVerified) {
       await setDoc(ref, {
         ...initialProfile,
         createdAt: serverTimestamp(),
@@ -185,6 +331,12 @@ export async function loadOrCreateOperatorProfile(
     }
     return initialProfile;
   } catch (error) {
+    if (isTokenServiceError(error)) {
+      await signOut(auth).catch(() => {});
+    }
+    if (isTransientOrOfflineError(error)) {
+      return fallback;
+    }
     handleFirestoreError(error, OperationType.GET, path);
   }
 }
@@ -205,10 +357,26 @@ export async function saveOperatorCustomization(
     | 'credits'
   >
 ): Promise<void> {
+  writeLocalFallbackProfile({
+    callsign: sanitizeCallsign(customization.callsign),
+    skinId: customization.skinId,
+    emoteId: customization.emoteId,
+    primaryWeaponId: customization.primaryWeaponId,
+    opticId: customization.opticId,
+    barrelId: customization.barrelId,
+    underbarrelId: customization.underbarrelId,
+    magId: customization.magId,
+    stimCompoundCid: customization.stimCompoundCid,
+    credits: Math.max(0, Math.min(100000000, Math.round(customization.credits))),
+  });
+
   if (!user.emailVerified) return;
-  const path = `operators/${user.uid}`;
+  const validUser = await ensureValidAuthUser(user);
+  if (!validUser) return;
+
+  const path = `operators/${validUser.uid}`;
   try {
-    const ref = doc(db, 'operators', user.uid);
+    const ref = doc(db, 'operators', validUser.uid);
     await updateDoc(ref, {
       callsign: sanitizeCallsign(customization.callsign),
       skinId: customization.skinId,
@@ -223,6 +391,12 @@ export async function saveOperatorCustomization(
       updatedAt: serverTimestamp(),
     });
   } catch (error) {
+    if (isTokenServiceError(error)) {
+      await signOut(auth).catch(() => {});
+    }
+    if (isTransientOrOfflineError(error)) {
+      return;
+    }
     handleFirestoreError(error, OperationType.UPDATE, path);
   }
 }
@@ -233,11 +407,14 @@ export async function sendFirestoreFriendRequest(
   toUsername: string
 ): Promise<void> {
   if (!user.emailVerified) return;
-  const reqId = `freq_${user.uid.slice(0, 12)}_${Date.now()}`;
+  const validUser = await ensureValidAuthUser(user);
+  if (!validUser) return;
+
+  const reqId = `freq_${validUser.uid.slice(0, 12)}_${Date.now()}`;
   const path = `friendRequests/${reqId}`;
   try {
     await setDoc(doc(db, 'friendRequests', reqId), {
-      fromUid: user.uid,
+      fromUid: validUser.uid,
       fromUsername: sanitizeCallsign(fromUsername),
       toUsername: sanitizeCallsign(toUsername),
       status: 'pending',
@@ -245,6 +422,12 @@ export async function sendFirestoreFriendRequest(
       updatedAt: serverTimestamp(),
     });
   } catch (error) {
+    if (isTokenServiceError(error)) {
+      await signOut(auth).catch(() => {});
+    }
+    if (isTransientOrOfflineError(error)) {
+      return;
+    }
     handleFirestoreError(error, OperationType.CREATE, path);
   }
 }
@@ -263,14 +446,20 @@ export async function recordMatchAndProgression(
     outcome: 'victory' | 'defeat';
   }
 ): Promise<OperatorProfileData> {
-  const nextXp = Math.min(100000000, currentProfile.xp + Math.max(50, match.xpEarned));
+  const nextXp = Math.min(
+    100000000,
+    currentProfile.xp + Math.max(50, match.xpEarned)
+  );
   const nextCredits = Math.min(
     100000000,
     currentProfile.credits + Math.max(10, match.creditsEarned)
   );
   const nextHighestLevel =
     match.outcome === 'victory'
-      ? Math.min(4, Math.max(currentProfile.highestTrainingLevel, match.trainingLevel + 1))
+      ? Math.min(
+          4,
+          Math.max(currentProfile.highestTrainingLevel, match.trainingLevel + 1)
+        )
       : currentProfile.highestTrainingLevel;
   const nextElims = Math.min(
     10000000,
@@ -290,11 +479,15 @@ export async function recordMatchAndProgression(
     wallsBuilt: nextWalls,
   };
 
-  if (!user.emailVerified) return updatedProfile;
+  writeLocalFallbackProfile(updatedProfile);
 
-  const opPath = `operators/${user.uid}`;
+  if (!user.emailVerified) return updatedProfile;
+  const validUser = await ensureValidAuthUser(user);
+  if (!validUser) return updatedProfile;
+
+  const opPath = `operators/${validUser.uid}`;
   try {
-    await updateDoc(doc(db, 'operators', user.uid), {
+    await updateDoc(doc(db, 'operators', validUser.uid), {
       xp: nextXp,
       credits: nextCredits,
       highestTrainingLevel: nextHighestLevel,
@@ -303,24 +496,39 @@ export async function recordMatchAndProgression(
       updatedAt: serverTimestamp(),
     });
   } catch (error) {
+    if (isTokenServiceError(error)) {
+      await signOut(auth).catch(() => {});
+    }
+    if (isTransientOrOfflineError(error)) {
+      return updatedProfile;
+    }
     handleFirestoreError(error, OperationType.UPDATE, opPath);
   }
 
-  const matchId = `match_${user.uid.slice(0, 12)}_${Date.now()}`;
+  const matchId = `match_${validUser.uid.slice(0, 12)}_${Date.now()}`;
   const matchPath = `matches/${matchId}`;
   try {
     await setDoc(doc(db, 'matches', matchId), {
-      uid: user.uid,
+      uid: validUser.uid,
       callsign: sanitizeCallsign(currentProfile.callsign),
       mapId: match.mapId,
       trainingLevel: Math.max(1, Math.min(4, match.trainingLevel)),
       score: Math.max(0, Math.min(10000000, Math.round(match.score))),
       eliminations: Math.max(0, Math.min(100000, Math.round(match.eliminations))),
-      wallsConstructed: Math.max(0, Math.min(100000, Math.round(match.wallsConstructed))),
+      wallsConstructed: Math.max(
+        0,
+        Math.min(100000, Math.round(match.wallsConstructed))
+      ),
       outcome: match.outcome,
       createdAt: serverTimestamp(),
     });
   } catch (error) {
+    if (isTokenServiceError(error)) {
+      await signOut(auth).catch(() => {});
+    }
+    if (isTransientOrOfflineError(error)) {
+      return updatedProfile;
+    }
     handleFirestoreError(error, OperationType.CREATE, matchPath);
   }
 
@@ -328,12 +536,21 @@ export async function recordMatchAndProgression(
 }
 
 export async function fetchOperatorMatchHistory(user: User) {
+  const validUser = await ensureValidAuthUser(user);
+  if (!validUser) return [];
   const path = 'matches';
   try {
-    const q = query(collection(db, 'matches'), where('uid', '==', user.uid));
+    const q = query(collection(db, 'matches'), where('uid', '==', validUser.uid));
     const snap = await getDocs(q);
     return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
   } catch (error) {
+    if (isTokenServiceError(error)) {
+      await signOut(auth).catch(() => {});
+    }
+    if (isTransientOrOfflineError(error)) {
+      return [];
+    }
     handleFirestoreError(error, OperationType.LIST, path);
   }
 }
+

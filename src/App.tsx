@@ -19,6 +19,7 @@ import {
   LobbyPageId,
   FriendProfile,
   FriendRequestRecord,
+  PartyInviteRecord,
   WeatherAtmosphereMode,
   WeaponId,
   OpticId,
@@ -42,6 +43,7 @@ import {
   computeOperatorLevelFromXp,
   generatePlayerFriendCode,
   normalizeFriendCode,
+  BOT_DISCOVERY_RADIUS,
 } from './game/rules';
 import { soundEngine } from './game/sound';
 import {
@@ -57,6 +59,7 @@ import { TouchControlsOverlay } from './components/TouchControlsOverlay';
 import {
   auth,
   onAuthStateChanged,
+  ensureValidAuthUser,
   signInOperator,
   signOutOperator,
   loadOrCreateOperatorProfile,
@@ -183,20 +186,12 @@ export default function App() {
     damageBonus: 0.05,
   });
 
-  // Real Online Friends & Friend Code Request State (Zero Bot Friends)
+  // Real Online Friends, Friend Code Requests & Party Handshake State (Zero Bot Friends)
   const [friendsList, setFriendsList] = useState<FriendProfile[]>([]);
   const [friendRequests, setFriendRequests] = useState<FriendRequestRecord[]>(
     []
   );
-  const [onlineDirectory, setOnlineDirectory] = useState<
-    Array<{
-      friendCode: string;
-      username: string;
-      level: number;
-      skinId: SkinId;
-      status: string;
-    }>
-  >([]);
+  const [partyInvites, setPartyInvites] = useState<PartyInviteRecord[]>([]);
   const [partyMembers, setPartyMembers] = useState<FriendProfile[]>([]);
   const [friendCodeInput, setFriendCodeInput] = useState<string>('');
   const [friendStatusMsg, setFriendStatusMsg] = useState<string | null>(null);
@@ -318,6 +313,10 @@ export default function App() {
     activeChunkKey: '0,0',
     loadedChunkCount: 25,
     chunksDiscovered: 1,
+    discoveredByCount: 0,
+    arenaSizeLabel: '68m × 68m Tactical Skirmish Map',
+    useChunkStreaming: false,
+    brPlayersAlive: null,
     weatherMode: 'light-rain-blur',
     activeEnvironmentEvent: null,
     nextEventCooldownSec: 6.5,
@@ -394,8 +393,11 @@ export default function App() {
         if (Array.isArray(data.requests)) {
           setFriendRequests(data.requests);
         }
-        if (Array.isArray(data.directory)) {
-          setOnlineDirectory(data.directory);
+        if (Array.isArray(data.partyInvites)) {
+          setPartyInvites(data.partyInvites);
+        }
+        if (Array.isArray(data.partyMembers)) {
+          setPartyMembers(data.partyMembers);
         }
       }
     } catch {
@@ -454,45 +456,52 @@ export default function App() {
   // Connect to Firebase Auth and load/create Firestore profile
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (user) => {
-      setCurrentUser(user);
-      if (user) {
-        clientIdRef.current = user.uid;
-        try {
-          const loaded = await loadOrCreateOperatorProfile(user, {
-            callsign,
-            skinId,
-            emoteId,
-            primaryWeaponId: weaponId,
-            opticId,
-            barrelId,
-            underbarrelId,
-            magId,
-            stimCompoundCid,
-            xp: localXp,
-            credits: localCredits,
-            highestTrainingLevel: 4,
-            totalEliminations: 0,
-            wallsBuilt: 0,
-          });
-          setOperatorProfile(loaded);
-          setCallsign(loaded.callsign);
-          setUsernameDraft(loaded.callsign);
-          setSkinId(loaded.skinId as SkinId);
-          setEmoteId(loaded.emoteId as EmoteId);
-          setWeaponId(loaded.primaryWeaponId as WeaponId);
-          setOpticId(loaded.opticId as OpticId);
-          setBarrelId(loaded.barrelId as BarrelId);
-          setUnderbarrelId(loaded.underbarrelId as UnderbarrelId);
-          setMagId(loaded.magId as MagId);
-          setStimCompoundCid(loaded.stimCompoundCid);
-          setLocalXp((prev) => Math.max(prev, loaded.xp));
-          setLocalCredits((prev) => Math.max(prev, loaded.credits ?? 600));
-          setHighestReachedLevel(Math.max(4, loaded.highestTrainingLevel));
-        } catch {
-          // Handled via handleFirestoreError
-        }
-      } else {
+      if (!user) {
+        setCurrentUser(null);
         setOperatorProfile(null);
+        return;
+      }
+      const validUser = await ensureValidAuthUser(user);
+      if (!validUser) {
+        setCurrentUser(null);
+        setOperatorProfile(null);
+        return;
+      }
+      setCurrentUser(validUser);
+      clientIdRef.current = validUser.uid;
+      try {
+        const loaded = await loadOrCreateOperatorProfile(validUser, {
+          callsign,
+          skinId,
+          emoteId,
+          primaryWeaponId: weaponId,
+          opticId,
+          barrelId,
+          underbarrelId,
+          magId,
+          stimCompoundCid,
+          xp: localXp,
+          credits: localCredits,
+          highestTrainingLevel: 4,
+          totalEliminations: 0,
+          wallsBuilt: 0,
+        });
+        setOperatorProfile(loaded);
+        setCallsign(loaded.callsign);
+        setUsernameDraft(loaded.callsign);
+        setSkinId(loaded.skinId as SkinId);
+        setEmoteId(loaded.emoteId as EmoteId);
+        setWeaponId(loaded.primaryWeaponId as WeaponId);
+        setOpticId(loaded.opticId as OpticId);
+        setBarrelId(loaded.barrelId as BarrelId);
+        setUnderbarrelId(loaded.underbarrelId as UnderbarrelId);
+        setMagId(loaded.magId as MagId);
+        setStimCompoundCid(loaded.stimCompoundCid);
+        setLocalXp((prev) => Math.max(prev, loaded.xp));
+        setLocalCredits((prev) => Math.max(prev, loaded.credits ?? 600));
+        setHighestReachedLevel(Math.max(4, loaded.highestTrainingLevel));
+      } catch {
+        // Handled via handleFirestoreError or local fallback
       }
     });
     return () => unsub();
@@ -555,9 +564,13 @@ export default function App() {
           } else if (
             msg.type === 'friend:request' ||
             msg.type === 'friend:responded' ||
+            msg.type === 'party:invite' ||
+            msg.type === 'party:responded' ||
+            msg.type === 'party:updated' ||
+            msg.type === 'account:status' ||
             msg.type === 'account:registered'
           ) {
-            // Real-time refresh of friend requests & accepted friends when another player interacts via code
+            // Real-time refresh of friend requests, party invites & accepted party members
             const savedCode =
               localStorage.getItem('apex_friend_code') || friendCode;
             const savedName =
@@ -573,8 +586,10 @@ export default function App() {
                 if (Array.isArray(data.friends)) setFriendsList(data.friends);
                 if (Array.isArray(data.requests))
                   setFriendRequests(data.requests);
-                if (Array.isArray(data.directory))
-                  setOnlineDirectory(data.directory);
+                if (Array.isArray(data.partyInvites))
+                  setPartyInvites(data.partyInvites);
+                if (Array.isArray(data.partyMembers))
+                  setPartyMembers(data.partyMembers);
               })
               .catch(() => {});
           }
@@ -694,7 +709,8 @@ export default function App() {
       }
       if (Array.isArray(data.friends)) setFriendsList(data.friends);
       if (Array.isArray(data.requests)) setFriendRequests(data.requests);
-      if (Array.isArray(data.directory)) setOnlineDirectory(data.directory);
+      if (Array.isArray(data.partyInvites)) setPartyInvites(data.partyInvites);
+      if (Array.isArray(data.partyMembers)) setPartyMembers(data.partyMembers);
       setFriendCodeInput('');
       const targetName = data.targetProfile?.username || normalizedTarget;
       const targetCode = data.targetProfile?.friendCode || normalizedTarget;
@@ -732,7 +748,8 @@ export default function App() {
         const data = await res.json();
         if (Array.isArray(data.friends)) setFriendsList(data.friends);
         if (Array.isArray(data.requests)) setFriendRequests(data.requests);
-        if (Array.isArray(data.directory)) setOnlineDirectory(data.directory);
+        if (Array.isArray(data.partyInvites)) setPartyInvites(data.partyInvites);
+        if (Array.isArray(data.partyMembers)) setPartyMembers(data.partyMembers);
         setFriendErrorMsg(null);
         setFriendStatusMsg(
           action === 'accept'
@@ -745,25 +762,124 @@ export default function App() {
     }
   };
 
-  const handleTogglePartyMember = (friend: FriendProfile) => {
-    setPartyMembers((prev) => {
-      const exists = prev.some(
-        (p) =>
-          p.friendCode === friend.friendCode ||
-          p.username.toUpperCase() === friend.username.toUpperCase()
+  // Send a Party Invite and WAIT until the other player accepts before adding to Party
+  const handleSendPartyInvite = async (friend: FriendProfile) => {
+    setFriendErrorMsg(null);
+    setFriendStatusMsg(null);
+
+    if (friend.online === false || friend.status === 'offline') {
+      setFriendErrorMsg(
+        `${friend.username} (${friend.friendCode}) is currently OFFLINE and unavailable for party invites.`
       );
-      if (exists) {
-        return prev.filter(
-          (p) =>
-            p.friendCode !== friend.friendCode &&
-            p.username.toUpperCase() !== friend.username.toUpperCase()
+      return;
+    }
+
+    try {
+      const levelInfo = computeOperatorLevelFromXp(localXp);
+      const res = await fetch('/api/party/invite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fromCode: friendCode,
+          fromUsername: callsign,
+          fromLevel: levelInfo.level,
+          fromSkinId: skinId,
+          toCode: friend.friendCode,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setFriendErrorMsg(
+          data.error || `Could not invite ${friend.username} to party.`
+        );
+        return;
+      }
+      if (Array.isArray(data.friends)) setFriendsList(data.friends);
+      if (Array.isArray(data.requests)) setFriendRequests(data.requests);
+      if (Array.isArray(data.partyInvites)) setPartyInvites(data.partyInvites);
+      if (Array.isArray(data.partyMembers)) setPartyMembers(data.partyMembers);
+      setFriendStatusMsg(
+        `Party invite sent to ${friend.username} (${friend.friendCode})! Waiting until they accept...`
+      );
+    } catch {
+      setFriendErrorMsg('Network error while sending party invite.');
+    }
+  };
+
+  const handleRespondToPartyInvite = async (
+    inviteId: string,
+    action: 'accept' | 'decline'
+  ) => {
+    setFriendErrorMsg(null);
+    try {
+      const res = await fetch('/api/party/respond', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          friendCode,
+          username: callsign,
+          inviteId,
+          action,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.friends)) setFriendsList(data.friends);
+        if (Array.isArray(data.requests)) setFriendRequests(data.requests);
+        if (Array.isArray(data.partyInvites)) setPartyInvites(data.partyInvites);
+        if (Array.isArray(data.partyMembers)) setPartyMembers(data.partyMembers);
+        setFriendStatusMsg(
+          action === 'accept'
+            ? 'Party invite accepted! Both operators now appear on screen in your shared Party!'
+            : 'Party invite declined.'
         );
       }
-      if (prev.length >= 3) {
-        return [...prev.slice(1), friend];
+    } catch {
+      // Ignore network error
+    }
+  };
+
+  const handleLeaveOrRemovePartyMember = async (targetCode: string) => {
+    try {
+      const res = await fetch('/api/party/leave', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          friendCode,
+          targetCode,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.friends)) setFriendsList(data.friends);
+        if (Array.isArray(data.partyInvites)) setPartyInvites(data.partyInvites);
+        if (Array.isArray(data.partyMembers)) setPartyMembers(data.partyMembers);
       }
-      return [...prev, friend];
-    });
+    } catch {
+      setPartyMembers((prev) =>
+        prev.filter((p) => p.friendCode !== targetCode)
+      );
+    }
+  };
+
+  const handleToggleAccountOnlineStatus = async (
+    targetCode: string,
+    nextOnline: boolean
+  ) => {
+    try {
+      await fetch('/api/accounts/status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          friendCode: targetCode,
+          online: nextOnline,
+          status: nextOnline ? 'online' : 'offline',
+        }),
+      });
+      await syncFriendsAndAccount(callsign, friendCode);
+    } catch {
+      // Ignore error
+    }
   };
 
   const handleBuyOrEquipSkin = (targetSkinId: SkinId) => {
@@ -892,6 +1008,19 @@ export default function App() {
     BOT_HARDNESS_TIERS[botHardness] || BOT_HARDNESS_TIERS.veteran;
   const levelInfo = computeOperatorLevelFromXp(localXp);
 
+  // Incoming pending notifications for the top menu slider (Friend Requests + Party Invites)
+  const incomingPendingFriendRequests = friendRequests.filter(
+    (r) => r.status === 'pending' && r.fromCode !== friendCode
+  );
+  const incomingPendingPartyInvites = partyInvites.filter(
+    (inv) => inv.status === 'pending' && inv.toCode === friendCode
+  );
+  const outgoingPendingPartyInvites = partyInvites.filter(
+    (inv) => inv.status === 'pending' && inv.fromCode === friendCode
+  );
+  const totalMenuNotificationCount =
+    incomingPendingFriendRequests.length + incomingPendingPartyInvites.length;
+
   return (
     <main className="relative w-screen h-screen overflow-hidden select-none">
       {/* Isolated Full-Bleed Three.js 3D Viewport */}
@@ -989,7 +1118,7 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Dedicated Lobby Pages Navigation */}
+              {/* Dedicated Lobby Pages Navigation Slider with Live Notification Badges */}
               <nav
                 aria-label="Lobby Pages"
                 className="flex flex-wrap items-center gap-1 p-1 rounded-xl border border-white/15"
@@ -997,15 +1126,16 @@ export default function App() {
               >
                 {(
                   [
-                    { id: 'play', label: 'PLAY' },
-                    { id: 'operator', label: 'OPERATOR' },
-                    { id: 'shop', label: 'SKIN SHOP' },
-                    { id: 'maps', label: 'MAPS & MODES' },
+                    { id: 'play', label: 'PLAY', badge: 0 },
+                    { id: 'operator', label: 'OPERATOR', badge: 0 },
+                    { id: 'shop', label: 'SKIN SHOP', badge: 0 },
+                    { id: 'maps', label: 'MAPS & MODES', badge: 0 },
                     {
                       id: 'friends',
                       label: `FRIENDS (${friendsList.length})`,
+                      badge: totalMenuNotificationCount,
                     },
-                    { id: 'practice', label: 'PRACTICE' },
+                    { id: 'practice', label: 'PRACTICE', badge: 0 },
                   ] as const
                 ).map((tab) => {
                   const active = lobbyPage === tab.id;
@@ -1015,13 +1145,21 @@ export default function App() {
                       type="button"
                       data-testid={`lobby-nav-${tab.id}`}
                       onClick={() => setLobbyPage(tab.id)}
-                      className={`px-3.5 py-2 rounded-lg text-xs font-display font-bold tracking-wide transition-colors cursor-pointer whitespace-nowrap ${
+                      className={`relative flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-display font-bold tracking-wide transition-colors cursor-pointer whitespace-nowrap ${
                         active
                           ? 'bg-amber-500 text-slate-950 shadow'
                           : 'text-slate-300 hover:text-white hover:bg-slate-800/80'
                       }`}
                     >
-                      {tab.label}
+                      <span>{tab.label}</span>
+                      {tab.badge > 0 && (
+                        <span
+                          data-testid="menu-notification-badge"
+                          className="inline-flex items-center justify-center min-w-5 h-5 px-1.5 rounded-full bg-rose-500 text-white font-mono text-[11px] font-bold shadow-md animate-pulse"
+                        >
+                          {tab.badge}
+                        </span>
+                      )}
                     </button>
                   );
                 })}
@@ -1331,53 +1469,87 @@ export default function App() {
                   </span>
                 </div>
 
-                {/* `+` Signs to Add Friends to Party (Up to 3 Squad Slots for 4v4) */}
+                {/* `+` Signs to Invite Friends to Party (Wait for Acceptance -> Shared 3D Avatar on Screen) */}
                 <div
-                  className="pointer-events-auto flex items-center gap-2.5"
+                  className="pointer-events-auto flex flex-wrap items-center justify-center gap-2.5"
                   aria-label="Party Squad Slots"
                 >
                   {[0, 1, 2].map((slotIdx) => {
                     const member = partyMembers[slotIdx];
-                    return member ? (
-                      <div
-                        key={member.username}
-                        className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-emerald-400/50 text-xs font-mono text-white shadow-lg"
-                        style={{ backgroundColor: 'rgba(9,13,22,0.9)' }}
-                      >
-                        <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                        <span className="font-bold">{member.username}</span>
-                        <span className="text-[10px] text-amber-400">
-                          LVL {member.level}
-                        </span>
-                        <button
-                          type="button"
-                          aria-label={`Remove ${member.username} from party`}
-                          onClick={() => handleTogglePartyMember(member)}
-                          className="ml-1 text-slate-400 hover:text-rose-400 font-bold cursor-pointer"
+                    const pendingOutgoing: PartyInviteRecord | undefined =
+                      !member
+                        ? outgoingPendingPartyInvites[
+                            slotIdx - partyMembers.length
+                          ]
+                        : undefined;
+                    if (member) {
+                      return (
+                        <div
+                          key={member.friendCode || member.username}
+                          data-testid={`party-active-member-${member.friendCode}`}
+                          className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-emerald-400/60 text-xs font-mono text-white shadow-lg"
+                          style={{ backgroundColor: 'rgba(9,13,22,0.92)' }}
                         >
-                          ×
-                        </button>
-                      </div>
-                    ) : (
+                          <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                          <span className="font-bold">{member.username}</span>
+                          <span className="text-[10px] text-emerald-300">
+                            ON SCREEN · LVL {member.level}
+                          </span>
+                          <button
+                            type="button"
+                            aria-label={`Remove ${member.username} from party`}
+                            onClick={() =>
+                              handleLeaveOrRemovePartyMember(member.friendCode)
+                            }
+                            className="ml-1 text-slate-400 hover:text-rose-400 font-bold cursor-pointer"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      );
+                    }
+                    if (pendingOutgoing) {
+                      return (
+                        <div
+                          key={pendingOutgoing.id}
+                          data-testid={`party-waiting-slot-${pendingOutgoing.toCode}`}
+                          className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-amber-400/60 text-xs font-mono text-amber-200 shadow-lg"
+                          style={{ backgroundColor: 'rgba(9,13,22,0.92)' }}
+                        >
+                          <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
+                          <span className="font-bold">
+                            {pendingOutgoing.toUsername}
+                          </span>
+                          <span className="text-[10px] text-amber-300 uppercase">
+                            WAITING FOR ACCEPTANCE...
+                          </span>
+                        </div>
+                      );
+                    }
+                    return (
                       <button
                         key={slotIdx}
                         type="button"
                         data-testid={`party-plus-slot-${slotIdx}`}
                         onClick={() => {
-                          // If there is an available friend not yet in party, quick-add or open Friends page
-                          const availableFriend = friendsList.find(
+                          const availableOnlineFriend = friendsList.find(
                             (f) =>
+                              f.online !== false &&
+                              f.status !== 'offline' &&
                               !partyMembers.some(
-                                (pm) => pm.username === f.username
+                                (pm) => pm.friendCode === f.friendCode
+                              ) &&
+                              !outgoingPendingPartyInvites.some(
+                                (inv) => inv.toCode === f.friendCode
                               )
                           );
-                          if (availableFriend && slotIdx === 0) {
-                            handleTogglePartyMember(availableFriend);
+                          if (availableOnlineFriend && slotIdx === 0) {
+                            handleSendPartyInvite(availableOnlineFriend);
                           } else {
                             setLobbyPage('friends');
                           }
                         }}
-                        title="Add Friend to Party"
+                        title="Invite Friend to Party"
                         className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-dashed border-white/30 hover:border-amber-400 text-xs font-mono text-slate-200 hover:text-amber-300 transition-colors cursor-pointer shadow-lg"
                         style={{ backgroundColor: 'rgba(9,13,22,0.82)' }}
                       >
@@ -1388,7 +1560,57 @@ export default function App() {
                       </button>
                     );
                   })}
+
+                  {partyMembers.length > 0 && (
+                    <button
+                      type="button"
+                      data-testid="lobby-play-vs-party-btn"
+                      onClick={() => handleStartDeployment('party-vs')}
+                      className="px-3.5 py-1.5 rounded-xl bg-rose-500 hover:bg-rose-400 text-slate-950 font-mono font-bold text-xs shadow-lg cursor-pointer"
+                    >
+                      ⚔ PLAY VS PARTY ({partyMembers[0].username})
+                    </button>
+                  )}
                 </div>
+
+                {/* Incoming Party Invite / Friend Request Quick Notification Banner on Main Screen */}
+                {incomingPendingPartyInvites.length > 0 && (
+                  <div
+                    data-testid="main-incoming-party-invite-banner"
+                    className="pointer-events-auto flex flex-wrap items-center gap-2.5 px-4 py-2 rounded-xl border border-amber-400 bg-slate-950/95 text-xs font-mono text-white shadow-2xl"
+                  >
+                    <span className="text-amber-300 font-bold">
+                      PARTY INVITE FROM{' '}
+                      {incomingPendingPartyInvites[0].fromUsername} (
+                      {incomingPendingPartyInvites[0].fromCode})
+                    </span>
+                    <button
+                      type="button"
+                      data-testid="main-accept-party-invite-btn"
+                      onClick={() =>
+                        handleRespondToPartyInvite(
+                          incomingPendingPartyInvites[0].id,
+                          'accept'
+                        )
+                      }
+                      className="px-3 py-1 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold cursor-pointer"
+                    >
+                      Accept Party
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleRespondToPartyInvite(
+                          incomingPendingPartyInvites[0].id,
+                          'decline'
+                        )
+                      }
+                      className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 cursor-pointer"
+                    >
+                      Decline
+                    </button>
+                  </div>
+                )}
               </div>
 
               {/* Bottom Bar: Minimalist Play Button + Current Mode/Map Pill */}
@@ -1822,13 +2044,13 @@ export default function App() {
               className="pointer-events-auto w-full max-w-5xl mx-auto my-auto rounded-2xl border border-white/15 p-5 shadow-2xl space-y-4 max-h-[80vh] overflow-y-auto"
               style={{ backgroundColor: 'rgba(9,13,22,0.94)' }}
             >
-              {/* Team Modes (1v1, 2v2, 3v3, 4v4, Offline Co-Op Split-Screen) */}
+              {/* Team Modes (1v1, 2v2, 3v3, 4v4, Party VS, 100-Player Battle Royale, Co-Op) */}
               <div>
                 <div className="text-xs font-mono text-amber-400 uppercase mb-1">
-                  1. SELECT MATCH MODE (1V1 TO MAXIMUM 4V4 &amp; OFFLINE CO-OP
-                  SPLIT-SCREEN)
+                  1. SELECT MATCH MODE (1V1, 2V2, 3V3, 4V4, PARTY VS PARTY &amp;
+                  100-PLAYER BATTLE ROYALE)
                 </div>
-                <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
                   {Object.values(BATTLE_MODES).map((m) => {
                     const active = battleMode === m.id;
                     return (
@@ -1850,7 +2072,13 @@ export default function App() {
                               {m.shortLabel}
                             </span>
                           </div>
-                          <p className="text-[11px] text-slate-400">
+                          <div className="text-[10px] font-mono text-emerald-300 mb-1">
+                            {m.arenaSizeLabel} ·{' '}
+                            {m.useChunkStreaming
+                              ? '∞ CHUNK STREAMING'
+                              : 'TAILORED ARENA'}
+                          </div>
+                          <p className="text-[11px] text-slate-400 line-clamp-2">
                             {m.description}
                           </p>
                         </div>
@@ -1860,10 +2088,19 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Bot Hardness Levels (Beginner to Legend) */}
+              {/* Bot Hardness Levels (Beginner to Legend) + 25-Block Stealth Rule */}
               <div className="pt-2 border-t border-white/10">
-                <div className="text-xs font-mono text-sky-400 uppercase mb-1">
-                  2. SELECT BOT HARDNESS LEVEL (BEGINNER TO LEGEND)
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
+                  <div className="text-xs font-mono text-sky-400 uppercase">
+                    2. SELECT BOT HARDNESS LEVEL (BEGINNER TO LEGEND)
+                  </div>
+                  <div
+                    data-testid="bot-discovery-rule-badge"
+                    className="text-[10px] font-mono text-emerald-300 bg-emerald-500/10 border border-emerald-400/30 px-2.5 py-0.5 rounded"
+                  >
+                    ANTI-CHAOS AI: BOTS ONLY DISCOVER &amp; ENGAGE WITHIN{' '}
+                    {BOT_DISCOVERY_RADIUS} BLOCKS
+                  </div>
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-5 gap-2.5">
                   {Object.values(BOT_HARDNESS_TIERS).map((tier) => {
@@ -1895,15 +2132,17 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 5 Infinite Procedural Chunk Biomes + Weather Atmosphere Masking */}
+              {/* 9 Maps (Including Playground, Forest, Water Splash & Abandoned Theme Park) */}
               <div className="pt-2 border-t border-white/10 space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
                     <span className="text-xs font-mono text-emerald-400 uppercase block">
-                      3. INFINITE PROCEDURAL CHUNK BIOME (UNBOUNDED 64M × 64M STREAMING CHUNKS)
+                      3. SELECT COMBAT MAP ({currentModeDef.arenaSizeLabel})
                     </span>
                     <span className="text-[11px] text-slate-400">
-                      Terrain, cover, foliage, and salvage stream seamlessly in every direction as you move.
+                      {currentModeDef.useChunkStreaming
+                        ? 'Open-world mode active: 64m × 64m procedural chunks stream endlessly in all directions.'
+                        : `Fixed-team mode (${currentModeDef.shortLabel}) active: Uses tailored ${currentModeDef.arenaSizeLabel} bounds without infinite chunk streaming.`}
                     </span>
                   </div>
                   <button
@@ -1911,10 +2150,10 @@ export default function App() {
                     onClick={() => handleStartDeployment()}
                     className="px-4 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-xs cursor-pointer"
                   >
-                    Deploy Into Infinite World →
+                    Deploy Into {currentBiome.name} →
                   </button>
                 </div>
-                <div className="grid grid-cols-1 sm:grid-cols-5 gap-2.5">
+                <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-3 gap-2.5">
                   {(Object.keys(BIOMES) as MapId[]).map((id) => {
                     const b = BIOMES[id];
                     const active = mapId === id;
@@ -1937,7 +2176,11 @@ export default function App() {
                               style={{ backgroundColor: b.accentHex }}
                             />
                             <span className="text-[10px] font-mono text-amber-300">
-                              ∞ CHUNKS
+                              {currentModeDef.useChunkStreaming
+                                ? '∞ CHUNK STREAM'
+                                : currentModeDef.arenaSizeLabel.split(' ')[0] +
+                                  '×' +
+                                  currentModeDef.arenaSizeLabel.split(' ')[2]}
                             </span>
                           </div>
                           <div className="text-xs font-bold leading-snug">
@@ -2109,12 +2352,18 @@ export default function App() {
               )}
 
               <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
-                {/* Real Friends Roster + Add to Party (Zero Bot Friends) */}
-                <div className="md:col-span-7 space-y-2">
-                  <div className="text-xs font-semibold text-slate-300">
-                    Real Friends List ({friendsList.length}) · Click [+] to Add to
-                    Party ({partyMembers.length}/3)
+                {/* Only Your Friends Roster + Online/Offline Availability + Party Handshake */}
+                <div className="md:col-span-7 space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <div className="text-xs font-semibold text-slate-300">
+                      Your Friends Only ({friendsList.length}) · Online / Offline
+                      Availability
+                    </div>
+                    <span className="text-[10px] font-mono text-emerald-400">
+                      Party ({partyMembers.length}/3)
+                    </span>
                   </div>
+
                   <div className="space-y-2">
                     {friendsList.length === 0 ? (
                       <div
@@ -2122,15 +2371,15 @@ export default function App() {
                         className="p-4 rounded-xl bg-slate-950 border border-white/10 text-xs text-slate-400 font-mono space-y-1"
                       >
                         <div className="text-slate-200 font-bold">
-                          No friends added yet (0 Bot Friends).
+                          Your Friends list is empty (Only your added friends are
+                          shown here).
                         </div>
                         <div>
                           Share your personal code{' '}
                           <span className="text-amber-300 font-bold">
                             {friendCode}
                           </span>{' '}
-                          or enter another real player&apos;s Friend Code above to
-                          connect!
+                          or enter a friend&apos;s code above to add them!
                         </div>
                       </div>
                     ) : (
@@ -2138,142 +2387,186 @@ export default function App() {
                         const inParty = partyMembers.some(
                           (pm) => pm.friendCode === f.friendCode
                         );
+                        const pendingInviteSent = outgoingPendingPartyInvites.some(
+                          (inv) => inv.toCode === f.friendCode
+                        );
+                        const isOnline =
+                          f.online !== false && f.status !== 'offline';
+
                         return (
                           <div
                             key={f.friendCode}
                             data-testid={`friend-row-${f.friendCode}`}
-                            className="flex items-center justify-between p-2.5 rounded-xl bg-slate-900 border border-white/10"
+                            className="flex flex-wrap items-center justify-between gap-2 p-3 rounded-xl bg-slate-900 border border-white/10"
                           >
                             <div className="flex items-center gap-2.5">
                               <span
                                 className={`w-2.5 h-2.5 rounded-full ${
-                                  f.status === 'online'
-                                    ? 'bg-emerald-400'
-                                    : 'bg-amber-400'
+                                  isOnline ? 'bg-emerald-400' : 'bg-slate-500'
                                 }`}
                               />
                               <div>
-                                <div className="text-xs font-mono font-bold text-white">
-                                  {f.username}{' '}
+                                <div className="flex items-center gap-2 text-xs font-mono font-bold text-white">
+                                  <span>{f.username}</span>
                                   <span className="text-amber-300">
                                     [{f.friendCode}]
-                                  </span>{' '}
+                                  </span>
                                   <span className="text-sky-400">
                                     LVL {f.level}
                                   </span>
+                                  <span
+                                    data-testid={`friend-availability-${f.friendCode}`}
+                                    className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold ${
+                                      isOnline
+                                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/40'
+                                        : 'bg-slate-800 text-slate-400 border border-white/10'
+                                    }`}
+                                  >
+                                    {isOnline
+                                      ? 'ONLINE · AVAILABLE'
+                                      : 'OFFLINE · UNAVAILABLE'}
+                                  </span>
                                 </div>
-                                <div className="text-[10px] font-mono text-slate-400">
-                                  Skin:{' '}
-                                  {OPERATOR_SKINS[f.skinId]?.name ||
-                                    'Vanguard Obsidian'}
+                                <div className="text-[10px] font-mono text-slate-400 mt-0.5 flex items-center gap-2">
+                                  <span>
+                                    Skin:{' '}
+                                    {OPERATOR_SKINS[f.skinId]?.name ||
+                                      'Vanguard Obsidian'}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    data-testid={`toggle-friend-online-${f.friendCode}`}
+                                    onClick={() =>
+                                      handleToggleAccountOnlineStatus(
+                                        f.friendCode,
+                                        !isOnline
+                                      )
+                                    }
+                                    className="text-[10px] text-sky-400 hover:underline cursor-pointer"
+                                  >
+                                    [Set {isOnline ? 'Offline' : 'Online'}]
+                                  </button>
                                 </div>
                               </div>
                             </div>
 
-                            <button
-                              type="button"
-                              data-testid={`friend-party-toggle-${f.friendCode}`}
-                              onClick={() => handleTogglePartyMember(f)}
-                              className={`px-3 py-1.5 rounded-lg font-mono text-xs font-bold cursor-pointer ${
-                                inParty
-                                  ? 'bg-emerald-500 text-slate-950'
-                                  : 'bg-slate-800 hover:bg-amber-500 hover:text-slate-950 text-slate-200'
-                              }`}
-                            >
-                              {inParty ? 'IN PARTY [ACTIVE]' : '+ ADD TO PARTY'}
-                            </button>
+                            <div className="flex items-center gap-1.5">
+                              {inParty ? (
+                                <>
+                                  <span
+                                    data-testid={`friend-in-party-badge-${f.friendCode}`}
+                                    className="px-2.5 py-1.5 rounded-lg bg-emerald-500 text-slate-950 font-mono text-xs font-bold"
+                                  >
+                                    ✓ IN PARTY (ON SCREEN)
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleLeaveOrRemovePartyMember(f.friendCode)
+                                    }
+                                    className="px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-rose-500/20 text-rose-300 font-mono text-xs cursor-pointer"
+                                  >
+                                    Leave
+                                  </button>
+                                </>
+                              ) : pendingInviteSent ? (
+                                <span
+                                  data-testid={`friend-party-waiting-${f.friendCode}`}
+                                  className="px-3 py-1.5 rounded-lg bg-amber-500/20 border border-amber-400 text-amber-300 font-mono text-xs font-bold"
+                                >
+                                  ⏳ WAITING FOR ACCEPT...
+                                </span>
+                              ) : (
+                                <button
+                                  type="button"
+                                  disabled={!isOnline}
+                                  data-testid={`friend-party-invite-${f.friendCode}`}
+                                  onClick={() => handleSendPartyInvite(f)}
+                                  className={`px-3 py-1.5 rounded-lg font-mono text-xs font-bold transition-colors ${
+                                    isOnline
+                                      ? 'bg-slate-800 hover:bg-amber-500 hover:text-slate-950 text-slate-200 cursor-pointer'
+                                      : 'bg-slate-950 text-slate-600 border border-white/5 cursor-not-allowed'
+                                  }`}
+                                >
+                                  {isOnline
+                                    ? '+ INVITE TO PARTY'
+                                    : 'OFFLINE'}
+                                </button>
+                              )}
+                            </div>
                           </div>
                         );
                       })
                     )}
                   </div>
 
-                  {/* Active Real Online Players Directory (Quick Click Code) */}
-                  <div className="pt-2">
-                    <div className="text-[11px] font-mono text-sky-300 uppercase mb-1.5">
-                      Real Players Currently Registered Online (
-                      {
-                        onlineDirectory.filter((p) => p.friendCode !== friendCode)
-                          .length
-                      }
-                      )
+                  {/* Active Party Summary + Play vs Party Mode Shortcut */}
+                  {partyMembers.length > 0 && (
+                    <div
+                      data-testid="active-party-summary-card"
+                      className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-400/40 flex flex-wrap items-center justify-between gap-2"
+                    >
+                      <div className="text-xs font-mono text-emerald-200">
+                        <span className="font-bold text-emerald-300">
+                          SHARED 3D PARTY ACTIVE:
+                        </span>{' '}
+                        {partyMembers.map((m) => m.username).join(', ')} standing
+                        on your lobby screen!
+                      </div>
+                      <button
+                        type="button"
+                        data-testid="friends-page-play-vs-party-btn"
+                        onClick={() => handleStartDeployment('party-vs')}
+                        className="px-3 py-1.5 rounded-lg bg-rose-500 hover:bg-rose-400 text-slate-950 font-mono font-bold text-xs cursor-pointer"
+                      >
+                        ⚔ Play VS Your Party Now →
+                      </button>
                     </div>
-                    {onlineDirectory.filter((p) => p.friendCode !== friendCode)
-                      .length === 0 ? (
-                      <div className="p-2.5 rounded-xl bg-slate-950/80 border border-white/5 text-[11px] font-mono text-slate-400">
-                        Waiting for other real players to connect online. Open a
-                        second tab or invite a friend to see them live!
-                      </div>
-                    ) : (
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                        {onlineDirectory
-                          .filter((p) => p.friendCode !== friendCode)
-                          .map((p) => (
-                            <div
-                              key={p.friendCode}
-                              className="p-2 rounded-lg bg-slate-950 border border-white/10 flex items-center justify-between text-xs font-mono"
-                            >
-                              <div>
-                                <div className="font-bold text-white">
-                                  {p.username}
-                                </div>
-                                <div className="text-[10px] text-amber-300">
-                                  {p.friendCode} · LVL {p.level}
-                                </div>
-                              </div>
-                              <button
-                                type="button"
-                                onClick={() => setFriendCodeInput(p.friendCode)}
-                                className="px-2 py-1 rounded bg-slate-800 hover:bg-amber-500 hover:text-slate-950 text-[10px] text-amber-300 font-bold cursor-pointer"
-                              >
-                                Use Code
-                              </button>
-                            </div>
-                          ))}
-                      </div>
-                    )}
-                  </div>
+                  )}
                 </div>
 
-                {/* Incoming & Outgoing Real Friend Requests via Code */}
-                <div className="md:col-span-5 space-y-2">
-                  <div className="text-xs font-semibold text-slate-300">
-                    Real Friend Requests ({friendRequests.length})
-                  </div>
-                  <div className="space-y-2">
-                    {friendRequests.length === 0 ? (
+                {/* Right Column: Party Invites Handshake + Friend Requests */}
+                <div className="md:col-span-5 space-y-3">
+                  {/* Party Invites Section */}
+                  <div className="space-y-1.5">
+                    <div className="text-xs font-semibold text-amber-300">
+                      Party Invites ({partyInvites.length})
+                    </div>
+                    {partyInvites.length === 0 ? (
                       <div className="p-3 rounded-xl bg-slate-950 border border-white/5 text-xs text-slate-400 font-mono">
-                        No pending friend requests. Enter a registered player&apos;s
-                        Friend Code above to send a real-time request!
+                        No active party invites. Invite an ONLINE friend to your
+                        party — they will see the invite and once accepted, both
+                        3D operators appear on screen!
                       </div>
                     ) : (
-                      friendRequests.map((req) => (
+                      partyInvites.map((inv) => (
                         <div
-                          key={req.id}
-                          data-testid={`friend-request-card-${req.id}`}
-                          className="p-2.5 rounded-xl bg-slate-900 border border-white/10 flex items-center justify-between gap-2"
+                          key={inv.id}
+                          data-testid={`party-invite-card-${inv.id}`}
+                          className="p-2.5 rounded-xl bg-slate-900 border border-amber-400/30 flex items-center justify-between gap-2"
                         >
                           <div>
                             <div className="text-xs font-mono font-bold text-white">
-                              {req.fromCode === friendCode
-                                ? `To: ${req.toUsername} (${req.toCode})`
-                                : `From: ${req.fromUsername} (${req.fromCode})`}
+                              {inv.fromCode === friendCode
+                                ? `To: ${inv.toUsername} (${inv.toCode})`
+                                : `From: ${inv.fromUsername} (${inv.fromCode})`}
                             </div>
-                            <div className="text-[10px] font-mono text-amber-400 uppercase">
-                              {req.status}
+                            <div className="text-[10px] font-mono text-amber-300 uppercase">
+                              {inv.status === 'pending'
+                                ? inv.fromCode === friendCode
+                                  ? 'WAITING FOR ACCEPTANCE...'
+                                  : 'INVITED YOU TO PARTY'
+                                : inv.status}
                             </div>
                           </div>
-                          {req.status === 'pending' &&
-                            req.fromCode !== friendCode && (
+                          {inv.status === 'pending' &&
+                            inv.toCode === friendCode && (
                               <div className="flex items-center gap-1.5">
                                 <button
                                   type="button"
-                                  data-testid={`accept-request-${req.id}`}
+                                  data-testid={`accept-party-invite-${inv.id}`}
                                   onClick={() =>
-                                    handleRespondToFriendRequest(
-                                      req.id,
-                                      'accept'
-                                    )
+                                    handleRespondToPartyInvite(inv.id, 'accept')
                                   }
                                   className="px-2.5 py-1 rounded bg-emerald-500 text-slate-950 font-mono font-bold text-[11px] cursor-pointer"
                                 >
@@ -2281,12 +2574,9 @@ export default function App() {
                                 </button>
                                 <button
                                   type="button"
-                                  data-testid={`decline-request-${req.id}`}
+                                  data-testid={`decline-party-invite-${inv.id}`}
                                   onClick={() =>
-                                    handleRespondToFriendRequest(
-                                      req.id,
-                                      'decline'
-                                    )
+                                    handleRespondToPartyInvite(inv.id, 'decline')
                                   }
                                   className="px-2 py-1 rounded bg-slate-800 text-slate-300 font-mono text-[11px] cursor-pointer"
                                 >
@@ -2297,6 +2587,71 @@ export default function App() {
                         </div>
                       ))
                     )}
+                  </div>
+
+                  {/* Friend Requests Section */}
+                  <div className="space-y-1.5 pt-2 border-t border-white/10">
+                    <div className="text-xs font-semibold text-slate-300">
+                      Friend Requests ({friendRequests.length})
+                    </div>
+                    <div className="space-y-2">
+                      {friendRequests.length === 0 ? (
+                        <div className="p-3 rounded-xl bg-slate-950 border border-white/5 text-xs text-slate-400 font-mono">
+                          No pending friend requests. Enter a player&apos;s
+                          Friend Code above to send a request!
+                        </div>
+                      ) : (
+                        friendRequests.map((req) => (
+                          <div
+                            key={req.id}
+                            data-testid={`friend-request-card-${req.id}`}
+                            className="p-2.5 rounded-xl bg-slate-900 border border-white/10 flex items-center justify-between gap-2"
+                          >
+                            <div>
+                              <div className="text-xs font-mono font-bold text-white">
+                                {req.fromCode === friendCode
+                                  ? `To: ${req.toUsername} (${req.toCode})`
+                                  : `From: ${req.fromUsername} (${req.fromCode})`}
+                              </div>
+                              <div className="text-[10px] font-mono text-amber-400 uppercase">
+                                {req.status}
+                              </div>
+                            </div>
+                            {req.status === 'pending' &&
+                              req.fromCode !== friendCode && (
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    data-testid={`accept-request-${req.id}`}
+                                    onClick={() =>
+                                      handleRespondToFriendRequest(
+                                        req.id,
+                                        'accept'
+                                      )
+                                    }
+                                    className="px-2.5 py-1 rounded bg-emerald-500 text-slate-950 font-mono font-bold text-[11px] cursor-pointer"
+                                  >
+                                    Accept
+                                  </button>
+                                  <button
+                                    type="button"
+                                    data-testid={`decline-request-${req.id}`}
+                                    onClick={() =>
+                                      handleRespondToFriendRequest(
+                                        req.id,
+                                        'decline'
+                                      )
+                                    }
+                                    className="px-2 py-1 rounded bg-slate-800 text-slate-300 font-mono text-[11px] cursor-pointer"
+                                  >
+                                    Decline
+                                  </button>
+                                </div>
+                              )}
+                          </div>
+                        ))
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
@@ -2638,14 +2993,19 @@ export default function App() {
                     {currentModeDef.shortLabel} · {currentHardnessDef.name}
                   </div>
                   <div className="text-lg font-display font-bold tabular-nums text-white">
-                    WAVE {hud.wave}/{hud.totalWaves}
+                    {battleMode === 'battle-royale'
+                      ? `ALIVE ${hud.brPlayersAlive ?? 100}/100`
+                      : `WAVE ${hud.wave}/${hud.totalWaves}`}
                   </div>
                 </div>
                 <div>
                   <div className="text-[10px] font-mono uppercase text-slate-400">
-                    HOSTILES
+                    {battleMode === 'party-vs' ? 'PARTY RIVALS' : 'HOSTILES'}
                   </div>
-                  <div className="text-lg font-display font-bold tabular-nums text-rose-400">
+                  <div
+                    data-testid="hud-hostiles-remaining"
+                    className="text-lg font-display font-bold tabular-nums text-rose-400"
+                  >
                     {hud.enemiesRemaining}
                   </div>
                 </div>
@@ -2660,18 +3020,25 @@ export default function App() {
               </div>
               <div
                 data-testid="hud-chunk-weather-badge"
-                className="text-[10px] font-mono text-emerald-300 flex items-center gap-2 border-t border-white/10 pt-1"
+                className="text-[10px] font-mono text-emerald-300 flex flex-wrap items-center gap-2 border-t border-white/10 pt-1"
               >
-                <span>CHUNK [{hud.activeChunkKey}]</span>
+                <span>
+                  {hud.useChunkStreaming
+                    ? `CHUNK [${hud.activeChunkKey}] · ${hud.loadedChunkCount} STREAMING`
+                    : `${hud.arenaSizeLabel}`}
+                </span>
                 <span className="text-slate-500">·</span>
-                <span>{hud.loadedChunkCount} STREAMING</span>
-                <span className="text-slate-500">·</span>
-                <span className="text-sky-300">
-                  {weatherMode === 'light-rain-blur'
-                    ? 'LIGHT RAIN + BLUR'
-                    : weatherMode === 'storm-squall'
-                      ? 'STORM SQUALL'
-                      : 'HORIZON MIST'}
+                <span
+                  data-testid="hud-stealth-discovery-badge"
+                  className={
+                    hud.discoveredByCount > 0
+                      ? 'text-amber-300 font-bold'
+                      : 'text-emerald-300'
+                  }
+                >
+                  {hud.discoveredByCount > 0
+                    ? `ENGAGED (${hud.discoveredByCount} IN 25M)`
+                    : 'STEALTH (>25 BLOCKS)'}
                 </span>
               </div>
             </div>

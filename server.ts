@@ -233,8 +233,8 @@ interface SharedWall {
 const roomOperators = new Map<string, RemoteOperator>();
 const roomWalls = new Map<string, SharedWall>();
 const clientMap = new Map<WebSocket, string>();
+const wsCodeMap = new Map<WebSocket, string>();
 
-// Seed 2 persistent server-authoritative squad bots in the multiplayer room so players immediately see live squadmates/opponents
 function ensureSeedSquadState() {
   if (!roomWalls.has('wall-seed-alpha')) {
     roomWalls.set('wall-seed-alpha', {
@@ -302,13 +302,14 @@ async function startServer() {
     });
   });
 
-  // Real Online Account Directory & Friend Code Request System (No Bot Accounts)
+  // Real Online Account Directory, Friend Code Requests & Party Handshake System (No Bot Accounts)
   interface OnlineAccountEntry {
     friendCode: string;
     username: string;
     level: number;
     skinId: string;
-    status: 'online' | 'in-match' | 'idle';
+    status: 'online' | 'in-match' | 'offline';
+    online: boolean;
     updatedAt: number;
   }
 
@@ -318,6 +319,20 @@ async function startServer() {
     toCode: string;
     fromUsername: string;
     toUsername: string;
+    status: 'pending' | 'accepted' | 'declined';
+    timestamp: number;
+  }
+
+  interface ServerPartyInvite {
+    id: string;
+    fromCode: string;
+    fromUsername: string;
+    fromLevel: number;
+    fromSkinId: string;
+    toCode: string;
+    toUsername: string;
+    toLevel: number;
+    toSkinId: string;
     status: 'pending' | 'accepted' | 'declined';
     timestamp: number;
   }
@@ -350,6 +365,7 @@ async function startServer() {
   // Strictly real registered accounts only — zero bot friends
   const onlineAccounts = new Map<string, OnlineAccountEntry>();
   const serverFriendRequests: ServerFriendRequest[] = [];
+  const serverPartyInvites: ServerPartyInvite[] = [];
 
   app.post('/api/accounts/register', (req, res) => {
     const rawUsername = String(req.body?.username || '').trim().slice(0, 28);
@@ -361,31 +377,68 @@ async function startServer() {
     const friendCode =
       /^VX-[A-Z0-9]{6}$/.test(rawCode) ? rawCode : generateCodeFromUsername(rawUsername);
 
+    const requestedStatus =
+      req.body?.status === 'offline' || req.body?.online === false
+        ? 'offline'
+        : req.body?.status === 'in-match'
+          ? 'in-match'
+          : 'online';
+
     const entry: OnlineAccountEntry = {
       friendCode,
       username: rawUsername,
       level: Math.max(1, Number(req.body?.level || 1)),
       skinId: String(req.body?.skinId || 'vanguard-obsidian'),
-      status:
-        req.body?.status === 'in-match' || req.body?.status === 'idle'
-          ? req.body.status
-          : 'online',
+      status: requestedStatus,
+      online: requestedStatus !== 'offline',
       updatedAt: Date.now(),
     };
     onlineAccounts.set(friendCode, entry);
 
-    // Update any existing friend requests with latest username for this code
     for (const r of serverFriendRequests) {
       if (r.fromCode === friendCode) r.fromUsername = rawUsername;
       if (r.toCode === friendCode) r.toUsername = rawUsername;
+    }
+    for (const p of serverPartyInvites) {
+      if (p.fromCode === friendCode) {
+        p.fromUsername = rawUsername;
+        p.fromLevel = entry.level;
+        p.fromSkinId = entry.skinId;
+      }
+      if (p.toCode === friendCode) {
+        p.toUsername = rawUsername;
+        p.toLevel = entry.level;
+        p.toSkinId = entry.skinId;
+      }
     }
 
     broadcast({ type: 'account:registered', account: entry });
     res.json({
       ok: true,
       account: entry,
-      directory: Array.from(onlineAccounts.values()),
     });
+  });
+
+  // Update online / offline availability status for an account
+  app.post('/api/accounts/status', (req, res) => {
+    const friendCode = normalizeCodeServer(String(req.body?.friendCode || ''));
+    const existing = onlineAccounts.get(friendCode);
+    if (!existing) {
+      res.status(404).json({ error: `Account ${friendCode} not found.` });
+      return;
+    }
+    const nextStatus =
+      req.body?.status === 'offline' || req.body?.online === false
+        ? 'offline'
+        : req.body?.status === 'in-match'
+          ? 'in-match'
+          : 'online';
+    existing.status = nextStatus;
+    existing.online = nextStatus !== 'offline';
+    existing.updatedAt = Date.now();
+    onlineAccounts.set(friendCode, existing);
+    broadcast({ type: 'account:status', account: existing });
+    res.json({ ok: true, account: existing });
   });
 
   function buildFriendsStateForCode(rawCode: string, rawUsername: string) {
@@ -420,6 +473,29 @@ async function startServer() {
       }
     }
 
+    // Party invites involving this player
+    const partyInvites = serverPartyInvites
+      .filter(
+        (p) =>
+          p.status !== 'declined' &&
+          (p.fromCode === myCode || p.toCode === myCode)
+      )
+      .map((p) => ({
+        ...p,
+        direction: (p.fromCode === myCode ? 'outgoing' : 'incoming') as 'outgoing' | 'incoming',
+      }));
+
+    // Accepted party members (mutual: both inviter and invitee see each other in their active party!)
+    const acceptedPartyCodes = new Set<string>();
+    for (const p of partyInvites) {
+      if (p.status === 'accepted') {
+        const otherCode = p.fromCode === myCode ? p.toCode : p.fromCode;
+        if (otherCode && otherCode !== myCode) {
+          acceptedPartyCodes.add(otherCode);
+        }
+      }
+    }
+
     const friends = Array.from(acceptedFriendCodes)
       .map((code) => onlineAccounts.get(code))
       .filter((entry): entry is OnlineAccountEntry => Boolean(entry))
@@ -429,13 +505,28 @@ async function startServer() {
         level: entry.level,
         skinId: entry.skinId,
         status: entry.status,
-        inParty: false,
+        online: entry.online,
+        inParty: acceptedPartyCodes.has(entry.friendCode),
+      }));
+
+    const partyMembers = Array.from(acceptedPartyCodes)
+      .map((code) => onlineAccounts.get(code))
+      .filter((entry): entry is OnlineAccountEntry => Boolean(entry))
+      .map((entry) => ({
+        friendCode: entry.friendCode,
+        username: entry.username,
+        level: entry.level,
+        skinId: entry.skinId,
+        status: entry.status,
+        online: entry.online,
+        inParty: true,
       }));
 
     return {
       friends,
       requests,
-      directory: Array.from(onlineAccounts.values()),
+      partyInvites,
+      partyMembers,
     };
   }
 
@@ -455,7 +546,6 @@ async function startServer() {
         ? rawFromCode
         : generateCodeFromUsername(fromUsername);
 
-    // Ensure sender is registered in the directory
     if (!onlineAccounts.has(fromCode)) {
       onlineAccounts.set(fromCode, {
         friendCode: fromCode,
@@ -463,6 +553,7 @@ async function startServer() {
         level: Math.max(1, Number(req.body?.fromLevel || 1)),
         skinId: String(req.body?.fromSkinId || 'vanguard-obsidian'),
         status: 'online',
+        online: true,
         updatedAt: Date.now(),
       });
     }
@@ -492,7 +583,6 @@ async function startServer() {
       return;
     }
 
-    // Check if an active or accepted request already exists between these two codes
     const existingReq = serverFriendRequests.find(
       (r) =>
         r.status !== 'declined' &&
@@ -507,7 +597,6 @@ async function startServer() {
         });
         return;
       }
-      // If the other player had already sent us a pending request, auto-accept both!
       if (existingReq.fromCode === toCode && existingReq.status === 'pending') {
         existingReq.status = 'accepted';
         broadcast({ type: 'friend:responded', request: existingReq });
@@ -563,6 +652,125 @@ async function startServer() {
     res.json({ ok: true, request: found, ...state });
   });
 
+  // Party Invite Handshake: Sender must wait until the invited friend accepts the party request
+  app.post('/api/party/invite', (req, res) => {
+    const fromCode = normalizeCodeServer(String(req.body?.fromCode || ''));
+    const fromUsername = String(req.body?.fromUsername || 'VANGUARD_01').trim();
+    const fromLevel = Math.max(1, Number(req.body?.fromLevel || 1));
+    const fromSkinId = String(req.body?.fromSkinId || 'vanguard-obsidian');
+    const toCode = normalizeCodeServer(String(req.body?.toCode || ''));
+
+    if (!fromCode || !toCode || fromCode === toCode) {
+      res.status(400).json({ error: 'Invalid party invite target code.' });
+      return;
+    }
+
+    const targetAccount = onlineAccounts.get(toCode);
+    if (!targetAccount) {
+      res.status(404).json({ error: `Friend ${toCode} not found.` });
+      return;
+    }
+
+    if (!targetAccount.online || targetAccount.status === 'offline') {
+      res.status(400).json({
+        error: `${targetAccount.username} (${toCode}) is currently OFFLINE and unavailable for party invites.`,
+      });
+      return;
+    }
+
+    // Check if an active or pending party invite already exists between these two players
+    const existingInvite = serverPartyInvites.find(
+      (p) =>
+        p.status !== 'declined' &&
+        ((p.fromCode === fromCode && p.toCode === toCode) ||
+          (p.fromCode === toCode && p.toCode === fromCode))
+    );
+
+    if (existingInvite) {
+      if (existingInvite.status === 'accepted') {
+        const state = buildFriendsStateForCode(fromCode, fromUsername);
+        res.json({ ok: true, invite: existingInvite, ...state });
+        return;
+      }
+      // If the other friend already invited us, auto-accept so both join the party immediately
+      if (existingInvite.fromCode === toCode && existingInvite.status === 'pending') {
+        existingInvite.status = 'accepted';
+        broadcast({ type: 'party:responded', invite: existingInvite });
+        const state = buildFriendsStateForCode(fromCode, fromUsername);
+        res.json({ ok: true, invite: existingInvite, ...state });
+        return;
+      }
+      const state = buildFriendsStateForCode(fromCode, fromUsername);
+      res.json({
+        ok: true,
+        invite: { ...existingInvite, direction: 'outgoing' },
+        ...state,
+      });
+      return;
+    }
+
+    const newInvite: ServerPartyInvite = {
+      id: `pinv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      fromCode,
+      fromUsername,
+      fromLevel,
+      fromSkinId,
+      toCode,
+      toUsername: targetAccount.username,
+      toLevel: targetAccount.level,
+      toSkinId: targetAccount.skinId,
+      status: 'pending',
+      timestamp: Date.now(),
+    };
+    serverPartyInvites.unshift(newInvite);
+    broadcast({ type: 'party:invite', invite: newInvite });
+
+    const state = buildFriendsStateForCode(fromCode, fromUsername);
+    res.json({
+      ok: true,
+      invite: { ...newInvite, direction: 'outgoing' },
+      ...state,
+    });
+  });
+
+  app.post('/api/party/respond', (req, res) => {
+    const friendCode = normalizeCodeServer(String(req.body?.friendCode || ''));
+    const username = String(req.body?.username || 'VANGUARD_01').trim();
+    const inviteId = String(req.body?.inviteId || '');
+    const action = req.body?.action === 'decline' ? 'declined' : 'accepted';
+
+    const found = serverPartyInvites.find((p) => p.id === inviteId);
+    if (!found) {
+      res.status(404).json({ error: 'Party invite not found.' });
+      return;
+    }
+    found.status = action;
+    broadcast({ type: 'party:responded', invite: found });
+    const state = buildFriendsStateForCode(friendCode, username);
+    res.json({ ok: true, invite: found, ...state });
+  });
+
+  app.post('/api/party/leave', (req, res) => {
+    const friendCode = normalizeCodeServer(String(req.body?.friendCode || ''));
+    const username = String(req.body?.username || 'VANGUARD_01').trim();
+    const targetCode = normalizeCodeServer(String(req.body?.targetCode || ''));
+
+    for (let i = serverPartyInvites.length - 1; i >= 0; i--) {
+      const p = serverPartyInvites[i];
+      const matchesPair =
+        targetCode
+          ? (p.fromCode === friendCode && p.toCode === targetCode) ||
+            (p.fromCode === targetCode && p.toCode === friendCode)
+          : p.fromCode === friendCode || p.toCode === friendCode;
+      if (matchesPair) {
+        serverPartyInvites.splice(i, 1);
+      }
+    }
+    broadcast({ type: 'party:updated', friendCode, targetCode });
+    const state = buildFriendsStateForCode(friendCode, username);
+    res.json({ ok: true, ...state });
+  });
+
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws' });
 
@@ -576,7 +784,6 @@ async function startServer() {
   }
 
   wss.on('connection', (ws) => {
-    // Send initial authoritative room snapshot
     ws.send(
       JSON.stringify({
         type: 'room:init',
@@ -594,6 +801,18 @@ async function startServer() {
           const id = String(msg.id || '').slice(0, 64);
           if (!id) return;
           clientMap.set(ws, id);
+
+          const rawCode = normalizeCodeServer(String(msg.friendCode || ''));
+          if (/^VX-[A-Z0-9]{6}$/.test(rawCode)) {
+            wsCodeMap.set(ws, rawCode);
+            const acc = onlineAccounts.get(rawCode);
+            if (acc) {
+              acc.online = true;
+              if (acc.status === 'offline') acc.status = 'online';
+              acc.updatedAt = Date.now();
+              onlineAccounts.set(rawCode, acc);
+            }
+          }
 
           const existing = roomOperators.get(id);
           const updated: RemoteOperator = {
@@ -669,7 +888,7 @@ async function startServer() {
           }
         } else if (eventType === 'wall:build') {
           const wallId = String(msg.id || '').slice(0, 64);
-          if (!wallId || roomWalls.has(wallId)) return; // Idempotency guard
+          if (!wallId || roomWalls.has(wallId)) return;
           const wallType = (
             ['barricade', 'rampart', 'bastion'].includes(String(msg.wallType))
               ? msg.wallType
@@ -688,7 +907,6 @@ async function startServer() {
             ownerCallsign: String(msg.ownerCallsign || 'OPERATOR').slice(0, 32),
             mapId: String(msg.mapId || 'alpine-outpost'),
           };
-          // Cap total walls at 40
           if (roomWalls.size >= 40) {
             const oldestKey = roomWalls.keys().next().value;
             if (oldestKey) roomWalls.delete(oldestKey);
@@ -722,6 +940,7 @@ async function startServer() {
         clientMap.delete(ws);
         broadcast({ type: 'player:left', id });
       }
+      wsCodeMap.delete(ws);
     });
   });
 

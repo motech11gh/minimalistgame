@@ -31,6 +31,10 @@ export interface VirtualTouchInputState {
 }
 
 export type MapId =
+  | 'playground'
+  | 'forest'
+  | 'water-splash'
+  | 'theme-park'
   | 'alpine-outpost'
   | 'dune-refinery'
   | 'emerald-citadel'
@@ -74,6 +78,8 @@ export type BattleModeId =
   | '2v2'
   | '3v3'
   | '4v4'
+  | 'party-vs'
+  | 'battle-royale'
   | 'coop-splitscreen'
   | 'practice';
 
@@ -120,7 +126,16 @@ export interface BiomeDefinition {
   terrainSecondaryHex: string;
   accentHex: string;
   elevationScale: number;
-  landmarkType: 'radar-dome' | 'refinery-silo' | 'canopy-bastion' | 'obsidian-reactor' | 'cryo-monolith';
+  landmarkType:
+    | 'playground-fort'
+    | 'forest-watchtower'
+    | 'water-slide-tower'
+    | 'ferris-wheel'
+    | 'radar-dome'
+    | 'refinery-silo'
+    | 'canopy-bastion'
+    | 'obsidian-reactor'
+    | 'cryo-monolith';
 }
 
 export interface WeaponDefinition {
@@ -195,6 +210,8 @@ export interface ObstacleBox {
   depth: number;
   climbable: boolean;
   vaultable: boolean;
+  colorHex?: string;
+  themePropType?: 'slide' | 'swing' | 'log-bunker' | 'pool-wall' | 'coaster-arch' | 'standard';
 }
 
 export interface PlayerPhysicsState {
@@ -240,6 +257,7 @@ export interface NpcEntity {
   koTimer: number;
   hitFlashTimer: number;
   strafeSign: number;
+  skinId?: SkinId;
 }
 
 export interface ProjectedOpponentOverlay {
@@ -255,6 +273,7 @@ export interface ProjectedOpponentOverlay {
   isWindup: boolean;
   distance: number;
   isSquadmate: boolean;
+  isDiscovered?: boolean;
   activeEmote?: string | null;
 }
 
@@ -281,6 +300,82 @@ export interface BuiltWallEntity {
 }
 
 export const BIOMES: Record<MapId, BiomeDefinition> = {
+  playground: {
+    id: 'playground',
+    name: 'Tactical Playground Park',
+    regionCode: 'SECTOR 06 · URBAN REC ZONE',
+    tagline: 'Colorful climbing forts, tube slides, swing sets, and sandpit cover blocks.',
+    skyTopHex: 0x0284c7,
+    skyHorizonHex: 0xbae6fd,
+    fogHex: 0x93c5fd,
+    fogDensity: 0.0075,
+    sunHex: 0xfffbeb,
+    sunIntensity: 2.5,
+    hemiSkyHex: 0xbae6fd,
+    hemiGroundHex: 0x15803d,
+    terrainPrimaryHex: '#16a34a',
+    terrainSecondaryHex: '#facc15',
+    accentHex: '#f97316',
+    elevationScale: 0.9,
+    landmarkType: 'playground-fort',
+  },
+  forest: {
+    id: 'forest',
+    name: 'Redwood Deep Forest',
+    regionCode: 'SECTOR 07 · CASCADIA TIMBERLINE',
+    tagline: 'Towering ancient redwoods, mossy boulders, hollow-log trenches, and timber watchtowers.',
+    skyTopHex: 0x052e16,
+    skyHorizonHex: 0x86efac,
+    fogHex: 0x4ade80,
+    fogDensity: 0.0095,
+    sunHex: 0xfef9c3,
+    sunIntensity: 2.1,
+    hemiSkyHex: 0x86efac,
+    hemiGroundHex: 0x14532d,
+    terrainPrimaryHex: '#14532d',
+    terrainSecondaryHex: '#3f6212',
+    accentHex: '#22c55e',
+    elevationScale: 1.75,
+    landmarkType: 'forest-watchtower',
+  },
+  'water-splash': {
+    id: 'water-splash',
+    name: 'Water Splash Aqua Park',
+    regionCode: 'SECTOR 08 · LAGOON SPLASH DOME',
+    tagline: 'Hydro-slides, shallow splash pools, aqua fountains, and lifeguard overwatch towers.',
+    skyTopHex: 0x0369a1,
+    skyHorizonHex: 0x67e8f9,
+    fogHex: 0x22d3ee,
+    fogDensity: 0.008,
+    sunHex: 0xffffff,
+    sunIntensity: 2.6,
+    hemiSkyHex: 0x67e8f9,
+    hemiGroundHex: 0x0e7490,
+    terrainPrimaryHex: '#0284c7',
+    terrainSecondaryHex: '#38bdf8',
+    accentHex: '#06b6d4',
+    elevationScale: 0.85,
+    landmarkType: 'water-slide-tower',
+  },
+  'theme-park': {
+    id: 'theme-park',
+    name: 'Abandoned Theme Park',
+    regionCode: 'SECTOR 09 · RUSTED CARNIVAL PIER',
+    tagline: 'Rusted Ferris wheel, overgrown rollercoaster arches, ticket booths, and carnival stalls.',
+    skyTopHex: 0x3b0764,
+    skyHorizonHex: 0xfb923c,
+    fogHex: 0xc084fc,
+    fogDensity: 0.009,
+    sunHex: 0xfed7aa,
+    sunIntensity: 2.25,
+    hemiSkyHex: 0xe879f9,
+    hemiGroundHex: 0x334155,
+    terrainPrimaryHex: '#334155',
+    terrainSecondaryHex: '#7c2d12',
+    accentHex: '#ec4899',
+    elevationScale: 1.4,
+    landmarkType: 'ferris-wheel',
+  },
   'alpine-outpost': {
     id: 'alpine-outpost',
     name: 'Alpine Bio-Research Outpost',
@@ -517,7 +612,7 @@ export const BARREL_ATTACHMENTS: Record<BarrelId, AttachmentModifiers> = {
   },
   'tactical-suppressor': {
     id: 'tactical-suppressor',
-    name: ' monolithic Whisper Suppressor',
+    name: 'Monolithic Whisper Suppressor',
     slot: 'barrel',
     summary: 'Silences acoustic signature · -12% Recoil · +8% Range',
     recoilMult: 0.88,
@@ -528,7 +623,7 @@ export const BARREL_ATTACHMENTS: Record<BarrelId, AttachmentModifiers> = {
     id: 'muzzle-compensator',
     name: 'Dual-Port Muzzle Brake',
     slot: 'barrel',
-    summary: '-28% Vertical RecoilClimb',
+    summary: '-28% Vertical Recoil Climb',
     recoilMult: 0.72,
   },
   'heavy-fluted': {
@@ -851,6 +946,10 @@ export const TRAINING_LEVELS = [
 ];
 
 export type DynamicEnvironmentEventId =
+  | 'playground-overdrive'
+  | 'redwood-mist-surge'
+  | 'aqua-geyser-burst'
+  | 'carnival-neon-surge'
   | 'cryo-blizzard'
   | 'solar-sandstorm'
   | 'bio-spore-bloom'
@@ -878,6 +977,82 @@ export interface DynamicEnvironmentEventDef {
 }
 
 export const DYNAMIC_ENVIRONMENT_EVENTS: Record<MapId, DynamicEnvironmentEventDef> = {
+  playground: {
+    id: 'playground-overdrive',
+    mapId: 'playground',
+    name: 'KINETIC BOUNCE OVERDRIVE',
+    subtitle: '+28% Jump Vault Height · +15% Sprint Cadence · High-Visibility Flare',
+    accentColor: '#f97316',
+    fogHex: 0xfde047,
+    fogDensityMult: 1.25,
+    sunIntensityMult: 1.15,
+    particleHex: 0xfacc15,
+    windDriftX: 0.3,
+    windDriftZ: 0.2,
+    speedMultiplier: 1.15,
+    damageMultiplier: 1.1,
+    shieldRegenBonus: 3.0,
+    hpRegenBonus: 2.0,
+    jumpMultiplier: 1.28,
+    disruptEnemyShields: false,
+  },
+  forest: {
+    id: 'redwood-mist-surge',
+    mapId: 'forest',
+    name: 'CANOPY SPORE & TIMBER MIST',
+    subtitle: '+7 HP/s Forest Bio-Regen · +20% Stealth Cover · Pine Spore Drift',
+    accentColor: '#22c55e',
+    fogHex: 0x166534,
+    fogDensityMult: 1.55,
+    sunIntensityMult: 0.82,
+    particleHex: 0x4ade80,
+    windDriftX: 0.35,
+    windDriftZ: -0.3,
+    speedMultiplier: 1.1,
+    damageMultiplier: 1.08,
+    shieldRegenBonus: 2.5,
+    hpRegenBonus: 7.0,
+    jumpMultiplier: 1.05,
+    disruptEnemyShields: false,
+  },
+  'water-splash': {
+    id: 'aqua-geyser-burst',
+    mapId: 'water-splash',
+    name: 'HYDRO-GEYSER TIDAL SURGE',
+    subtitle: '+25% Slide Velocity · +5 Shield/s Cooling · Hydro-Mist Spray',
+    accentColor: '#06b6d4',
+    fogHex: 0x38bdf8,
+    fogDensityMult: 1.4,
+    sunIntensityMult: 1.1,
+    particleHex: 0x67e8f9,
+    windDriftX: -0.4,
+    windDriftZ: 0.4,
+    speedMultiplier: 1.22,
+    damageMultiplier: 1.05,
+    shieldRegenBonus: 5.0,
+    hpRegenBonus: 2.0,
+    jumpMultiplier: 1.18,
+    disruptEnemyShields: false,
+  },
+  'theme-park': {
+    id: 'carnival-neon-surge',
+    mapId: 'theme-park',
+    name: 'CARNIVAL GRID OVERCHARGE',
+    subtitle: 'Shatters Hostile Shields · +20% Ballistic Output · Neon Spark Shower',
+    accentColor: '#ec4899',
+    fogHex: 0x701a75,
+    fogDensityMult: 1.5,
+    sunIntensityMult: 1.2,
+    particleHex: 0xf472b6,
+    windDriftX: 0.5,
+    windDriftZ: 0.35,
+    speedMultiplier: 1.12,
+    damageMultiplier: 1.2,
+    shieldRegenBonus: 3.5,
+    hpRegenBonus: 1.5,
+    jumpMultiplier: 1.12,
+    disruptEnemyShields: true,
+  },
   'alpine-outpost': {
     id: 'cryo-blizzard',
     mapId: 'alpine-outpost',
@@ -1041,13 +1216,19 @@ export interface BattleModeDefinition {
   name: string;
   shortLabel: string;
   allyCount: number; // Number of friendly AI/Squad teammates alongside Player 1
-  enemyCount: number; // Number of hostile bots per wave
+  enemyCount: number; // Number of hostile bots per wave (or initial active pool in Battle Royale)
+  totalCombatants: number; // Total players in match (e.g. 2 for 1v1, 4 for 2v2, 100 for Battle Royale)
   waves: number;
+  arenaRadius: number; // Mode-specific map radius in meters (smaller for 1v1/2v2, huge for Battle Royale)
+  arenaSizeLabel: string; // Human-readable map size label for this mode
+  useChunkStreaming: boolean; // True ONLY in non-fixed player modes (Battle Royale 100 & Practice)
   xpMultiplier: number;
   creditWinBonus: number;
   description: string;
   isSplitScreen?: boolean;
   isPractice?: boolean;
+  isPartyVs?: boolean;
+  isBattleRoyale?: boolean;
 }
 
 export const BATTLE_MODES: Record<BattleModeId, BattleModeDefinition> = {
@@ -1057,10 +1238,14 @@ export const BATTLE_MODES: Record<BattleModeId, BattleModeDefinition> = {
     shortLabel: '1v1 DUEL',
     allyCount: 0,
     enemyCount: 1,
-    waves: 3,
+    totalCombatants: 2,
+    waves: 1,
+    arenaRadius: 24,
+    arenaSizeLabel: '48m × 48m Compact Duel Arena (No Chunk Streaming)',
+    useChunkStreaming: false,
     xpMultiplier: 1.0,
     creditWinBonus: 140,
-    description: 'Pure head-to-head precision duel across 3 rounds in an expanded arena.',
+    description: 'Pure 1v1 duel against exactly 1 opponent on a compact 48m × 48m tailored map.',
   },
   '2v2': {
     id: '2v2',
@@ -1068,10 +1253,14 @@ export const BATTLE_MODES: Record<BattleModeId, BattleModeDefinition> = {
     shortLabel: '2v2 WINGMAN',
     allyCount: 1,
     enemyCount: 2,
-    waves: 2,
+    totalCombatants: 4,
+    waves: 1,
+    arenaRadius: 34,
+    arenaSizeLabel: '68m × 68m Small Wingman Arena (No Chunk Streaming)',
+    useChunkStreaming: false,
     xpMultiplier: 1.2,
     creditWinBonus: 180,
-    description: 'Deploy with 1 Allied Operator or Party Friend against a 2-unit hostile duo.',
+    description: 'Real 2v2 Wingman clash (You + 1 Ally vs 2 Rivals) on a small 68m × 68m arena.',
   },
   '3v3': {
     id: '3v3',
@@ -1079,29 +1268,73 @@ export const BATTLE_MODES: Record<BattleModeId, BattleModeDefinition> = {
     shortLabel: '3v3 SQUAD',
     allyCount: 2,
     enemyCount: 3,
-    waves: 2,
+    totalCombatants: 6,
+    waves: 1,
+    arenaRadius: 46,
+    arenaSizeLabel: '92m × 92m Medium Squad Arena (No Chunk Streaming)',
+    useChunkStreaming: false,
     xpMultiplier: 1.35,
     creditWinBonus: 220,
-    description: 'Coordinated 3-operator fireteam clashes with fortifications and crossfire.',
+    description: 'Real 3v3 fireteam skirmish (3 vs 3) on a medium 92m × 92m tactical sector.',
   },
   '4v4': {
     id: '4v4',
     name: '4v4 Maximum Strike Force',
-    shortLabel: '4v4 MAX WARFARE',
+    shortLabel: '4v4 STRIKE',
     allyCount: 3,
     enemyCount: 4,
-    waves: 2,
+    totalCombatants: 8,
+    waves: 1,
+    arenaRadius: 58,
+    arenaSizeLabel: '116m × 116m Full Strike Arena (No Chunk Streaming)',
+    useChunkStreaming: false,
     xpMultiplier: 1.55,
     creditWinBonus: 280,
-    description: 'Full 4v4 squad warfare across the expanded 192m × 192m sector.',
+    description: 'Full 4v4 squad warfare (4 vs 4) across a dedicated 116m × 116m battleground.',
+  },
+  'party-vs': {
+    id: 'party-vs',
+    name: 'Party Mode (Play vs Your Party)',
+    shortLabel: 'VS PARTY',
+    allyCount: 0,
+    enemyCount: 1,
+    totalCombatants: 2,
+    waves: 1,
+    arenaRadius: 30,
+    arenaSizeLabel: '60m × 60m Party Showdown Arena (No Chunk Streaming)',
+    useChunkStreaming: false,
+    xpMultiplier: 1.4,
+    creditWinBonus: 210,
+    description: 'Fight head-to-head against the friend(s) currently in your Party on a 60m × 60m arena!',
+    isPartyVs: true,
+  },
+  'battle-royale': {
+    id: 'battle-royale',
+    name: '100-Player Battle Royale',
+    shortLabel: '100P ROYALE',
+    allyCount: 0,
+    enemyCount: 99,
+    totalCombatants: 100,
+    waves: 1,
+    arenaRadius: 280,
+    arenaSizeLabel: '560m × 560m Massive Chunk-Generated Island',
+    useChunkStreaming: true,
+    xpMultiplier: 2.0,
+    creditWinBonus: 450,
+    description: '100 combatants drop onto a huge chunk-streaming map with 25-block stealth discovery zones.',
+    isBattleRoyale: true,
   },
   'coop-splitscreen': {
     id: 'coop-splitscreen',
     name: 'Offline Co-Op Split-Screen',
     shortLabel: '2P SPLIT-SCREEN',
     allyCount: 1,
-    enemyCount: 4,
-    waves: 2,
+    enemyCount: 2,
+    totalCombatants: 4,
+    waves: 1,
+    arenaRadius: 42,
+    arenaSizeLabel: '84m × 84m Co-Op Arena (No Chunk Streaming)',
+    useChunkStreaming: false,
     xpMultiplier: 1.45,
     creditWinBonus: 240,
     description: 'Dual-viewport local Co-Op: P1 (WASD/Mouse) + P2 (Arrows/Enter or Pad 2).',
@@ -1109,14 +1342,18 @@ export const BATTLE_MODES: Record<BattleModeId, BattleModeDefinition> = {
   },
   practice: {
     id: 'practice',
-    name: 'Practice & Target Range',
-    shortLabel: 'PRACTICE RANGE',
-    allyCount: 1,
+    name: 'Open Chunk Practice & Range',
+    shortLabel: 'CHUNK PRACTICE',
+    allyCount: 0,
     enemyCount: 5,
+    totalCombatants: 6,
     waves: 1,
+    arenaRadius: 9999,
+    arenaSizeLabel: 'Infinite 64m × 64m Procedural Chunk World',
+    useChunkStreaming: true,
     xpMultiplier: 0.85,
     creditWinBonus: 90,
-    description: 'Free-fire ballistics range with extra salvage (300) and customizable bot hardness.',
+    description: 'Infinite procedural chunk streaming world with 300 salvage and 25-block stealth AI.',
     isPractice: true,
   },
 };
@@ -1202,7 +1439,8 @@ export interface FriendProfile {
   username: string;
   level: number;
   skinId: SkinId;
-  status: 'online' | 'in-match' | 'idle';
+  status: 'online' | 'in-match' | 'offline';
+  online: boolean;
   inParty: boolean;
 }
 
@@ -1212,6 +1450,21 @@ export interface FriendRequestRecord {
   fromUsername: string;
   toCode: string;
   toUsername: string;
+  direction: 'incoming' | 'outgoing';
+  status: 'pending' | 'accepted' | 'declined';
+  timestamp: number;
+}
+
+export interface PartyInviteRecord {
+  id: string;
+  fromCode: string;
+  fromUsername: string;
+  fromLevel: number;
+  fromSkinId: SkinId;
+  toCode: string;
+  toUsername: string;
+  toLevel: number;
+  toSkinId: SkinId;
   direction: 'incoming' | 'outgoing';
   status: 'pending' | 'accepted' | 'declined';
   timestamp: number;
